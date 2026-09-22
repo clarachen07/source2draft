@@ -22,15 +22,25 @@ export function validateArticleLinks(body, sources) {
     for (const url of urls) if (!permitted.has(canonical(url))) throw new Error(`文章包含未经证据验证的链接：${url}`);
   } finally { doc.defaultView.close(); }
 }
-export function renderCitations(body, sources) {
+export function renderCitations(body, sources, sourceIds = []) {
   const byId = new Map(sources.map(s => [s.id, s]));
   const used = [];
-  const replaced = body.replace(/\[(S\d+)\]/g, (_, id) => {
+  const removedMarker = '\uE000';
+  const replaced = body.replace(/(?:\[(S?\d+)\]|【(S?\d+)】)(?!\()/g, (_, bracketId, cornerId) => {
+    const rawId = bracketId || cornerId;
+    const id = rawId.startsWith('S') ? rawId : `S${rawId}`;
     if (!byId.has(id)) throw new Error(`文章引用了不存在的来源 ${id}`);
     if (!used.includes(id)) used.push(id);
-    return `[${used.indexOf(id) + 1}]`;
-  });
-  if (/\[S[^\]]*\]/.test(replaced)) throw new Error('文章含有无效来源标记');
+    return removedMarker;
+  }).replace(/[ \t]*\uE000(?:[ \t]*\uE000)*[ \t]*(?=[，。；、,.!?！？;:：])/g, '')
+    .replace(/[ \t]*\uE000(?:[ \t]*\uE000)*/g, '');
+  if (/\[S[^\]]*\]|【S[^】]*】/.test(replaced)) throw new Error('文章含有无效来源标记');
+  if (!used.length) {
+    for (const id of sourceIds.length ? sourceIds : sources.map(s => s.id)) {
+      if (!byId.has(id)) throw new Error(`文章引用了不存在的来源 ${id}`);
+      if (!used.includes(id)) used.push(id);
+    }
+  }
   const references = used.map((id, i) => {
     const source = byId.get(id), title = source.title.replace(/[\r\n]/g, ' ')
       .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/[\\`*_[\]!()]/g, c => `&#${c.charCodeAt(0)};`);
@@ -80,6 +90,9 @@ async function fillSlots(slots, signal, action, persist) {
 
 export async function runAnalysis({ run, config, workDir, model, signal, progress, read = readSource, fetchFn = globalThis.fetch, previousArticle = '', onTelemetry }) {
   signal?.throwIfAborted();
+  // A prior draft produced from unresolved parser tokens is not useful revision
+  // context. Rebuild from current evidence instead of copying its false caveats.
+  if (/SL_INLINE_\d|\[object Object\]/.test(previousArticle)) previousArticle = '';
   const traceFile = path.join(workDir, 'research-trace.json');
   const trace = readJson(traceFile, { prompt: run.input, createdAt: new Date().toISOString(), sources: [] });
   trace.createdAt ||= new Date().toISOString();
@@ -174,10 +187,12 @@ exclusiveSources 仅在用户明确禁止扩展搜索时为 true。按原始要�
     progress('正在组织证据并写作');
     trace.draft = await model.json({ role: 'writer', signal, systemPrompt: BASE,
       prompt: `原始要求：${run.input}\n写作约定：${JSON.stringify(trace.plan)}\n证据：${evidence}\n${previousArticle ? `上一修订成稿（供按补充指令修改，原文事实仍需由本次证据核对）：\n${previousArticle}` : ''}\n
-返回 JSON {"title":"64 字内标题","body":"完整 Markdown 正文"}。
+返回 JSON {"title":"64 字内标题","body":"完整 Markdown 正文","sourceIds":["正文实际使用的来源 ID，如 S1"]}。
 不重复正文标题，不写 frontmatter，不生成图片、不添加未提供的链接。可使用用户材料 assets 中的原图路径。
-可核对事实紧邻引用 [S1] 等已有来源 ID，不自行写来源列表；证据不足就缩小结论，不捏造。材料链接不是自动直译要求。`,
-      validate: d => typeof d.title === 'string' && d.title.trim() && d.title.length <= 64 && typeof d.body === 'string' && d.body.trim().length > 20,
+正文不要写 [S1]、[1]、【1】等任何引用标记，也不要自行写来源列表。通过 sourceIds 列出实际使用的证据来源；证据不足就缩小结论，不捏造。材料链接不是自动直译要求。`,
+      validate: d => typeof d.title === 'string' && d.title.trim() && d.title.length <= 64 && typeof d.body === 'string'
+        && d.body.trim().length > 20 && !/SL_INLINE_\d|\[object Object\]/.test(d.body)
+        && (d.sourceIds === undefined || (Array.isArray(d.sourceIds) && d.sourceIds.every(id => typeof id === 'string'))),
     }); persist();
   }
   const reviewFingerprint = () => hash({ version: AUDIT_VERSION, system: BASE, input: run.input, evidence, draft: trace.draft,
@@ -210,7 +225,7 @@ exclusiveSources 仅在用户明确禁止扩展搜索时为 true。按原始要�
     }
     persist();
   }
-  const body = renderCitations(trace.draft.body, trace.sources);
+  const body = renderCitations(trace.draft.body, trace.sources, trace.draft.sourceIds);
   validateArticleLinks(body, trace.sources);
   trace.warnings = [...new Set(warnings)];
   trace.approvedReview = { fingerprint: reviewFingerprint(), version: AUDIT_VERSION, warnings: trace.warnings };

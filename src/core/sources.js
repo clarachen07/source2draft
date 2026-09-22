@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { JSDOM } from 'jsdom';
 import { Readability } from '@mozilla/readability';
-import { acquireSourceDocument, safeFetchResource } from '../workflows/translation-source-text.js';
+import { acquireSourceDocument, safeFetchResource, sourceDownloadUrl } from '../workflows/translation-source-text.js';
 import { withTaskCancellation } from '../lib/task-cancellation.js';
 import { fetchRetry, writeAtomic } from '../lib/io.js';
 import { emitTelemetry } from '../lib/telemetry.js';
@@ -46,8 +46,30 @@ export const translationConfig = config => ({
 export async function download(url, { signal, headers = {}, fetchFn = globalThis.fetch, limits = DOWNLOAD_LIMITS } = {}) {
   return safeFetchResource({ url, fetchFn: withTaskCancellation(fetchFn, signal), fetchWithRetry: fetchRetry, headers, limits, signal });
 }
+export { sourceDownloadUrl };
 export function documentText(document) {
-  return document.blocks.map(b => [b.text, ...(b.rows || []).map(r => r.join(' | ')), ...(b.images || []).map(i => i.alt || '')].filter(Boolean).join('\n')).join('\n\n');
+  const inlineText = (text, fragments = []) => {
+    let restored = String(text || '');
+    for (const fragment of fragments) {
+      const value = String(fragment.value || '');
+      // PDF link fragments often point to short-lived signed download URLs.
+      // The visible citation text is useful evidence; the temporary URL is not.
+      const visible = /^\[([^\]]*)\]\(https?:\/\//.exec(value)?.[1] || value;
+      restored = restored.replaceAll(fragment.token, visible);
+    }
+    if (/⟦SL_INLINE_\d+⟧/.test(restored)) throw new Error('原文内联公式或引用未能还原，已停止写作');
+    return restored;
+  };
+  return document.blocks.map((block) => {
+    const parts = [];
+    if (block.text) parts.push(inlineText(block.text, block.fragments));
+    if (block.caption && block.caption !== block.text) parts.push(inlineText(block.caption, block.captionFragments));
+    if (block.tex) parts.push(`公式：${block.tex}`);
+    for (const row of block.rows || []) parts.push(row.map((cell) =>
+      typeof cell === 'string' ? cell : inlineText(cell?.text, cell?.fragments)).join(' | '));
+    parts.push(...(block.images || []).map((image) => image.alt || '').filter(Boolean));
+    return parts.join('\n');
+  }).filter(Boolean).join('\n\n');
 }
 async function githubText(rawUrl, signal, fetchFn) {
   const url = new URL(rawUrl), pieces = url.pathname.split('/').filter(Boolean);
@@ -68,7 +90,8 @@ export async function readSource({ url, file, config, workDir, signal, fetchFn =
   const headers = file ? attachmentHeaders(file, config) : {};
   if (!file && new URL(sourceUrl).hostname === 'github.com') return githubText(sourceUrl, signal, fetchFn);
   const start = performance.now();
-  const fetched = await download(sourceUrl, { signal, headers, fetchFn });
+  const downloadUrl = sourceDownloadUrl(sourceUrl);
+  const fetched = await download(downloadUrl, { signal, headers, fetchFn });
   emitTelemetry(onTelemetry, { stage: 'source_download', count: 1, cacheHit: false, durationMs: Math.round(performance.now() - start) });
   const isPdf = fetched.buffer.subarray(0, 5).toString() === '%PDF-';
   const pdfHint = /pdf/i.test(file?.mimetype || '') || /\.pdf(?:[?#]|$)/i.test(file?.name || sourceUrl);
@@ -76,7 +99,7 @@ export async function readSource({ url, file, config, workDir, signal, fetchFn =
     if (!isPdf) throw new Error(`PDF 签名不正确：${file?.name || sourceUrl}；请检查 Slack files:read 权限`);
     const document = await acquireSourceDocument({ sourceUrl, workDir, requestHeaders: headers,
       config: translationConfig(config), fetchFn: withTaskCancellation(fetchFn, signal), fetchWithRetry: fetchRetry, signal,
-      prefetched: { ...fetched, sourceUrl }, onTelemetry });
+      prefetched: { ...fetched, sourceUrl: downloadUrl }, onTelemetry });
     writeAtomic(path.join(workDir, 'source-document.json'), document);
     return { title: document.title || file?.name || sourceUrl, url: file ? '' : sourceUrl, text: documentText(document),
       assets: document.blocks.flatMap(b => [...(b.images || []).map(i => i.localPath), b.localPath].filter(Boolean)) };

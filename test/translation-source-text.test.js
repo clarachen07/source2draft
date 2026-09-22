@@ -1863,6 +1863,45 @@ test('URL 安全拦截 localhost、私网和保留地址', async () => {
   await assert.doesNotReject(() => assertSafeHttpUrl('https://public.example/a', { dnsLookup: PUBLIC_DNS }));
 });
 
+test('代理合成 DNS 仅在公共 DNS 返回安全公网地址时放行，下载仍固定到公网地址', async () => {
+  const syntheticDns = async () => [{ address: '198.18.1.82', family: 4 }];
+  const publicDnsLookup = async () => [{ address: '93.184.216.34', family: 4 }];
+  await assert.doesNotReject(() => assertSafeHttpUrl('https://public.example/a', {
+    dnsLookup: syntheticDns, publicDnsLookup,
+  }));
+  await assert.rejects(() => assertSafeHttpUrl('https://public.example/a', {
+    dnsLookup: syntheticDns,
+    publicDnsLookup: async () => [{ address: '10.1.2.3', family: 4 }],
+  }), /公共 DNS 未返回安全公网地址/);
+  await assert.rejects(() => assertSafeHttpUrl('https://public.example/a', {
+    dnsLookup: async () => [{ address: '198.18.1.82', family: 4 }, { address: '10.1.2.3', family: 4 }],
+    publicDnsLookup: async () => { throw new Error('不应调用公共 DNS'); },
+  }), /私网或保留地址/);
+  let pinnedAddresses;
+  const result = await safeFetchResource({
+    url: 'https://public.example/paper.pdf', dnsLookup: syntheticDns, publicDnsLookup,
+    pinnedFetchFactory: addresses => {
+      pinnedAddresses = addresses;
+      return async () => new Response('%PDF-fixture', { headers: { 'content-type': 'application/pdf' } });
+    },
+  });
+  assert.deepEqual(pinnedAddresses, [{ address: '93.184.216.34', family: 4 }]);
+  assert.equal(result.buffer.toString(), '%PDF-fixture');
+});
+
+test('忠实翻译读取 Hugging Face PDF 时使用原文件地址并保留原链接', async () => {
+  const sourceUrl = 'https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Pro-RL/blob/main/MiMo_V2_6_technical_report.pdf';
+  const requested = [];
+  await assert.rejects(() => acquireSourceDocument({
+    sourceUrl, workDir: tempDir(), dnsLookup: PUBLIC_DNS, config: { browserEnabled: false },
+    fetchFn: async (url) => {
+      requested.push(String(url));
+      return new Response('missing', { status: 404 });
+    },
+  }), /原文获取失败:404/);
+  assert.deepEqual(requested, [sourceUrl.replace('/blob/', '/resolve/')]);
+});
+
 test('验证码页面拒绝产稿', async () => {
   await assert.rejects(() => acquireSourceDocument({
     sourceUrl: 'https://example.com/captcha',

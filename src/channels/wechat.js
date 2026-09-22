@@ -9,8 +9,21 @@ export function contentIdentity(article) {
   const doc = new JSDOM(article.content || '').window.document;
   try {
     return JSON.stringify({ title: article.title, text: doc.body.textContent.replace(/\s+/g, ''),
-      images: [...doc.querySelectorAll('img')].map(i => i.getAttribute('src')), thumb: article.thumb_media_id });
+      images: [...doc.querySelectorAll('img')].map(i => imageIdentity(i)), thumb: article.thumb_media_id });
   } finally { doc.defaultView.close(); }
+}
+function imageIdentity(image) {
+  const value = image.getAttribute('data-src') || image.getAttribute('src');
+  if (!value) return value;
+  try {
+    const url = new URL(value);
+    // WeChat moves uploaded images from src to data-src, upgrades http to
+    // https, and replaces the final /0 size with /640 in draft/get.
+    if (url.hostname === 'mmbiz.qpic.cn' && ['http:', 'https:'].includes(url.protocol)) {
+      return `${url.host}${url.pathname.replace(/\/(?:0|640)$/, '')}${url.search}`;
+    }
+  } catch {}
+  return value;
 }
 export function createWechat(config, { fetchFn = globalThis.fetch } = {}) {
   let token, tokenUntil = 0;

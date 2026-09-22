@@ -3,10 +3,17 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createWechat } from '../src/channels/wechat.js';
+import { contentIdentity, createWechat } from '../src/channels/wechat.js';
 import { openStore } from '../src/core/store.js';
 
 const png = Buffer.from('89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000a49444154789c6360000002000148afa4710000000049454e44ae426082', 'hex');
+test('公众号回读将图片移至 data-src 并改成 /640 时仍核对同一素材', () => {
+  const base = { title: '文章', thumb_media_id: 'cover', content: '<p>正文</p><img src="http://mmbiz.qpic.cn/mmbiz_jpg/abc/0">' };
+  const readback = { ...base, content: '<p>正文</p><img data-src="https://mmbiz.qpic.cn/mmbiz_jpg/abc/640">' };
+  assert.equal(contentIdentity(base), contentIdentity(readback));
+  assert.notEqual(contentIdentity(base), contentIdentity({ ...readback,
+    content: '<p>正文</p><img data-src="https://mmbiz.qpic.cn/mmbiz_jpg/other/640">' }));
+});
 function fixture(mode) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'shallow-wechat-'));
   fs.writeFileSync(path.join(dir, 'cover.png'), png);

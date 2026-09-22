@@ -4,7 +4,23 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { readSource } from '../src/core/sources.js';
+import { documentText, readSource } from '../src/core/sources.js';
+
+test('analysis source text restores PDF inline fragments, table cells, and equations', () => {
+  const text = documentText({ blocks: [
+    { type: 'paragraph', text: 'top-⟦SL_INLINE_001⟧, Figure ⟦SL_INLINE_002⟧', fragments: [
+      { token: '⟦SL_INLINE_001⟧', value: '$p$' },
+      { token: '⟦SL_INLINE_002⟧', value: '[2](https://example.com/signed.pdf?token=temporary)' },
+    ] },
+    { type: 'table', caption: 'Scores', rows: [[{ text: 'Model' }, { text: '92.3' }]] },
+    { type: 'equation', tex: '\\mathcal{L}(\\theta)' },
+  ] });
+  assert.match(text, /top-\$p\$, Figure 2/);
+  assert.match(text, /Model \| 92\.3/);
+  assert.match(text, /公式：\\mathcal\{L\}/);
+  assert.doesNotMatch(text, /SL_INLINE|\[object Object\]|signed\.pdf/);
+  assert.throws(() => documentText({ blocks: [{ text: '⟦SL_INLINE_001⟧' }] }), /未能还原/);
+});
 import { loadConfig } from '../src/config/index.js';
 
 // A valid one-page PDF exercises the real Poppler and structured-PDF path.

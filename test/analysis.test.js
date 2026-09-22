@@ -4,7 +4,15 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { runAnalysis, renderCitations, validateArticleLinks } from '../src/workflows/analysis.js';
-import { inputUrls, coverUrls } from '../src/core/sources.js';
+import { inputUrls, coverUrls, sourceDownloadUrl } from '../src/core/sources.js';
+
+test('Hugging Face PDF 预览链接转为原文件下载地址', () => {
+  const source = 'https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Pro-RL/blob/main/MiMo_V2_6_technical_report.pdf';
+  assert.equal(sourceDownloadUrl(source), source.replace('/blob/', '/resolve/'));
+  assert.equal(sourceDownloadUrl('https://example.com/a/blob/main/paper.pdf'), 'https://example.com/a/blob/main/paper.pdf');
+  assert.equal(sourceDownloadUrl('https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Pro-RL/blob/main/README.md?download=true'),
+    'https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Pro-RL/resolve/main/README.md?download=true');
+});
 import { marked } from 'marked';
 import { JSDOM } from 'jsdom';
 import { createModel } from '../src/core/model.js';
@@ -38,6 +46,7 @@ test('analysis runs bilingual research, writes, audits, and builds grounded sour
     assert.equal(f.queries.length, 2); assert.ok(f.queries[0].startPublishedDate); assert.equal(f.queries[1].startPublishedDate, undefined);
     assert.deepEqual(f.calls.map(c => c.role), ['planner', 'writer', 'review']);
     assert.match(result.article, /参考来源/); assert.match(result.article, /https:\/\/example.org\/research/);
+    assert.doesNotMatch(result.article.split('## 参考来源')[0], /\[S?\d+\]|【\d+】/);
     assert.ok(fs.existsSync(path.join(f.args.workDir, 'research-trace.json')));
   } finally { f.close(); }
 });
@@ -87,7 +96,8 @@ test('citation rendering preserves literal destinations and treats source titles
     { id: 'S1', title: '[研究] <tag> ![图](https://unverified.example/img)', url: 'https://example.org/training-(qat)' },
     { id: 'S2', title: '资料', url: 'https://example.org/unbalanced)?a=1&copy=2' },
   ];
-  const body = renderCitations('正文[S1][S2]', sources);
+  const body = renderCitations('正文 [S1][S2]。另一句【1】。', sources);
+  assert.equal(body.split('## 参考来源')[0].trim(), '正文。另一句。');
   validateArticleLinks(body, sources);
   const dom = new JSDOM(marked.parse(body));
   try {
@@ -95,6 +105,16 @@ test('citation rendering preserves literal destinations and treats source titles
     assert.equal(dom.window.document.querySelectorAll('img, tag').length, 0);
     assert.ok(dom.window.document.body.textContent.includes(sources[0].title));
   } finally { dom.window.close(); }
+});
+
+test('writer can omit inline citations and select the sources listed at the end', () => {
+  const sources = [
+    { id: 'S1', title: 'Unused source', url: 'https://example.org/unused' },
+    { id: 'S2', title: 'Used source', url: 'https://example.org/used' },
+  ];
+  const body = renderCitations('正文没有引用标识。', sources, ['S2']);
+  assert.match(body, /## 参考来源\n\n1\. \[Used source\]/);
+  assert.doesNotMatch(body, /Unused source|\[S2\]|【2】/);
 });
 
 test('link validation matches rendered Markdown, reference links, escaped URLs and HTML entities', () => {

@@ -57,17 +57,26 @@ export function safeLocalAsset(src, workDir) {
 function referencesHeading(element) {
   return /^(?:references|bibliography|works cited|参考来源|参考文献|引用文献)\s*[:：]?$/i.test(element.textContent.trim());
 }
-function replaceWithOrderedList(list) {
-  if (list.tagName === 'OL') return list;
-  const ordered = list.ownerDocument.createElement('ol');
-  for (const attribute of [...list.attributes]) ordered.setAttribute(attribute.name, attribute.value);
-  while (list.firstChild) ordered.appendChild(list.firstChild);
-  list.replaceWith(ordered);
-  return ordered;
+function renderReferenceParagraphs(list) {
+  const document = list.ownerDocument;
+  const paragraphs = document.createDocumentFragment();
+  for (const [index, item] of [...list.children].entries()) {
+    if (item.tagName !== 'LI') continue;
+    const paragraph = document.createElement('p');
+    paragraph.setAttribute('style', `${STYLES.p}margin:.35em 0;`);
+    paragraph.append(`${index + 1}. `);
+    for (const child of [...item.childNodes]) {
+      if (child.nodeType === 1 && child.tagName === 'P') {
+        while (child.firstChild) paragraph.appendChild(child.firstChild);
+      } else paragraph.appendChild(child);
+    }
+    paragraphs.appendChild(paragraph);
+  }
+  list.replaceWith(paragraphs);
 }
 // Apply typography only after the Markdown DOM exists. This makes research and
-// faithful-translation output share one presentation contract, including the
-// generated reference list rather than relying on WeChat's list defaults.
+// faithful-translation output share one presentation contract. Fixed numbers in
+// ordinary paragraphs survive WeChat's editor and remain stable after editing.
 export function applyWechatArticleStyles(body) {
   for (const el of [...body.querySelectorAll('*')]) {
     const originalStyle = el.hasAttribute('data-sl-math') ? el.getAttribute('style') : '';
@@ -80,12 +89,7 @@ export function applyWechatArticleStyles(body) {
     if (!referencesHeading(heading)) continue;
     const list = heading.nextElementSibling;
     if (!list || !['OL', 'UL'].includes(list.tagName)) continue;
-    const ordered = replaceWithOrderedList(list);
-    ordered.setAttribute('style', `${STYLES.ol}margin:.75em 0;`);
-    for (const item of ordered.querySelectorAll(':scope > li')) {
-      item.setAttribute('style', `${STYLES.li}margin:0 0 .7em;`);
-      for (const paragraph of item.querySelectorAll(':scope > p')) paragraph.setAttribute('style', `${STYLES.p}margin:0;`);
-    }
+    renderReferenceParagraphs(list);
   }
 }
 export async function prepareArticle({ markdown, workDir, config, signal, cover, onTelemetry }) {

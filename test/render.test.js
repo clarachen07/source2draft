@@ -26,19 +26,21 @@ test('image lookup cannot escape task directory, including symbolic links', () =
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('article typography is uniformly 15px and reference lists use one ordered sequence', () => {
-  const document = new JSDOM('<body><p>Body</p><h2>参考来源</h2><ul><li><p>First source</p></li><li><p>Second source</p></li></ul><table><tr><td>Cell</td></tr></table></body>').window.document;
+test('reference links render as stable numbered paragraphs while ordinary lists remain lists', () => {
+  const document = new JSDOM('<body><p>Body</p><ul><li>Ordinary item</li></ul><h2>参考来源</h2><ul><li><p><a href="https://example.org/first">First source</a></p></li><li><p>Second source</p></li></ul><table><tr><td>Cell</td></tr></table></body>').window.document;
   applyWechatArticleStyles(document.body);
-  for (const element of document.querySelectorAll('p,h2,ol,li,table,td')) {
+  for (const element of document.querySelectorAll('p,h2,li,table,td')) {
     const style = element.getAttribute('style') || '';
     assert.match(style, /font-size:15px/);
     assert.match(style, /text-align:left/);
     assert.match(style, /font-family:/);
   }
-  const references = document.querySelector('h2 + ol');
-  assert.ok(references);
-  assert.equal(references.children.length, 2);
-  for (const paragraph of references.querySelectorAll('li > p')) assert.match(paragraph.getAttribute('style'), /margin:0/);
+  const heading = document.querySelector('h2');
+  assert.deepEqual([heading.nextElementSibling, heading.nextElementSibling.nextElementSibling]
+    .map(element => element.textContent), ['1. First source', '2. Second source']);
+  assert.equal(document.querySelector('h2 + ol, h2 + ul'), null);
+  assert.equal(heading.nextElementSibling.querySelector('a')?.getAttribute('href'), 'https://example.org/first');
+  assert.equal(document.querySelector('p + ul li')?.textContent, 'Ordinary item');
 });
 
 test('prepared article embeds the uniform 15px layout in its upload HTML', async () => {
@@ -54,6 +56,9 @@ test('prepared article embeds the uniform 15px layout in its upload HTML', async
     assert.match(section.getAttribute('style'), /font-size:15px/);
     assert.match(section.getAttribute('style'), /text-align:left/);
     assert.match(section.getAttribute('style'), /font-family:/);
-    assert.equal(document.querySelector('h2 + ol')?.children.length, 2);
+    const heading = document.querySelector('h2');
+    assert.deepEqual([heading.nextElementSibling, heading.nextElementSibling.nextElementSibling]
+      .map(element => element.textContent), ['1. First source', '2. Second source']);
+    assert.equal(document.querySelector('h2 + ol'), null);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

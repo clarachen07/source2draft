@@ -204,7 +204,7 @@ export async function acquireSourceDocument({
   fs.mkdirSync(workDir, { recursive: true });
   const acquisition = { attempts: [], fallbacks: [] };
   const arxiv = arxivSourceUrls(sourceUrl);
-  let acquisitionUrl = arxiv ? (scope.kind === 'pages' ? arxiv.pdf : arxiv.html) : sourceUrl;
+  let acquisitionUrl = arxiv ? (scope.kind === 'pages' ? arxiv.pdf : arxiv.html) : sourceDownloadUrl(sourceUrl);
   if (acquisitionUrl !== sourceUrl) acquisition.attempts.push(scope.kind === 'pages' ? 'arxiv-pdf' : 'arxiv-html');
   const acquisitionHeaders = requestHeaders;
   const reusableResponse = (url) => {
@@ -1301,11 +1301,21 @@ export function removeRepeatedSourceMetadata(document) {
   };
 }
 
-export async function assertSafeHttpUrl(rawUrl, { dnsLookup = dns.lookup } = {}) {
-  return (await resolveSafeHttpUrl(rawUrl, { dnsLookup })).url;
+export function sourceDownloadUrl(sourceUrl) {
+  const url = new URL(sourceUrl);
+  if (url.protocol === 'https:' && url.hostname === 'huggingface.co'
+    && /^\/[^/]+\/[^/]+\/blob\/[^/]+\/.+/.test(url.pathname)) {
+    url.pathname = url.pathname.replace('/blob/', '/resolve/');
+    return url.toString();
+  }
+  return sourceUrl;
 }
 
-async function resolveSafeHttpUrl(rawUrl, { dnsLookup = dns.lookup } = {}) {
+export async function assertSafeHttpUrl(rawUrl, { dnsLookup = dns.lookup, publicDnsLookup = lookupPublicDns } = {}) {
+  return (await resolveSafeHttpUrl(rawUrl, { dnsLookup, publicDnsLookup })).url;
+}
+
+async function resolveSafeHttpUrl(rawUrl, { dnsLookup = dns.lookup, publicDnsLookup = lookupPublicDns } = {}) {
   let url;
   try { url = new URL(rawUrl); } catch { throw new Error('原文链接格式无效'); }
   if (!['http:', 'https:'].includes(url.protocol)) throw new Error('只允许 http(s) 原文链接');
@@ -1325,10 +1335,50 @@ async function resolveSafeHttpUrl(rawUrl, { dnsLookup = dns.lookup } = {}) {
     address: String(record?.address || ''),
     family: Number(record?.family) || net.isIP(record?.address),
   }));
+  // Some local network proxies map every public hostname into 198.18.0.0/15.
+  // Resolve the original hostname over authenticated HTTPS and pin the public
+  // result; never connect to the synthetic address or permit other private IPs.
+  if (addresses.length && addresses.every((record) => isSyntheticDnsIp(record.address))) {
+    try { records = await publicDnsLookup(host); }
+    catch (error) { throw new Error(`公共 DNS 核验失败:${safeError(error)}`); }
+    const publicAddresses = (records || []).map((record) => ({
+      address: String(record?.address || ''),
+      family: Number(record?.family) || net.isIP(record?.address),
+    }));
+    if (!publicAddresses.length || publicAddresses.some((record) => !record.family || isPrivateIp(record.address))) {
+      throw new Error('公共 DNS 未返回安全公网地址');
+    }
+    return { url, addresses: publicAddresses };
+  }
   if (!addresses.length || addresses.some((record) => !record.family || isPrivateIp(record.address))) {
     throw new Error('原文域名解析到私网或保留地址');
   }
   return { url, addresses };
+}
+
+function isSyntheticDnsIp(address) {
+  if (!net.isIPv4(address)) return false;
+  const [a, b] = address.split('.').map(Number);
+  return a === 198 && (b === 18 || b === 19);
+}
+
+async function lookupPublicDns(host) {
+  const answers = await Promise.all(['A', 'AAAA'].map(async (type) => {
+    const endpoint = new URL('https://cloudflare-dns.com/dns-query');
+    endpoint.searchParams.set('name', host);
+    endpoint.searchParams.set('type', type);
+    const response = await fetch(endpoint, {
+      headers: { Accept: 'application/dns-json' },
+      redirect: 'error',
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    if (data.Status !== 0 || data.TC) throw new Error(`DNS 状态 ${data.Status}`);
+    return (data.Answer || []).filter((answer) => answer.type === (type === 'A' ? 1 : 28))
+      .map((answer) => ({ address: answer.data, family: type === 'A' ? 4 : 6 }));
+  }));
+  return answers.flat();
 }
 
 export function isPrivateIp(address) {
@@ -1417,6 +1467,7 @@ export async function safeFetchResource({
   fetchWithRetry,
   limits = DEFAULT_LIMITS,
   dnsLookup = dns.lookup,
+  publicDnsLookup = lookupPublicDns,
   accept,
   headers = {},
   maxBytes = limits.maxSourceBytes,
@@ -1435,7 +1486,7 @@ export async function safeFetchResource({
     let current = url;
     let currentHeaders = { ...headers };
     for (let redirects = 0; redirects <= limits.maxRedirects; redirects += 1) {
-      const resolved = await resolveSafeHttpUrl(current, { dnsLookup });
+      const resolved = await resolveSafeHttpUrl(current, { dnsLookup, publicDnsLookup });
       throwIfTaskCancelled(requestSignal);
       const requestFetch = fetchUsesGlobalTransport(fetchFn)
         ? rebindFetchTransport(fetchFn, pinnedFetchFactory(resolved.addresses))

@@ -1,12 +1,12 @@
 # Source2Draft
 
-- 只开发当前项目。其他本机项目仅作只读参考，不修改、不执行其脚本、不使用其密钥或数据库。
-- 只有通用搜索写作和严格直译两条内容流程，不加载公司写作 skills、品牌模板、Newsletter、Discord 或定时文章任务。
-- 所有文章只创建微信草稿。不要接入正式发布接口。
-- Slack 必须同时匹配个人工作区、频道和用户；顶层消息需要 @Bot，线程上下文只来自已登记任务。
-- 同一修订的草稿创建只能发起一次不明确结果的请求；先持久化操作，再写入远端。media_id 立即持久化，重试优先回读。修改已完成文章创建新修订和新草稿。
-- 用户材料优先；仅使用给定材料的要求禁止扩展搜索。直译不得用搜索结果补齐缺失原文。
-- 外部 URL 使用安全下载器，Slack token 只发送至允许的 Slack 文件地址；跨域跳转剥离认证信息。
-- 不在日志、测试样例或提交中包含真实密钥。仅在本项目 `.env` 存放个人密钥，保持 0600。
-- 每个任务独立目录；维护命令与常驻服务共享单实例锁。失败恢复不删除用户内容。
-- 修改后运行 `npm run check`；图片/公式/排版变动还应渲染检查。真实连接和草稿验收单独报告，不将模拟结果作为上线成功。
+- Develop only this project. Other local projects are read-only references: do not modify them, run their scripts, or use their credentials or databases.
+- Support only two content flows: general search writing and faithful translation. Do not load company writing skills, brand templates, newsletters, Discord, or scheduled-article workflows.
+- Articles may create WeChat drafts only. Do not integrate a publishing API.
+- Slack must match the personal workspace, channel, and user. Top-level messages must mention the bot; thread context comes only from registered tasks.
+- A draft creation for the same revision may make only one request with an ambiguous result. Persist the operation before the remote write; persist `media_id` immediately and read it back before retrying. Editing a completed article creates a new revision and draft.
+- Supplied material takes priority. A request to use only supplied material prohibits expanded search. A faithful translation must not fill missing source text with search results.
+- External URLs use the secure downloader. Send Slack tokens only to permitted Slack-file addresses and strip authentication on cross-origin redirects.
+- Never include real credentials in logs, test samples, or commits. Store personal credentials only in this project's `.env` with mode `0600`.
+- Each task has an independent directory. Maintenance commands and the persistent service share a single-instance lock. Failure recovery does not delete user content.
+- Run `npm run check` after changes. Image, formula, or layout changes also require a rendered check. Report real connections and draft acceptance separately; never present simulated results as production success.

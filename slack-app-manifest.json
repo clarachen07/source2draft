@@ -1,5 +1,5 @@
 {
-  "display_information": { "name": "Source2Draft", "description": "个人公众号搜索写作与直译助手", "background_color": "#344054" },
+  "display_information": { "name": "Source2Draft", "description": "Personal research writing and faithful translation assistant for WeChat drafts", "background_color": "#344054" },
   "features": { "bot_user": { "display_name": "Source2Draft", "always_online": true } },
   "oauth_config": { "scopes": { "bot": ["app_mentions:read", "channels:history", "channels:read", "chat:write", "files:read"] } },
   "settings": {

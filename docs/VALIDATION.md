@@ -1,41 +1,41 @@
-# 验证记录
+# Validation record
 
-最近验证日期：2026-09-22。此文件只记录项目验证，不包含个人账号、实际任务或草稿标识。
+Last validated: 2026-09-22. This file records project validation only; it contains no personal accounts, real tasks, or draft identifiers.
 
-## 当前结果
+## Current results
 
-- npm run check：162 项测试通过、0 跳过；覆盖语法、项目隔离、回归测试和依赖审计，验证时依赖审计为 0 项漏洞。
-- 使用真实 Chrome 检查正文、公式、表格、图片和封面。390px 与 1024px 视口无横向溢出，混合样例的 21 个图片引用全部加载成功。
-- 渲染优化前后的混合样例 HTML、图片及封面逐字节一致；已目视检查手机预览和封面。
-- 使用真实 Poppler 和模拟 Datalab 响应验证 PDF 解析，同一 PDF 只下载一次。
+- `npm run check`: 162 tests passed, 0 skipped. The check covers syntax, project isolation, regression tests, and dependency auditing; the audit found 0 vulnerabilities at validation time.
+- Real Chrome verified article text, formulas, tables, images, and covers. The 390px and 1024px viewports had no horizontal overflow, and all 21 image references in the mixed sample loaded successfully.
+- The mixed-sample HTML, images, and cover were byte-for-byte identical before and after rendering optimization; the mobile preview and cover were visually inspected.
+- PDF parsing was checked with real Poppler and mocked Datalab responses. The same PDF was downloaded once.
 
-完整检查需要 Node.js 22+、Chrome 和 Poppler，无需真实账号凭据。
+The full check requires Node.js 22+, Chrome, and Poppler; it does not require real account credentials.
 
-## 回归覆盖
+## Regression coverage
 
-- 单实例锁：8 进程竞争、强制退出恢复、真实路径与符号链接共享同一锁。
-- Slack：工作区、频道、用户和 @ 限制；重复消息、乱序编辑、跨修订控制重放与重启恢复。
-- 材料：限定来源禁止扩搜、最新来源及封面选择、固定顺序的逐项恢复。
-- 网络：私网拦截、DNS 固定、跨域剥离认证、响应体限长、完整请求截止时间和取消。
-- 翻译：真实模型适配器的模拟截断触发有界拆批；页级范围、图表、公式与结构完整性检查。
-- 缓存：复核指纹失效、图片上传回执隔离、失败批次保留已通过译块。
-- 微信：创建前持久化操作、立即保存 media_id、响应丢失只核对、结果不明暂停、已有草稿不重建。
-- 浏览器：批次复用、独立 context、禁网、取消释放资源与后续任务恢复。
-- 统计：仅含耗时与计数；统计失败不改变任务结果或重复远端操作。
+- Single-instance locking: eight-process contention, recovery after forced exit, and a shared lock for real paths and symlinks.
+- Slack: workspace, channel, user, and mention restrictions; duplicate messages, out-of-order edits, cross-revision control replay, and restart recovery.
+- Material: restricted sources block expanded search; latest source and cover selections; item-by-item recovery in a stable order.
+- Network: private-network blocking, DNS pinning, cross-origin credential stripping, response-size limits, full-request deadlines, and cancellation.
+- Translation: a mocked truncation from the real-model adapter triggers bounded split batches; page ranges, charts, formulas, and structural completeness are checked.
+- Cache: review-fingerprint invalidation, isolation of image-upload receipts, and retained approved translation blocks after a failed batch.
+- WeChat: operations persist before creation, `media_id` persists immediately, lost responses are verified only, ambiguous results pause, and existing drafts are never recreated.
+- Browser: reusable batches, isolated contexts, no network, cancellation resource release, and recovery for the next task.
+- Telemetry: timing and counts only; telemetry failures neither change task results nor repeat remote operations.
 
-## 离线性能结果
+## Offline performance results
 
-| 场景 | 优化前 | 优化后 | 等价检查 |
+| Scenario | Before | After | Equivalence check |
 | --- | --- | --- | --- |
-| 六表，三轮 Chrome 耗时中位数 | 2.970 秒，启动 6 次 | 1.568 秒，启动 1 次 | 每轮 PNG 哈希一致 |
-| 1601 个翻译单元的检查点 | 1668 次，序列化 413.10 MiB | 67 次，序列化 16.89 MiB | 模型调用均 67 次，成稿一致 |
-| 六条固定延迟搜索 | 303.0 ms，并发 1 | 107.2 ms，并发 3 | 请求数均 6，全文和来源顺序一致 |
-| 相同任务恢复的复核请求 | 1 次 | 0 次 | 指纹一致的已通过复核 |
+| Six tables, median Chrome duration across three runs | 2.970 s, 6 launches | 1.568 s, 1 launch | Matching PNG hashes for every run |
+| Checkpoints for 1,601 translation units | 1,668 writes, 413.10 MiB serialized | 67 writes, 16.89 MiB serialized | 67 model calls in both cases; matching final article |
+| Six fixed-latency searches | 303.0 ms, concurrency 1 | 107.2 ms, concurrency 3 | 6 requests in both cases; matching text and source order |
+| Review requests on a resumed identical task | 1 | 0 | Reused approved review with matching fingerprint |
 
-搜索与模型使用固定模拟响应；检查点基准执行真实序列化、模拟磁盘写入。这些结果只说明对应阶段改进，不能推算真实整篇生成速度。
+Search and model calls use fixed mocked responses. The checkpoint benchmark performs real serialization with simulated disk writes. These results describe only the corresponding stages and do not predict whole-article generation time.
 
-## 真实接入验收
+## Real integration acceptance
 
-离线测试不等于真实账号验收。每个安装应按[接入指南](SETUP.md)独立验证 Slack 指令与通知、模型认证、Exa 搜索、Datalab PDF 解析、微信草稿创建与回读，以及断线和登录恢复。
+Offline testing is not real-account acceptance. Each installation should independently validate Slack commands and notifications, model authentication, Exa search, Datalab PDF parsing, WeChat draft creation and readback, plus reconnection and login recovery, using the [setup guide](SETUP.md).
 
-真实测试只创建草稿，不正式发表。个人验收记录、文章、凭据、数据库和日志保留本地，不随公开仓库分发。
+Real testing creates drafts only and never publishes. Personal acceptance records, articles, credentials, databases, and logs remain local and are not distributed with the public repository.

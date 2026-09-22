@@ -1,0 +1,45 @@
+{
+  "name": "source2draft",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test test/*.test.js",
+    "check": "node scripts/check.mjs && npm test && npm audit --omit=dev --audit-level=high",
+    "setup": "node scripts/manage.mjs setup",
+    "check:config": "node scripts/manage.mjs config",
+    "check:connections": "node scripts/manage.mjs connections",
+    "status": "node scripts/manage.mjs status",
+    "retry": "node scripts/manage.mjs retry",
+    "preview": "node scripts/manage.mjs preview",
+    "run:local": "node scripts/manage.mjs run",
+    "test:wechat": "node scripts/manage.mjs wechat-test",
+    "service:install": "node scripts/service.mjs install",
+    "service:restart": "node scripts/service.mjs restart",
+    "service:stop": "node scripts/service.mjs stop",
+    "service:status": "node scripts/service.mjs status",
+    "service:uninstall": "node scripts/service.mjs uninstall"
+  },
+  "dependencies": {
+    "@mozilla/readability": "^0.6.0",
+    "@slack/bolt": "^4.0.0",
+    "better-sqlite3": "^12.0.0",
+    "dotenv": "^17.0.0",
+    "jsdom": "^27.4.0",
+    "marked": "^17.0.0",
+    "mathjax-full": "3.2.2",
+    "playwright-core": "^1.61.1"
+  },
+  "overrides": {
+    "@xmldom/xmldom": "^0.9.12"
+  },
+  "description": "Source-grounded research writing and faithful translation to WeChat drafts, controlled through Slack.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/clarachen07/source2draft.git"
+  }
+}

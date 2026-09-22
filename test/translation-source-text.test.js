@@ -690,6 +690,18 @@ test('Markdown/HTML 直译保留有序列表的原始起始值、显式序号和
   );
 });
 
+test('直译参考文献合并为一个连续的有序列表并去除原始重复序号', () => {
+  const article = renderTranslatedDocument({
+    sourceUrl: 'https://example.com/paper', title: 'Paper', blocks: [
+      { type: 'heading', level: 2, text: '参考文献' },
+      { type: 'reference', text: '1. First source' },
+      { type: 'reference', text: '[2] Second source' },
+    ],
+  });
+  assert.match(article, /## 参考文献\n\n1\. First source\n2\. Second source/);
+  assert.doesNotMatch(article, /1\. 1\.|2\. \[2\]/);
+});
+
 test('结构化翻译覆盖标题、正文和图表标题，表格正文保留为原文图片', async () => {
   const workDir = tempDir();
   const imagePath = path.join(workDir, 'figure.png');

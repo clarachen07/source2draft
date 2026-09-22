@@ -286,7 +286,7 @@ export function restoreMathInHtml(html, { equations = [] } = {}) {
       if (equation.display) {
         const section = window.document.createElement('section');
         section.setAttribute('data-sl-math-display', 'true');
-        section.setAttribute('style', 'text-align:center;margin:1em 0;');
+        section.setAttribute('style', 'text-align:left;margin:1em 0;');
         section.appendChild(buildEquationImage(window.document, equation));
         fragment.appendChild(section);
       } else {

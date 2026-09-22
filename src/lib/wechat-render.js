@@ -8,14 +8,24 @@ import { screenshotHtml } from './browser.js';
 import { download } from '../core/sources.js';
 import { secretValues } from '../config/index.js';
 
+const ARTICLE_FONT = '-apple-system,BlinkMacSystemFont,Segoe UI,PingFang SC,Microsoft YaHei,Arial,sans-serif';
+const TEXT_STYLE = `font-family:${ARTICLE_FONT};font-size:15px;text-align:left;`;
 const STYLES = {
-  p: 'margin:1em 0;line-height:1.8;', h1: 'font-size:23px;line-height:1.4;margin:1.5em 0 .8em;',
-  h2: 'font-size:21px;line-height:1.5;margin:1.5em 0 .8em;', h3: 'font-size:18px;margin:1.3em 0 .7em;',
-  h4: 'font-size:17px;margin:1em 0;', blockquote: 'margin:1em 0;padding-left:12px;border-left:3px solid #d0d5dd;color:#667085;',
-  img: 'max-width:100%;height:auto;', table: 'border-collapse:collapse;width:100%;font-size:14px;word-break:break-word;',
-  th: 'border:1px solid #d0d5dd;padding:6px;text-align:left;', td: 'border:1px solid #d0d5dd;padding:6px;',
-  pre: 'white-space:pre-wrap;overflow-wrap:anywhere;background:#f5f5f5;padding:12px;font-size:13px;',
-  code: 'font-family:monospace;', a: 'color:#344054;text-decoration:underline;', li: 'margin:.5em 0;',
+  p: `${TEXT_STYLE}margin:1em 0;line-height:1.8;`,
+  h1: `${TEXT_STYLE}font-weight:600;line-height:1.5;margin:1.5em 0 .8em;`,
+  h2: `${TEXT_STYLE}font-weight:600;line-height:1.5;margin:1.5em 0 .8em;`,
+  h3: `${TEXT_STYLE}font-weight:600;line-height:1.5;margin:1.3em 0 .7em;`,
+  h4: `${TEXT_STYLE}font-weight:600;line-height:1.5;margin:1em 0;`,
+  blockquote: `${TEXT_STYLE}margin:1em 0;padding-left:12px;border-left:3px solid #d0d5dd;color:#667085;line-height:1.8;`,
+  img: 'max-width:100%;height:auto;',
+  table: `${TEXT_STYLE}border-collapse:collapse;width:100%;word-break:break-word;`,
+  th: `${TEXT_STYLE}border:1px solid #d0d5dd;padding:6px;`,
+  td: `${TEXT_STYLE}border:1px solid #d0d5dd;padding:6px;`,
+  pre: `${TEXT_STYLE}white-space:pre-wrap;overflow-wrap:anywhere;background:#f5f5f5;padding:12px;line-height:1.8;`,
+  code: `${TEXT_STYLE}`, a: 'color:#344054;text-decoration:underline;',
+  ol: `${TEXT_STYLE}margin:.75em 0;padding-left:1.5em;list-style-position:outside;`,
+  ul: `${TEXT_STYLE}margin:.75em 0;padding-left:1.5em;list-style-position:outside;`,
+  li: `${TEXT_STYLE}margin:.5em 0;padding-left:.25em;line-height:1.8;`,
 };
 const ALLOWED = new Set('section div p h1 h2 h3 h4 h5 h6 strong b em i s del u a img ul ol li blockquote pre code table thead tbody tr th td hr br sup sub span'.split(' '));
 export function validatePreparedWechatHtml(html) {
@@ -44,6 +54,40 @@ export function safeLocalAsset(src, workDir) {
   if (!full.startsWith(fs.realpathSync(workDir) + path.sep)) throw new Error('图片不能读取任务目录以外的文件');
   return full;
 }
+function referencesHeading(element) {
+  return /^(?:references|bibliography|works cited|参考来源|参考文献|引用文献)\s*[:：]?$/i.test(element.textContent.trim());
+}
+function replaceWithOrderedList(list) {
+  if (list.tagName === 'OL') return list;
+  const ordered = list.ownerDocument.createElement('ol');
+  for (const attribute of [...list.attributes]) ordered.setAttribute(attribute.name, attribute.value);
+  while (list.firstChild) ordered.appendChild(list.firstChild);
+  list.replaceWith(ordered);
+  return ordered;
+}
+// Apply typography only after the Markdown DOM exists. This makes research and
+// faithful-translation output share one presentation contract, including the
+// generated reference list rather than relying on WeChat's list defaults.
+export function applyWechatArticleStyles(body) {
+  for (const el of [...body.querySelectorAll('*')]) {
+    const originalStyle = el.hasAttribute('data-sl-math') ? el.getAttribute('style') : '';
+    if (originalStyle && /url\s*\(|expression|@import|javascript|\\/i.test(originalStyle)) throw new Error('公式样式含不安全内容');
+    el.setAttribute('style', originalStyle || STYLES[el.tagName.toLowerCase()] || '');
+    if (el.hasAttribute('href') && !/^https?:\/\//i.test(el.getAttribute('href'))) el.removeAttribute('href');
+  }
+  for (const paragraph of body.querySelectorAll('li > p')) paragraph.setAttribute('style', `${STYLES.p}margin:0;`);
+  for (const heading of body.querySelectorAll('h1,h2,h3,h4,h5,h6')) {
+    if (!referencesHeading(heading)) continue;
+    const list = heading.nextElementSibling;
+    if (!list || !['OL', 'UL'].includes(list.tagName)) continue;
+    const ordered = replaceWithOrderedList(list);
+    ordered.setAttribute('style', `${STYLES.ol}margin:.75em 0;`);
+    for (const item of ordered.querySelectorAll(':scope > li')) {
+      item.setAttribute('style', `${STYLES.li}margin:0 0 .7em;`);
+      for (const paragraph of item.querySelectorAll(':scope > p')) paragraph.setAttribute('style', `${STYLES.p}margin:0;`);
+    }
+  }
+}
 export async function prepareArticle({ markdown, workDir, config, signal, cover, onTelemetry }) {
   signal?.throwIfAborted();
   assertSafeArticle(markdown, config);
@@ -63,11 +107,8 @@ export async function prepareArticle({ markdown, workDir, config, signal, cover,
       if (/^on/i.test(attr.name)) throw new Error('正文含事件处理属性');
       if (!['href', 'src', 'alt', 'style', 'colspan', 'rowspan'].includes(attr.name) && !attr.name.startsWith('data-sl-math')) el.removeAttribute(attr.name);
     }
-    const originalStyle = el.hasAttribute('data-sl-math') ? el.getAttribute('style') : '';
-    if (originalStyle && /url\s*\(|expression|@import|javascript|\\/i.test(originalStyle)) throw new Error('公式样式含不安全内容');
-    el.setAttribute('style', originalStyle || STYLES[el.tagName.toLowerCase()] || '');
-    if (el.hasAttribute('href') && !/^https?:\/\//i.test(el.getAttribute('href'))) el.removeAttribute('href');
   }
+  applyWechatArticleStyles(doc.body);
   const assets = [];
   let assetBytes = 0;
   for (const img of doc.querySelectorAll('img')) {
@@ -89,7 +130,7 @@ export async function prepareArticle({ markdown, workDir, config, signal, cover,
     img.setAttribute('src', path.relative(workDir, local));
   }
   if (/\/(?:Users|home|private|var|srv)\/|[A-Z]:\\Users\\/.test(doc.body.textContent)) throw new Error('正文泄漏本机路径，禁止上传');
-  html = `<section style="font-size:16px;line-height:1.8;color:#222;overflow-wrap:break-word;">${doc.body.innerHTML}</section>`;
+  html = `<section style="font-family:${ARTICLE_FONT};font-size:15px;line-height:1.8;color:#222;text-align:left;overflow-wrap:break-word;">${doc.body.innerHTML}</section>`;
   const check = validatePreparedWechatHtml(html);
   if (check.errors.length) throw new Error(check.errors.join('；'));
   const coverPath = path.join(workDir, 'cover.png');

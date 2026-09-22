@@ -37,7 +37,7 @@ export function renderCitations(body, sources) {
     const url = source.url?.replace(/[<>\s\\]/g, c => encodeURIComponent(c)).replace(/&/g, '&amp;');
     return `${i + 1}. ${url ? `[${title}](<${url}>)` : `${title}（用户提供的材料）`}${source.publishedDate ? ` · ${source.publishedDate.slice(0, 10)}` : ''}`;
   });
-  return replaced + (references.length ? '\n\n## 参考来源\n\n' + references.join('\n\n') : '');
+  return replaced + (references.length ? '\n\n## 参考来源\n\n' + references.join('\n') : '');
 }
 const AUDIT_VERSION = 2;
 const FOLLOWUP_SEPARATOR = /\n\n补充指令：\n/;

@@ -127,7 +127,7 @@ test('恢复与校验:占位符替换为图片且通过硬门禁', () => {
   assert.equal(fullDocument.querySelectorAll('img[data-sl-math="true"]').length, protection.equations.length);
   const displaySections = [...fullDocument.querySelectorAll('section[data-sl-math-display="true"]')];
   assert.equal(displaySections.length, 1);
-  assert.ok(displaySections[0].getAttribute('style').includes('text-align:center'));
+  assert.ok(displaySections[0].getAttribute('style').includes('text-align:left'));
   assert.doesNotThrow(() => validateMathRestored(fullHtml, { equations: protection.equations }));
 });
 

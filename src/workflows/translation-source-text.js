@@ -1113,8 +1113,15 @@ export function renderTranslatedDocument(document) {
   ];
   let figureNumber = 0;
   let tableNumber = 0;
+  let previousWasReference = false;
+  let referenceNumber = 0;
   for (const block of document.blocks) {
     const text = restoreFragments(block.translatedText ?? block.text ?? '', block.fragments);
+    if (block.type !== 'reference' && previousWasReference) lines.push('');
+    if (block.type !== 'reference') {
+      previousWasReference = false;
+      referenceNumber = 0;
+    }
     if (block.type === 'heading') {
       if (block.level === 1 && sameLooseText(text, translatedTitle)) continue;
       lines.push(`${'#'.repeat(clamp(block.level || 2, 2, 4))} ${text}`, '');
@@ -1145,7 +1152,10 @@ export function renderTranslatedDocument(document) {
     } else if (block.type === 'code') {
       lines.push(`<pre><code>${escapeHtml(block.text || '')}</code></pre>`, '');
     } else if (block.type === 'reference') {
-      lines.push(`- ${text}`, '');
+      referenceNumber += 1;
+      previousWasReference = true;
+      const reference = String(text).replace(/^\s*(?:\[\s*\d+\s*\]|\d+[.)、])\s+/, '');
+      lines.push(`${referenceNumber}. ${reference}`);
     }
   }
   return `${lines.join('\n').replace(/\n{3,}/g, '\n\n').trimEnd()}\n`;
@@ -3418,7 +3428,7 @@ function restoreFragments(value, fragments = []) {
 }
 
 function captionLine(label, caption) {
-  return `<p style="text-align:center;color:#7b8490;font-size:.78em;line-height:1.55;margin:.35em 0 1.2em">${escapeHtml(label)}：${escapeHtml(caption)}</p>`;
+  return `<p style="font-size:15px;text-align:left;color:#7b8490;line-height:1.8;margin:.35em 0 1.2em">${escapeHtml(label)}：${escapeHtml(caption)}</p>`;
 }
 
 function escapeMarkdownAlt(value) {

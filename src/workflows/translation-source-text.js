@@ -538,7 +538,7 @@ export async function sourceDocumentFromMarkdown({
     blocks.push({ ...block, id: `b${String(++blockIndex).padStart(6, '0')}`, order: blocks.length });
   };
   const flushParagraph = () => {
-    const text = cleanMarkdownText(paragraph.join(' '));
+    const text = cleanMarkdownText(paragraph.join(' '), { omitCitations: !referencesStarted });
     paragraph = [];
     if (text) push({ type: referencesStarted ? 'reference' : 'paragraph', text });
   };
@@ -627,7 +627,7 @@ export async function sourceDocumentFromMarkdown({
           delimiter: list[2].endsWith(')') ? ')' : '.',
         } : {}),
         depth: Math.floor(list[1].length / 2),
-        text: cleanMarkdownText(list[3]),
+        text: cleanMarkdownText(list[3], { omitCitations: !referencesStarted }),
       });
       continue;
     }
@@ -1116,7 +1116,9 @@ export function renderTranslatedDocument(document) {
   let previousWasReference = false;
   let referenceNumber = 0;
   for (const block of document.blocks) {
-    const text = restoreFragments(block.translatedText ?? block.text ?? '', block.fragments);
+    const text = restoreFragments(block.translatedText ?? block.text ?? '', block.fragments, {
+      omitCitations: block.type !== 'reference',
+    });
     if (block.type !== 'reference' && previousWasReference) lines.push('');
     if (block.type !== 'reference') {
       previousWasReference = false;
@@ -1138,11 +1140,11 @@ export function renderTranslatedDocument(document) {
         if (!image.localPath) continue;
         lines.push(`![${escapeMarkdownAlt(image.alt || `原文图 ${figureNumber}`)}](${image.localPath})`, '');
       }
-      const caption = restoreFragments(block.translatedCaption ?? block.caption ?? '', block.captionFragments);
+      const caption = restoreFragments(block.translatedCaption ?? block.caption ?? '', block.captionFragments, { omitCitations: true });
       if (caption) lines.push(captionLine(`图 ${figureNumber}`, caption), '');
     } else if (block.type === 'table') {
       tableNumber += 1;
-      const caption = restoreFragments(block.translatedCaption ?? block.caption ?? '', block.captionFragments);
+      const caption = restoreFragments(block.translatedCaption ?? block.caption ?? '', block.captionFragments, { omitCitations: true });
       if (caption) lines.push(`**表 ${tableNumber}：${caption}**`, '');
       if (block.localPath) {
         lines.push(`![原文表 ${tableNumber}](${block.localPath})`, '');
@@ -1152,9 +1154,11 @@ export function renderTranslatedDocument(document) {
     } else if (block.type === 'code') {
       lines.push(`<pre><code>${escapeHtml(block.text || '')}</code></pre>`, '');
     } else if (block.type === 'reference') {
+      const reference = String(text).replace(/^\s*(?:\[\s*\d{1,3}\s*\]|\d{1,3}[.)、])\s*/, '')
+        .replace(/\s*\n\s*/g, ' ').replace(/[ \t]{2,}/g, ' ').trim();
+      if (!reference) continue;
       referenceNumber += 1;
       previousWasReference = true;
-      const reference = String(text).replace(/^\s*(?:\[\s*\d+\s*\]|\d+[.)、])\s+/, '');
       lines.push(`${referenceNumber}. ${reference}`);
     }
   }
@@ -2909,9 +2913,9 @@ function richTextFromNode(node, documentUrl) {
   clone.querySelectorAll(EXCLUDED_CONTENT_SELECTOR).forEach((child) => child.remove());
   if (node.tagName === 'LI') clone.querySelectorAll('ol,ul').forEach((child) => child.remove());
   const fragments = [];
-  const protect = (value) => {
+  const protect = (value, kind) => {
     const token = `⟦SL_INLINE_${String(fragments.length + 1).padStart(3, '0')}⟧`;
-    fragments.push({ token, value });
+    fragments.push({ token, value, ...(kind ? { kind } : {}) });
     return token;
   };
   for (const math of [...clone.querySelectorAll('math,.MathJax,.katex,.ltx_Math')]) {
@@ -2925,7 +2929,8 @@ function richTextFromNode(node, documentUrl) {
       const resolved = new URL(link.getAttribute('href'), documentUrl);
       if (['http:', 'https:'].includes(resolved.protocol)) value = `[${label || resolved.href}](${resolved.href})`;
     } catch {}
-    link.replaceWith(clone.ownerDocument.createTextNode(protect(value)));
+    link.replaceWith(clone.ownerDocument.createTextNode(protect(value,
+      isReferenceCitationLink(label, link.getAttribute('href')) ? 'citation' : undefined)));
   }
   for (const br of [...clone.querySelectorAll('br')]) br.replaceWith(clone.ownerDocument.createTextNode('\n'));
   return { text: cleanTextPreservingLines(clone.textContent), fragments };
@@ -3448,10 +3453,20 @@ function splitMarkdownTableRow(line) {
   return cells;
 }
 
-function cleanMarkdownText(value) {
+function isReferenceCitationLink(label, href) {
+  if (!/^(?:\[\s*\d+\s*\]|【\s*\d+\s*】|\(\s*\d+\s*\)|（\s*\d+\s*）|\d+)$/u.test(String(label || '').trim())) return false;
+  let fragment;
+  try { fragment = decodeURIComponent(new URL(String(href || ''), 'https://source.invalid/').hash.slice(1)); }
+  catch { return false; }
+  return /^(?:fn|footnote|bib|ref|cite|citation|b)[._:-]?(?:bib)?\d+(?:[._:-].*)?$/i.test(fragment);
+}
+
+function cleanMarkdownText(value, { omitCitations = true } = {}) {
   return cleanText(String(value || '')
     .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
-    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/\[(\[\s*\d+\s*\]|【\s*\d+\s*】|\(\s*\d+\s*\)|（\s*\d+\s*）)\]\(([^)]*)\)/gu,
+      (_, label, href) => omitCitations && isReferenceCitationLink(label, href) ? '' : label)
+    .replace(/\[([^\]]+)\]\(([^)]*)\)/g, (_, label, href) => omitCitations && isReferenceCitationLink(label, href) ? '' : label)
     .replace(/[*_~`]/g, '')
     .replace(/<[^>]+>/g, ' '));
 }
@@ -3472,9 +3487,14 @@ function normalizeTranslatedTitle(value) {
     .trim();
 }
 
-function restoreFragments(value, fragments = []) {
+function restoreFragments(value, fragments = [], { omitCitations = false } = {}) {
   let text = String(value || '');
-  for (const fragment of fragments || []) text = text.replaceAll(fragment.token, fragment.value);
+  for (const fragment of fragments || []) {
+    text = text.replaceAll(fragment.token, omitCitations && fragment.kind === 'citation' ? '' : fragment.value);
+  }
+  if (omitCitations && fragments?.some(fragment => fragment.kind === 'citation')) {
+    text = text.replace(/[ \t]+(?=[，。；、,.!?！？;:：])/g, '').replace(/[ \t]{2,}/g, ' ').trim();
+  }
   return text;
 }
 

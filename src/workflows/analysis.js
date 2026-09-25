@@ -26,15 +26,26 @@ export function renderCitations(body, sources, sourceIds = []) {
   const byId = new Map(sources.map(s => [s.id, s]));
   const used = [];
   const removedMarker = '\uE000';
-  const replaced = body.replace(/(?:\[(S?\d+)\]|【(S?\d+)】)(?!\()/g, (_, bracketId, cornerId) => {
-    const rawId = bracketId || cornerId;
+  const removeCitation = rawId => {
     const id = rawId.startsWith('S') ? rawId : `S${rawId}`;
     if (!byId.has(id)) throw new Error(`文章引用了不存在的来源 ${id}`);
     if (!used.includes(id)) used.push(id);
     return removedMarker;
-  }).replace(/[ \t]*\uE000(?:[ \t]*\uE000)*[ \t]*(?=[，。；、,.!?！？;:：])/g, '')
+  };
+  const replaced = body.replace(/(?:\[(S?\d+)\]|【(S?\d+)】)(?!\()/g,
+    (_, bracketId, cornerId) => removeCitation(bracketId || cornerId))
+    .replace(/[（(]\s*(S?\d+)\s*[）)]/g, (marker, rawId, offset, text) => {
+      if (rawId.startsWith('S')) return removeCitation(rawId);
+      const id = `S${rawId}`;
+      if (!byId.has(id)) return marker;
+      const before = text.slice(0, offset).trimEnd().at(-1) || '';
+      const after = text.slice(offset + marker.length).trimStart().at(0) || '';
+      return /[。！？.!?]/.test(before) || !after || /[，。；、,.!?！？;:：]/.test(after)
+        ? removeCitation(rawId) : marker;
+    })
+    .replace(/[ \t]*\uE000(?:[ \t]*\uE000)*[ \t]*(?=[，。；、,.!?！？;:：])/g, '')
     .replace(/[ \t]*\uE000(?:[ \t]*\uE000)*/g, '');
-  if (/\[S[^\]]*\]|【S[^】]*】/.test(replaced)) throw new Error('文章含有无效来源标记');
+  if (/\[S[^\]]*\]|【S[^】]*】|[（(]\s*S\d+\s*[）)]/.test(replaced)) throw new Error('文章含有无效来源标记');
   if (!used.length) {
     for (const id of sourceIds.length ? sourceIds : sources.map(s => s.id)) {
       if (!byId.has(id)) throw new Error(`文章引用了不存在的来源 ${id}`);
@@ -189,7 +200,7 @@ exclusiveSources 仅在用户明确禁止扩展搜索时为 true。按原始要�
       prompt: `原始要求：${run.input}\n写作约定：${JSON.stringify(trace.plan)}\n证据：${evidence}\n${previousArticle ? `上一修订成稿（供按补充指令修改，原文事实仍需由本次证据核对）：\n${previousArticle}` : ''}\n
 返回 JSON {"title":"64 字内标题","body":"完整 Markdown 正文","sourceIds":["正文实际使用的来源 ID，如 S1"]}。
 不重复正文标题，不写 frontmatter，不生成图片、不添加未提供的链接。可使用用户材料 assets 中的原图路径。
-正文不要写 [S1]、[1]、【1】等任何引用标记，也不要自行写来源列表。通过 sourceIds 列出实际使用的证据来源；证据不足就缩小结论，不捏造。材料链接不是自动直译要求。`,
+正文不要写 [S1]、[1]、【1】、（1）等任何引用标记，也不要自行写来源列表。通过 sourceIds 列出实际使用的证据来源；证据不足就缩小结论，不捏造。材料链接不是自动直译要求。`,
       validate: d => typeof d.title === 'string' && d.title.trim() && d.title.length <= 64 && typeof d.body === 'string'
         && d.body.trim().length > 20 && !/SL_INLINE_\d|\[object Object\]/.test(d.body)
         && (d.sourceIds === undefined || (Array.isArray(d.sourceIds) && d.sourceIds.every(id => typeof id === 'string'))),

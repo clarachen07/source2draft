@@ -695,11 +695,36 @@ test('直译参考文献合并为一个连续的有序列表并去除原始重�
     sourceUrl: 'https://example.com/paper', title: 'Paper', blocks: [
       { type: 'heading', level: 2, text: '参考文献' },
       { type: 'reference', text: '1. First source' },
-      { type: 'reference', text: '[2] Second source' },
+      { type: 'reference', text: '[2]Second source\nJournal 3: 1-61.' },
     ],
   });
-  assert.match(article, /## 参考文献\n\n1\. First source\n2\. Second source/);
+  assert.match(article, /## 参考文献\n\n1\. First source\n2\. Second source Journal 3: 1-61\./);
   assert.doesNotMatch(article, /1\. 1\.|2\. \[2\]/);
+});
+
+test('直译只移除指向脚注的数字引用，保留正文交叉编号与普通链接', async () => {
+  const source = await sourceDocumentFromHtml({
+    sourceUrl: 'https://example.com/paper',
+    html: `<main><h1>Symbol systems</h1><p>${'A symbol system has several properties. '.repeat(5)}
+      <a href="#FN1">[1]</a> Other phenomena can differ<a href="#footnote-2">（2）</a>.
+      Compositeness (7) and systematicity (8) matter; read <a href="/details">details</a>.</p>
+      <h2>References</h2><p>Author (1980). Study.</p></main>`,
+  });
+  const paragraph = source.blocks.find(block => block.type === 'paragraph' && block.fragments?.length);
+  assert.deepEqual(paragraph.fragments.map(fragment => fragment.kind), ['citation', 'citation', undefined]);
+  paragraph.translatedText = paragraph.text.replace('Compositeness (7) and systematicity (8)', '复合性（7）和系统性（8）');
+  const article = renderTranslatedDocument(source);
+  assert.doesNotMatch(article, /\[1\]|（2）|#FN1|#footnote-2/);
+  assert.match(article, /复合性（7）和系统性（8）/);
+  assert.match(article, /\[details\]\(https:\/\/example\.com\/details\)/);
+  assert.match(article, /## References\n\n1\. Author \(1980\)/);
+
+  const markdown = await sourceDocumentFromMarkdown({
+    sourceUrl: 'https://example.com/paper.md',
+    markdown: 'Claim [1](#FN1) and [[2]](#FN2) and see [details](https://example.com/details); criterion (7).',
+  });
+  assert.doesNotMatch(renderTranslatedDocument(markdown), /\[1\]|\[2\]|#FN[12]/);
+  assert.match(renderTranslatedDocument(markdown), /criterion \(7\)/);
 });
 
 test('结构化翻译覆盖标题、正文和图表标题，表格正文保留为原文图片', async () => {

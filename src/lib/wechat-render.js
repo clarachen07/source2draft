@@ -57,22 +57,53 @@ export function safeLocalAsset(src, workDir) {
 function referencesHeading(element) {
   return /^(?:references|bibliography|works cited|参考来源|参考文献|引用文献)\s*[:：]?$/i.test(element.textContent.trim());
 }
-function renderReferenceParagraphs(list) {
+function renderNumberedParagraphs(list, { references = false, depth = 0 } = {}) {
   const document = list.ownerDocument;
   const paragraphs = document.createDocumentFragment();
-  for (const [index, item] of [...list.children].entries()) {
-    if (item.tagName !== 'LI') continue;
+  const items = [...list.children].filter(item => item.tagName === 'LI');
+  const reversed = !references && list.hasAttribute('reversed');
+  const parsedStart = Number.parseInt(list.getAttribute('start') || '', 10);
+  const populatedItems = items.filter(item => item.textContent.trim() || item.querySelector('img,ol,ul')).length;
+  let number = references ? 1 : Number.isInteger(parsedStart) ? parsedStart : reversed ? populatedItems : 1;
+  for (const item of items) {
+    const explicit = Number.parseInt(item.getAttribute('value') || '', 10);
+    if (!references && Number.isInteger(explicit)) number = explicit;
     const paragraph = document.createElement('p');
-    paragraph.setAttribute('style', `${STYLES.p}margin:.35em 0;`);
-    paragraph.append(`${index + 1}. `);
-    for (const child of [...item.childNodes]) {
+    paragraph.setAttribute('style', `${STYLES.p}margin:.35em 0;${depth ? `padding-left:${depth * 1.5}em;` : ''}`);
+    paragraph.append(`${number}. `);
+    const nested = [];
+    let hasContent = false;
+    const children = [...item.childNodes];
+    for (const [index, child] of children.entries()) {
+      if (child.nodeType === 1 && ['OL', 'UL'].includes(child.tagName)) {
+        nested.push(child);
+        continue;
+      }
+      if (child.nodeType === 3 && !child.textContent.trim()) {
+        const next = children.slice(index + 1).find(node => node.nodeType !== 3 || node.textContent.trim());
+        if (hasContent && next && !(next.nodeType === 1 && ['OL', 'UL', 'P'].includes(next.tagName))) paragraph.append(' ');
+        continue;
+      }
+      if (child.nodeType === 1 && !child.textContent.trim() && !child.matches('img') && !child.querySelector('img')) continue;
       if (child.nodeType === 1 && child.tagName === 'P') {
+        if (!child.textContent.trim() && !child.querySelector('img')) continue;
+        if (hasContent) paragraph.appendChild(document.createElement('br'));
+        if (!hasContent && child.firstChild?.nodeType === 3) child.firstChild.textContent = child.firstChild.textContent.trimStart();
         while (child.firstChild) paragraph.appendChild(child.firstChild);
-      } else paragraph.appendChild(child);
+      } else {
+        if (!hasContent && child.nodeType === 3) child.textContent = child.textContent.trimStart();
+        paragraph.appendChild(child);
+      }
+      hasContent = true;
     }
-    paragraphs.appendChild(paragraph);
+    if (hasContent) paragraphs.appendChild(paragraph);
+    for (const child of nested) {
+      if (child.tagName === 'OL') paragraphs.appendChild(renderNumberedParagraphs(child, { depth: depth + 1 }));
+      else paragraphs.appendChild(child);
+    }
+    if (hasContent || nested.length) number += reversed ? -1 : 1;
   }
-  list.replaceWith(paragraphs);
+  return paragraphs;
 }
 // Apply typography only after the Markdown DOM exists. This makes research and
 // faithful-translation output share one presentation contract. Fixed numbers in
@@ -89,7 +120,10 @@ export function applyWechatArticleStyles(body) {
     if (!referencesHeading(heading)) continue;
     const list = heading.nextElementSibling;
     if (!list || !['OL', 'UL'].includes(list.tagName)) continue;
-    renderReferenceParagraphs(list);
+    list.replaceWith(renderNumberedParagraphs(list, { references: true }));
+  }
+  for (const list of [...body.querySelectorAll('ol')]) {
+    if (list.isConnected) list.replaceWith(renderNumberedParagraphs(list));
   }
 }
 export async function prepareArticle({ markdown, workDir, config, signal, cover, onTelemetry }) {
@@ -109,7 +143,10 @@ export async function prepareArticle({ markdown, workDir, config, signal, cover,
     if (!ALLOWED.has(el.tagName.toLowerCase())) throw new Error(`不支持的 HTML 元素 ${el.tagName}`);
     for (const attr of [...el.attributes]) {
       if (/^on/i.test(attr.name)) throw new Error('正文含事件处理属性');
-      if (!['href', 'src', 'alt', 'style', 'colspan', 'rowspan'].includes(attr.name) && !attr.name.startsWith('data-sl-math')) el.removeAttribute(attr.name);
+      const listNumbering = (el.tagName === 'OL' && ['start', 'reversed'].includes(attr.name))
+        || (el.tagName === 'LI' && attr.name === 'value');
+      if (!['href', 'src', 'alt', 'style', 'colspan', 'rowspan'].includes(attr.name)
+        && !listNumbering && !attr.name.startsWith('data-sl-math')) el.removeAttribute(attr.name);
     }
   }
   applyWechatArticleStyles(doc.body);

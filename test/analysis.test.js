@@ -117,6 +117,18 @@ test('writer can omit inline citations and select the sources listed at the end'
   assert.doesNotMatch(body, /Unused source|\[S2\]|【2】/);
 });
 
+test('source markers in parentheses are removed without erasing meaningful numbered references', () => {
+  const sources = [1, 2, 7, 8].map(number => ({
+    id: `S${number}`, title: `Source ${number}`, url: `https://example.org/${number}`,
+  }));
+  const body = renderCitations('研究结果（1）。另一结论。 （2）复合性（7）和系统性（8）仍重要；定义：(1) 第一项。', sources);
+  const prose = body.split('## 参考来源')[0];
+  assert.equal(prose.trim(), '研究结果。另一结论。复合性（7）和系统性（8）仍重要；定义：(1) 第一项。');
+  assert.match(body, /1\. \[Source 1\]/);
+  assert.match(body, /2\. \[Source 2\]/);
+  assert.doesNotMatch(body, /Source 7|Source 8/);
+});
+
 test('link validation matches rendered Markdown, reference links, escaped URLs and HTML entities', () => {
   const sources = [{ url: 'https://example.org/a(qat)?x=1&y=2' }];
   for (const body of [

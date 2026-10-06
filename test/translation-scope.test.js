@@ -22,8 +22,9 @@ test('识别中文和英文页码范围并转换为 Datalab 的零基页码', ()
   assert.equal(datalabPageRange(single), '6');
 });
 
-test('识别单章节和章节区间，未指定范围时返回全文', () => {
-  assert.deepEqual(parseTranslationScope('直译 https://example.com/a'), { kind: 'all', requestedText: '' });
+test('识别单章节和章节区间，未指定范围时自动判断文档类型', () => {
+  assert.deepEqual(parseTranslationScope('直译 https://example.com/a'), { kind: 'auto', requestedText: '' });
+  assert.equal(parseTranslationScope('翻译全文 https://example.com/a').kind, 'all');
   assert.deepEqual(parseTranslationScope('只翻译第3.2节 https://example.com/a'), {
     kind: 'sections',
     start: '3.2',
@@ -125,4 +126,88 @@ test('缺失数字章节不得回退到第一标题，空标题不参加模糊�
   assert.throws(() => applyTranslationScope(document, parseTranslationScope('翻译第9节')), /未找到指定翻译章节.*9/);
   assert.throws(() => applyTranslationScope(document, { kind: 'sections', start: '9 Introduction', end: '9 Introduction' }), /未找到指定翻译章节/);
   assert.throws(() => applyTranslationScope(document, { kind: 'sections', start: 'Methods', end: 'Methods' }), /未找到指定翻译章节/);
+});
+
+test('参考文献之前优先识别，线程更正继承范围且明确全文可覆盖', () => {
+  const original = '翻译参考文献之前 https://arxiv.org/html/2512.25060v1';
+  assert.equal(parseTranslationScope(original).kind, 'paper-main');
+  assert.equal(parseTranslationScope(`${original}\n\n补充指令：\nreference`).kind, 'paper-main');
+  assert.equal(parseTranslationScope(`${original}\n\n补充指令：\n翻译范围 参考文献之前`).kind, 'paper-main');
+  assert.equal(parseTranslationScope(`${original}\n\n补充指令：\n改为全文`).kind, 'all');
+  assert.equal(parseTranslationScope(`${original}\n\n补充指令：\n只翻译第2节`).start, '2');
+  assert.equal(parseTranslationScope('翻译范围：参考文献之前').kind, 'paper-main');
+  assert.equal(scopeLabel(parseTranslationScope(original)), '论文正文翻译、参考文献原文保留，文献之后停止');
+});
+
+function paperBlocks() {
+  return [
+    { id: 'title', type: 'heading', level: 1, text: 'Paper' },
+    { id: 'abstract', type: 'heading', level: 2, text: 'Abstract' },
+    { id: 'introduction', type: 'heading', level: 2, text: '1 Introduction' },
+    { id: 'conclusion', type: 'heading', level: 2, text: '7 Discussion, Limitations, and Conclusion' },
+    { id: 'body', type: 'paragraph', text: 'Main content.' },
+    { id: 'references', type: 'heading', level: 2, text: '8 References' },
+    { id: 'ref1', type: 'paragraph', text: 'Smith. A paper.' },
+    { id: 'ref2', type: 'list_item', text: 'Jones. Another paper.' },
+    ...'ABCDEFGH'.split('').flatMap(letter => [
+      { id: `appendix${letter}`, type: 'heading', level: 2, text: `${letter} Appendix` },
+      { id: `appendixBody${letter}`, type: 'paragraph', text: `${letter} Appendix body.` },
+    ]),
+  ].map((block, order) => ({ ...block, order }));
+}
+
+test('论文自动保留全部文献并排除 A–H 附录，普通网页保持全文', () => {
+  const original = { blocks: paperBlocks(), sourceUrl: 'https://example.com/document' };
+  const paper = applyTranslationScope(original, { kind: 'auto' });
+  assert.equal(paper.scope.kind, 'paper-main');
+  assert.equal(paper.scope.referenceStartBlockId, 'references');
+  assert.equal(paper.scope.referenceEndBlockId, 'ref2');
+  assert.deepEqual(paper.blocks.slice(-3).map(b => b.translationPolicy), Array(3).fill('preserve-original'));
+  assert.equal(paper.blocks.at(-1).id, 'ref2');
+  assert.equal(original.blocks.find(b => b.id === 'ref1').type, 'paragraph', '不修改原始文档');
+  assert.ok(original.blocks.some(b => b.id === 'appendixH'));
+
+  const web = applyTranslationScope({ blocks: paperBlocks().filter(b => b.id !== 'abstract') }, { kind: 'auto' });
+  assert.equal(web.scope.kind, 'all');
+  assert.equal(web.scope.paperDetected, false);
+  assert.ok(web.blocks.some(b => b.id === 'appendixH'));
+});
+
+test('论文来源或元数据可独立识别，缺失文献边界时全文回退', () => {
+  for (const extra of [
+    { sourceUrl: 'https://arxiv.org/html/2512.25060v1' },
+    { academicMetadata: true },
+  ]) {
+    const doc = applyTranslationScope({ ...extra, blocks: paperBlocks().slice(0, 5) }, { kind: 'auto' });
+    assert.equal(doc.scope.kind, 'all');
+    assert.equal(doc.scope.paperDetected, true);
+    assert.equal(doc.scope.referenceBoundaryMissing, true);
+    assert.equal(doc.blocks.length, 5);
+  }
+  const pdf = applyTranslationScope({ sourceType: 'pdf', blocks: paperBlocks().slice(2) }, { kind: 'auto' });
+  assert.equal(pdf.scope.paperDetected, false, 'PDF 格式本身不意味着论文');
+});
+
+test('文献容器优先于标题层级，正文标题和后续附录不标为文献', () => {
+  const blocks = paperBlocks();
+  const refIndex = blocks.findIndex(b => b.id === 'references');
+  blocks.splice(refIndex + 2, 0, { id: 'bibSubheading', type: 'heading', level: 2, text: 'Sources' });
+  for (const block of blocks.slice(refIndex, refIndex + 4)) block.bibliographyId = 'bib1';
+  const doc = applyTranslationScope({ blocks }, { kind: 'paper-main' });
+  assert.equal(doc.blocks.at(-1).id, 'ref2');
+  assert.equal(doc.blocks.find(b => b.id === 'bibSubheading').translationPolicy, 'preserve-original');
+
+  const full = applyTranslationScope({ blocks }, { kind: 'all' });
+  assert.equal(full.blocks.find(b => b.id === 'appendixBodyA').type, 'paragraph');
+  assert.equal(full.blocks.find(b => b.id === 'appendixA').translationPolicy, undefined);
+});
+
+test('明确全文和章节覆盖论文默认，中文文献章节匹配英文编号标题', () => {
+  const document = { blocks: paperBlocks(), sourceUrl: 'https://arxiv.org/html/2512.25060v1' };
+  const full = applyTranslationScope(document, parseTranslationScope('翻译全文'));
+  assert.ok(full.blocks.some(b => b.id === 'appendixH'));
+  const section = applyTranslationScope(document, parseTranslationScope('只翻译第7节'));
+  assert.deepEqual(section.blocks.map(b => b.id), ['conclusion', 'body']);
+  const references = applyTranslationScope(document, parseTranslationScope('翻译参考文献'));
+  assert.deepEqual(references.blocks.map(b => b.id), ['references', 'ref1', 'ref2']);
 });

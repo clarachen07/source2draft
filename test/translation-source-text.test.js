@@ -656,6 +656,176 @@ test('章节范围先裁剪结构再下载该范围内的图片', async () => {
   assert.equal(document.scope.appliedStartHeading, 'Results');
 });
 
+function paperHtml({ metadata = '', abstract = true, bibliography = true, container = true, appendixAssets = false } = {}) {
+  const references = bibliography ? `<h2>8 References</h2><ol>
+    <li>REFERENCE_ORIGINAL_ALPHA <a href="https://example.com/source_a">Source A</a>.</li>
+    <li>REFERENCE_ORIGINAL_BETA <a href="https://example.com/source_b">Source B</a>.</li></ol>` : '';
+  return `<html><head><title>Paper fixture</title>${metadata}</head><body><article>
+    <h1>Paper fixture</h1>${abstract ? '<h2>Abstract</h2>' : ''}
+    <p>${'An abstract describes the question, method and main contribution. '.repeat(5)}</p>
+    <h2>1 Introduction</h2><p>${'The main text explains representations and experiments. '.repeat(8)}</p>
+    <h2>7 Discussion, Limitations, and Conclusion</h2><p>Conclusion of the main text.</p>
+    ${container && bibliography ? `<section role="doc-bibliography">${references}</section>` : references}
+    ${'ABCDEFGH'.split('').map(letter => `<h2>${letter} Appendix</h2><p>APPENDIX_${letter}_BODY</p>`).join('')}
+    ${appendixAssets ? '<figure><img src="/appendix.png"><figcaption>Appendix chart</figcaption></figure><table><tr><td>Appendix table</td></tr></table>' : ''}
+    </article></body></html>`;
+}
+
+test('论文默认先裁剪再下载资源，文献不进模型，全文请求正常翻译 A–H 附录', async (t) => {
+  for (const full of [false, true]) {
+    const workDir = tempDir();
+    t.after(() => fs.rmSync(workDir, { recursive: true, force: true }));
+    const sourceUrl = 'https://arxiv.org/html/2512.25060v1';
+    const requests = [], units = [];
+    const artifact = await generateStructuredTranslation({
+      input: `翻译${full ? '全文' : ''} ${sourceUrl}`, sourceUrl,
+      workflow: { workDir, model: 'fixture' }, writer: {},
+      translationConfig: { dnsLookup: PUBLIC_DNS, browserEnabled: false,
+        tableRasterizer: async () => { throw new Error('附录表格不应渲染'); } },
+      fetchFn: async (url) => {
+        requests.push(String(url));
+        assert.equal(String(url), sourceUrl, '没有附录资源请求');
+        return new Response(paperHtml({ appendixAssets: !full }), { headers: { 'content-type': 'text/html' } });
+      },
+      completeArticle: jsonTranslator(payload => units.push(...payload.units)),
+    });
+    assert.deepEqual(requests, [sourceUrl]);
+    assert.equal(units.some(unit => /REFERENCE_ORIGINAL|8 References|Source [AB]/.test(unit.text)), false);
+    assert.match(artifact.article, /## 8 References\n\n1\. REFERENCE_ORIGINAL_ALPHA \[Source A\]\(https:\/\/example.com\/source_a\)\./);
+    assert.match(artifact.article, /2\. REFERENCE_ORIGINAL_BETA \[Source B\]\(https:\/\/example.com\/source_b\)\./);
+    assert.equal(artifact.manifest.scope.kind, full ? 'all' : 'paper-main');
+    assert.equal(artifact.manifest.scope.referencePolicy, 'preserve-original');
+    assert.equal(artifact.completeness.errors.length, 0);
+    if (full) {
+      for (const letter of 'ABCDEFGH') {
+        assert.ok(units.some(unit => unit.text === `APPENDIX_${letter}_BODY`));
+        assert.match(artifact.article, new RegExp(`中文译文：APPENDIX_${letter}_BODY`));
+      }
+    } else {
+      assert.doesNotMatch(artifact.article, /APPENDIX_|Appendix/);
+      assert.match(artifact.article, /7 Discussion, Limitations, and Conclusion/);
+    }
+  }
+});
+
+test('学术元数据和章节结构识别论文，普通网页不因文献标题而被裁剪', async () => {
+  for (const metadata of [
+    '<meta name="citation_title" content="Paper fixture">',
+    '<script type="application/ld+json">{"@graph":[{"@type":["ScholarlyArticle"]}]}</script>',
+  ]) {
+    const source = await sourceDocumentFromHtml({ html: paperHtml({ metadata, abstract: false }), sourceUrl: 'https://example.com/article' });
+    assert.equal(source.scope.kind, 'paper-main');
+    assert.equal(source.academicMetadata, true);
+    assert.doesNotMatch(source.blocks.map(b => b.text).join(' '), /APPENDIX_/);
+  }
+  const structural = await sourceDocumentFromHtml({ html: paperHtml({ container: false }), sourceUrl: 'https://example.com/article' });
+  assert.equal(structural.scope.kind, 'paper-main');
+  const web = await sourceDocumentFromHtml({ html: paperHtml({ abstract: false }), sourceUrl: 'https://example.com/article' });
+  assert.equal(web.scope.kind, 'all');
+  assert.match(web.blocks.map(b => b.text).join(' '), /APPENDIX_H_BODY/);
+});
+
+test('论文没有文献边界时翻译到文末，并通知实际采用的范围', async (t) => {
+  const workDir = tempDir();
+  t.after(() => fs.rmSync(workDir, { recursive: true, force: true }));
+  const notices = [], units = [];
+  const artifact = await generateStructuredTranslation({
+    input: '翻译 https://arxiv.org/html/2512.25060v1', workflow: { workDir, model: 'fixture' }, writer: {},
+    translationConfig: { dnsLookup: PUBLIC_DNS, browserEnabled: false },
+    fetchFn: async () => new Response(paperHtml({ bibliography: false }), { headers: { 'content-type': 'text/html' } }),
+    completeArticle: jsonTranslator(payload => units.push(...payload.units)),
+    onProgress: event => notices.push(event.message),
+  });
+  assert.equal(artifact.manifest.scope.kind, 'all');
+  assert.equal(artifact.manifest.scope.referenceBoundaryMissing, true);
+  assert.ok(notices.some(message => /未能可靠定位参考文献.*翻译到文末/.test(message)));
+  assert.ok(units.some(unit => unit.text === 'APPENDIX_H_BODY'));
+});
+
+test('论文范围在静态检查和浏览器图表截图前排除附录中的嵌入图表', async (t) => {
+  const workDir = tempDir();
+  t.after(() => fs.rmSync(workDir, { recursive: true, force: true }));
+  const frame = '<iframe sandbox title="Appendix chart" data-sl-source-frame="1" srcdoc="&lt;h2&gt;Appendix chart&lt;/h2&gt;"></iframe>';
+  const html = paperHtml().replace('</article>', `${frame}</article>`);
+  const sourceUrl = 'https://arxiv.org/html/2512.25060v1';
+  assert.equal(inspectEmbeddedChartFrames(html, { sourceUrl, scope: { kind: 'auto' } }).detected, 0);
+  assert.equal(inspectEmbeddedChartFrames(html, { sourceUrl, scope: { kind: 'all' } }).detected, 1);
+  const captured = await captureEmbeddedChartFrames({ html, sourceUrl, scope: { kind: 'auto' }, workDir,
+    page: { locator: () => { throw new Error('out-of-scope chart must not be captured'); } } });
+  assert.equal(captured.embeddedCharts.captured, 0);
+  const document = await acquireSourceDocument({ sourceUrl, workDir, scope: { kind: 'auto' },
+    config: { browserEnabled: false }, dnsLookup: PUBLIC_DNS,
+    fetchFn: async () => new Response(html, { headers: { 'content-type': 'text/html' } }) });
+  assert.equal(document.scope.kind, 'paper-main', '附录图表不触发浏览器抓取要求');
+});
+
+test('论文范围快照可恢复，旧版全文快照必须重新获取', async (t) => {
+  const workDir = tempDir();
+  t.after(() => fs.rmSync(workDir, { recursive: true, force: true }));
+  const sourceUrl = 'https://arxiv.org/html/2512.25060v1';
+  let downloads = 0;
+  const args = {
+    input: `翻译 ${sourceUrl}`, workflow: { workDir, model: 'fixture' }, writer: {}, resumeFromCheckpoint: true,
+    translationConfig: { dnsLookup: PUBLIC_DNS, browserEnabled: false },
+    fetchFn: async () => { downloads++; return new Response(paperHtml(), { headers: { 'content-type': 'text/html' } }); },
+    completeArticle: jsonTranslator(),
+  };
+  await generateStructuredTranslation(args);
+  await generateStructuredTranslation({ ...args, completeArticle: () => { throw new Error('current checkpoint should be reused'); } });
+  assert.equal(downloads, 1);
+  const filename = path.join(workDir, 'translation-source-document.json');
+  const snapshot = JSON.parse(fs.readFileSync(filename));
+  snapshot.version = 1;
+  snapshot.document.blocks.push({ id: 'oldAppendix', type: 'paragraph', text: 'OLD_FULL_SNAPSHOT_APPENDIX' });
+  fs.writeFileSync(filename, JSON.stringify(snapshot));
+  const artifact = await generateStructuredTranslation(args);
+  assert.equal(downloads, 2);
+  assert.doesNotMatch(artifact.article, /OLD_FULL_SNAPSHOT_APPENDIX/);
+});
+
+test('整个文献容器保留原文，内部标题、图表标题和列表均跳过翻译', async (t) => {
+  const workDir = tempDir();
+  t.after(() => fs.rmSync(workDir, { recursive: true, force: true }));
+  const source = await sourceDocumentFromHtml({
+    sourceUrl: 'https://arxiv.org/html/2512.25060v1',
+    html: `<article><h1>Paper</h1><p>${'Main content about the research. '.repeat(6)}</p>
+      <section class="ltx_bibliography"><h2>References</h2><h2>Books</h2>
+      <p>ORIGINAL_REFERENCE_PARAGRAPH</p><section role="doc-bibliography"><ul><li>ORIGINAL_REFERENCE_LIST</li></ul></section>
+      <blockquote>ORIGINAL_REFERENCE_QUOTE</blockquote>
+      <figure><img src="/reference.png"><figcaption>ORIGINAL_REFERENCE_FIGURE</figcaption></figure>
+      <table><caption>ORIGINAL_REFERENCE_TABLE</caption><tr><td>Source cell</td></tr></table>
+      </section><h2>A Appendix</h2><p>APPENDIX_BODY</p></article>`,
+  });
+  const units = [];
+  const translated = await translateDocument({ source, workDir, model: 'fixture', writer: {},
+    completeArticle: jsonTranslator(payload => units.push(...payload.units)) });
+  assert.equal(units.some(unit => /ORIGINAL_REFERENCE|References|Books|APPENDIX_BODY/.test(unit.text)), false);
+  const references = source.blocks.filter(block => block.translationPolicy === 'preserve-original');
+  assert.equal(references.length, 7);
+  assert.deepEqual(translated.blocks.filter(block => block.translationPolicy === 'preserve-original'), references);
+  assert.match(renderTranslatedDocument(translated), /ORIGINAL_REFERENCE_FIGURE/);
+});
+
+test('显式全文在文献后恢复正文分类，文献链接保留，原文保留门禁拒绝篡改', async (t) => {
+  const workDir = tempDir();
+  t.after(() => fs.rmSync(workDir, { recursive: true, force: true }));
+  const source = await sourceDocumentFromMarkdown({
+    sourceUrl: 'https://arxiv.org/html/2512.25060v1', scope: { kind: 'all' },
+    markdown: '# Paper\n\n## Abstract\n\nSummary.\n\n## 1 Introduction\n\nMain text.\n\n## 8 Bibliography\n\n1. Smith. [Original paper](https://example.com/paper_a).\n\n## A Appendix\n\nAppendix text.',
+  });
+  assert.equal(source.blocks.at(-1).type, 'paragraph');
+  const requests = [];
+  const translated = await translateDocument({ source, workDir, model: 'fixture', writer: {},
+    completeArticle: jsonTranslator(payload => requests.push(...payload.units)) });
+  assert.ok(requests.some(unit => unit.text === 'Appendix text.'));
+  assert.equal(requests.some(unit => /Smith|Bibliography/.test(unit.text)), false);
+  const article = renderTranslatedDocument(translated);
+  assert.match(article, /Smith\. \[Original paper\]\(https:\/\/example.com\/paper_a\)/);
+  assert.equal(validateTranslationArtifact({ source, translated, article }).errors.length, 0);
+  translated.blocks.find(block => block.type === 'reference').text = 'Changed reference.';
+  assert.ok(validateTranslationArtifact({ source, translated, article }).errors.some(error => /原文参考文献内容发生变化/.test(error)));
+});
+
 test('Markdown/HTML 直译保留有序列表的原始起始值、显式序号和分隔符', async () => {
   const markdown = await sourceDocumentFromMarkdown({
     sourceUrl: 'https://example.com/list.md',

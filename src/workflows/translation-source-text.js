@@ -22,14 +22,15 @@ import { convertPdfWithDatalab } from './datalab-parser.js';
 import {
   applyTranslationScope,
   datalabPageRange,
+  isReferencesHeading,
   parseTranslationScope,
   scopeLabel,
 } from './translation-scope.js';
 
 // Single active translation source: retain document structure and visual assets while replacing only translatable units.
-const DOCUMENT_VERSION = 5;
-const CHECKPOINT_VERSION = 6;
-const SOURCE_SNAPSHOT_VERSION = 1;
+const DOCUMENT_VERSION = 6;
+const CHECKPOINT_VERSION = 7;
+const SOURCE_SNAPSHOT_VERSION = 2;
 const TRANSLATION_BATCH_MAX_CHARS = 8000;
 const TRANSLATION_BATCH_MAX_ITEMS = 24;
 const TRANSLATION_SHORT_UNIT_MAX_ITEMS = 48;
@@ -120,13 +121,19 @@ export async function generateStructuredTranslation({
     });
   }
   emitTelemetry(onTelemetry, { stage: 'source-document', cacheHit: Boolean(cachedSource), count: 1 });
-  let source = acquired.scope?.kind === 'sections' && acquired.scope.appliedStartHeading
-    ? acquired
-    : applyTranslationScope(acquired, scope);
-  source.scope = source.scope || scope;
+  // Every acquisition path resolves the scope before localizing its assets.
+  let source = acquired;
   source = removeRepeatedSourceMetadata(source);
   assertSourceDocumentComplete(source);
   const manifest = buildDocumentManifest(source);
+  await report(onProgress, {
+    stage: 'scope',
+    message: source.scope.referenceBoundaryMissing
+      ? '未能可靠定位参考文献，按要求翻译到文末'
+      : `已确定翻译范围：${scopeLabel(source.scope)}`,
+    completed: 1,
+    total: 1,
+  });
   await report(onProgress, {
     stage: 'structure',
     message: `已提取 ${manifest.blocks} 个结构块：${manifest.headings} 个标题、${manifest.figures} 张图、${manifest.tables} 个表格${manifest.pageCoverage
@@ -242,6 +249,8 @@ export async function acquireSourceDocument({
   config = {},
   documentConfig = {},
   dnsLookup = dns.lookup,
+  // Research readers share this downloader and still require the full source.
+  // Translation supplies its explicit or automatic scope at the entrypoint.
   scope = { kind: 'all' },
   onProgress,
   requestHeaders = {},
@@ -374,7 +383,7 @@ export async function acquireSourceDocument({
       signal,
     });
     document.acquisition = acquisition;
-    const embeddedCharts = inspectEmbeddedChartFrames(html);
+    const embeddedCharts = inspectEmbeddedChartFrames(html, { documentUrl: fetched.finalUrl, sourceUrl, scope });
     const browserReason = embeddedCharts.detected > 0
       ? `静态 HTML 含 ${embeddedCharts.detected} 个需截图的嵌入图表`
       : '静态正文过短或疑似客户端渲染';
@@ -430,13 +439,15 @@ async function acquireWithBrowser({
   acquisition,
   fetchFn,
   fetchWithRetry,
-  scope = { kind: 'all' },
+  scope = { kind: 'auto' },
   signal,
 }) {
   throwIfTaskCancelled(signal);
   acquisition.attempts.push('playwright-structure');
   const rendered = await renderWithBrowser({
     sourceUrl,
+    attributionUrl,
+    scope,
     workDir,
     config,
     limits,
@@ -475,7 +486,7 @@ export async function sourceDocumentFromHtml({
   config = {},
   dnsLookup = dns.lookup,
   assetMap = {},
-  scope = { kind: 'all' },
+  scope = { kind: 'auto' },
   deferAssets = false,
   signal,
 }) {
@@ -490,6 +501,7 @@ export async function sourceDocumentFromHtml({
   const publishedDate = metadata(sourceDocument, [
     'meta[property="article:published_time"]', 'meta[name="date"]', 'time[datetime]',
   ], 'content', 'datetime');
+  const academicMetadata = academicMetadataFromDom(sourceDocument);
 
   discardExcludedContent(sourceDocument);
   const datalabPages = extractor === 'datalab-marker-html'
@@ -519,9 +531,9 @@ export async function sourceDocumentFromHtml({
   discardExcludedContent(bodyDom.window.document);
   const root = bodyDom.window.document.querySelector('main');
   const extractedBlocks = blocksFromDom(root, documentUrl);
-  const scoped = scope.kind === 'sections'
-    ? applyTranslationScope({ blocks: extractedBlocks }, scope)
-    : { blocks: extractedBlocks, scope };
+  const scoped = applyTranslationScope({
+    blocks: extractedBlocks, sourceUrl, documentUrl, academicMetadata,
+  }, scope);
   const blocks = scoped.blocks;
   if (workDir && !deferAssets) {
     await localizeFigureAssets(blocks, {
@@ -550,6 +562,7 @@ export async function sourceDocumentFromHtml({
     rawHashInput: String(html || ''),
   });
   document.scope = scoped.scope || scope;
+  document.academicMetadata = academicMetadata;
   if (datalabPages.length) {
     document.processedPageIds = datalabPages.map((page) => Number(page.getAttribute('data-page-id')));
     document.datalabHtmlTextCharacters = datalabPages
@@ -575,7 +588,7 @@ export async function sourceDocumentFromMarkdown({
   fetchWithRetry,
   config = {},
   dnsLookup = dns.lookup,
-  scope = { kind: 'all' },
+  scope = { kind: 'auto' },
   signal,
 }) {
   const lines = String(markdown || '').replace(/\r/g, '').split('\n');
@@ -585,6 +598,7 @@ export async function sourceDocumentFromMarkdown({
   let inFence = false;
   let fenceLines = [];
   let referencesStarted = false;
+  let referencesLevel = 0;
 
   const push = (block) => {
     const hasContent = block.text?.trim()
@@ -595,7 +609,9 @@ export async function sourceDocumentFromMarkdown({
     blocks.push({ ...block, id: `b${String(++blockIndex).padStart(6, '0')}`, order: blocks.length });
   };
   const flushParagraph = () => {
-    const text = cleanMarkdownText(paragraph.join(' '), { omitCitations: !referencesStarted });
+    const text = cleanMarkdownText(paragraph.join(' '), {
+      omitCitations: !referencesStarted, preserveLinks: referencesStarted,
+    });
     paragraph = [];
     if (text) push({ type: referencesStarted ? 'reference' : 'paragraph', text });
   };
@@ -668,6 +684,9 @@ export async function sourceDocumentFromMarkdown({
       const text = cleanMarkdownText(heading[2]);
       if (isReferencesHeading(text)) {
         referencesStarted = true;
+        referencesLevel = heading[1].length;
+      } else if (referencesStarted && heading[1].length <= referencesLevel) {
+        referencesStarted = false;
       }
       push({ type: 'heading', level: heading[1].length, text });
       continue;
@@ -684,7 +703,7 @@ export async function sourceDocumentFromMarkdown({
           delimiter: list[2].endsWith(')') ? ')' : '.',
         } : {}),
         depth: Math.floor(list[1].length / 2),
-        text: cleanMarkdownText(list[3], { omitCitations: !referencesStarted }),
+        text: cleanMarkdownText(list[3], { omitCitations: !referencesStarted, preserveLinks: referencesStarted }),
       });
       continue;
     }
@@ -699,9 +718,7 @@ export async function sourceDocumentFromMarkdown({
   flushParagraph();
   if (inFence && fenceLines.length) push({ type: 'code', text: fenceLines.join('\n') });
 
-  const scoped = scope.kind === 'sections'
-    ? applyTranslationScope({ blocks }, scope)
-    : { blocks, scope };
+  const scoped = applyTranslationScope({ blocks, sourceUrl }, scope);
   if (workDir) {
     await localizeFigureAssets(scoped.blocks, {
       workDir,
@@ -785,7 +802,8 @@ async function sourceDocumentFromPdf({
     fetchFn,
     config,
     assetMap: converted.images,
-    scope: scope?.kind === 'sections' ? { kind: 'all' } : scope,
+    // Validate full parser/page coverage before applying semantic boundaries.
+    scope: scope?.kind === 'pages' ? scope : { kind: 'all' },
     deferAssets: true,
     signal,
   });
@@ -809,7 +827,6 @@ async function sourceDocumentFromPdf({
     popplerTextCharacters,
   });
   document = applyTranslationScope(document, scope);
-  document.scope = document.scope?.appliedStartHeading ? document.scope : scope;
   await localizeFigureAssets(document.blocks, {
     workDir, fetchFn, config, assetMap: converted.images, signal,
   });
@@ -1183,8 +1200,9 @@ export function renderTranslatedDocument(document) {
   let previousWasReference = false;
   let referenceNumber = 0;
   for (const block of document.blocks) {
-    const text = restoreFragments(block.translatedText ?? block.text ?? '', block.fragments, {
-      omitCitations: block.type !== 'reference',
+    const preserveOriginal = block.translationPolicy === 'preserve-original';
+    const text = restoreFragments((preserveOriginal ? block.text : block.translatedText ?? block.text) ?? '', block.fragments, {
+      omitCitations: !preserveOriginal && block.type !== 'reference',
     });
     if (block.type !== 'reference' && previousWasReference) lines.push('');
     if (block.type !== 'reference') {
@@ -1207,11 +1225,11 @@ export function renderTranslatedDocument(document) {
         if (!image.localPath) continue;
         lines.push(`![${escapeMarkdownAlt(image.alt || `原文图 ${figureNumber}`)}](${image.localPath})`, '');
       }
-      const caption = restoreFragments(block.translatedCaption ?? block.caption ?? '', block.captionFragments, { omitCitations: true });
+      const caption = restoreFragments((preserveOriginal ? block.caption : block.translatedCaption ?? block.caption) ?? '', block.captionFragments, { omitCitations: !preserveOriginal });
       if (caption) lines.push(captionLine(`图 ${figureNumber}`, caption), '');
     } else if (block.type === 'table') {
       tableNumber += 1;
-      const caption = restoreFragments(block.translatedCaption ?? block.caption ?? '', block.captionFragments, { omitCitations: true });
+      const caption = restoreFragments((preserveOriginal ? block.caption : block.translatedCaption ?? block.caption) ?? '', block.captionFragments, { omitCitations: !preserveOriginal });
       if (caption) lines.push(`**表 ${tableNumber}：${caption}**`, '');
       if (block.localPath) {
         lines.push(`![原文表 ${tableNumber}](${block.localPath})`, '');
@@ -1253,6 +1271,12 @@ export function validateTranslationArtifact({ source, translated, article }) {
   if (sourceIds.join('|') !== translatedIds.join('|')) errors.push('结构块 ID 或顺序发生变化');
   if (source.blocks.some((block) => !DOCUMENT_BLOCK_TYPES.has(block.type))) errors.push('原文含未知结构块');
   if (translated.blocks.some((block) => !DOCUMENT_BLOCK_TYPES.has(block.type))) errors.push('译文含未知结构块');
+  const translatedById = new Map(translated.blocks.map(block => [block.id, block]));
+  for (const block of source.blocks.filter(item => item.translationPolicy === 'preserve-original')) {
+    if (JSON.stringify(block) !== JSON.stringify(translatedById.get(block.id))) {
+      errors.push(`原文参考文献内容发生变化:${block.id}`);
+    }
+  }
   for (const unit of translationUnits(source)) {
     const target = translatedUnitText(translated, unit.id);
     const assessment = assessTranslationUnit(unit, target, { afterRepair: true });
@@ -1629,6 +1653,8 @@ async function callFetch(fetchWithRetry, fetchFn, url, options, timeoutMs) {
 
 async function renderWithBrowser({
   sourceUrl,
+  attributionUrl = sourceUrl,
+  scope = { kind: 'all' },
   workDir,
   config,
   limits,
@@ -1697,6 +1723,9 @@ async function renderWithBrowser({
     const captured = await captureEmbeddedChartFrames({
       page,
       html: hydratedHtml,
+      documentUrl: page.url(),
+      sourceUrl: attributionUrl,
+      scope,
       workDir,
       config,
       limits,
@@ -1726,7 +1755,9 @@ async function renderWithBrowser({
   }
 }
 
-export function inspectEmbeddedChartFrames(html, { documentUrl = 'https://example.com/' } = {}) {
+export function inspectEmbeddedChartFrames(html, {
+  documentUrl = 'https://example.com/', sourceUrl = documentUrl, scope = { kind: 'all' },
+} = {}) {
   const dom = new JSDOM(String(html || ''), { url: documentUrl });
   const document = dom.window.document;
   const title = metadata(document, [
@@ -1743,7 +1774,7 @@ export function inspectEmbeddedChartFrames(html, { documentUrl = 'https://exampl
     || richestArticle(articles)
     || document.body;
   const frames = [...(root?.querySelectorAll('iframe') || [])];
-  const candidates = frames
+  let candidates = frames
     .map((frame, index) => {
       const srcdoc = String(frame.getAttribute('srcdoc') || '');
       const src = cleanText(frame.getAttribute('src') || '');
@@ -1757,6 +1788,26 @@ export function inspectEmbeddedChartFrames(html, { documentUrl = 'https://exampl
       };
     })
     .filter(Boolean);
+  if (scope.kind !== 'all' && scope.kind !== 'pages' && candidates.length) {
+    const academicMetadata = academicMetadataFromDom(document);
+    // Model an iframe as the figure it becomes after capture. Scope can then
+    // discard appendix charts before any screenshot or asset-budget accounting.
+    const placeholders = new Map();
+    for (const [index, frame] of frames.entries()) {
+      const marker = frame.getAttribute('data-sl-source-frame') || String(index + 1);
+      if (!candidates.some(candidate => candidate.marker === marker)) continue;
+      const src = `https://embedded-chart.invalid/${encodeURIComponent(marker)}.png`;
+      placeholders.set(src, marker);
+      const figure = document.createElement('figure');
+      const image = document.createElement('img');
+      image.setAttribute('src', src);
+      figure.appendChild(image);
+      frame.replaceWith(figure);
+    }
+    const selected = applyTranslationScope({ blocks: blocksFromDom(root, documentUrl), sourceUrl, documentUrl, academicMetadata }, scope);
+    const selectedMarkers = new Set(selected.blocks.flatMap(block => (block.images || []).map(image => placeholders.get(image.src))));
+    candidates = candidates.filter(candidate => selectedMarkers.has(candidate.marker));
+  }
   return {
     detected: candidates.length,
     excludedExternalFrames: frames.filter((frame) => cleanText(frame.getAttribute('src') || '')).length,
@@ -1770,9 +1821,12 @@ export async function captureEmbeddedChartFrames({
   workDir,
   config = {},
   limits = DEFAULT_LIMITS,
+  documentUrl,
+  sourceUrl,
+  scope,
   signal,
 }) {
-  const inspection = inspectEmbeddedChartFrames(html);
+  const inspection = inspectEmbeddedChartFrames(html, { documentUrl, sourceUrl, scope });
   if (!inspection.detected) {
     return {
       assetMap: {},
@@ -2250,6 +2304,7 @@ function restoreInvariantText(value, tokens) {
 function translationUnits(document) {
   const units = [{ id: 'meta:title', text: document.title || '原文直译', kind: 'title' }];
   for (const block of document.blocks) {
+    if (block.translationPolicy === 'preserve-original') continue;
     if (['heading', 'paragraph', 'quote', 'list_item'].includes(block.type) && block.text?.trim()) {
       units.push({ id: block.id, text: block.text, kind: block.type });
     }
@@ -2793,7 +2848,17 @@ function blocksFromDom(root, documentUrl) {
   if (!root) return [];
   const blocks = [];
   let blockIndex = 0;
-  let referencesStarted = false;
+  const bibliographyIds = new Map();
+  const push = (block, node) => {
+    const selector = '.ltx_bibliography,[role="doc-bibliography"],section.bibliography,section.references';
+    let container = node.closest(selector);
+    for (let parent = container?.parentElement?.closest(selector); parent; parent = parent.parentElement?.closest(selector)) container = parent;
+    if (container) {
+      if (!bibliographyIds.has(container)) bibliographyIds.set(container, `bibliography${bibliographyIds.size + 1}`);
+      block.bibliographyId = bibliographyIds.get(container);
+    }
+    blocks.push(block);
+  };
   const selector = [
     'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'blockquote', 'li',
     'figure', 'table', 'pre', 'img', '.ltx_equationgroup', '.ltx_equation',
@@ -2815,13 +2880,13 @@ function blocksFromDom(root, documentUrl) {
       for (const child of [...residual.querySelectorAll(selector)]) child.remove();
       const region = datalabRegionRichText(residual, documentUrl);
       if (!region.text) continue;
-      blocks.push({
+      push({
         id: `b${String(++blockIndex).padStart(6, '0')}`,
         order: blocks.length,
         type: 'paragraph',
         text: region.text,
         fragments: region.fragments,
-      });
+      }, node);
       continue;
     }
     if (node.matches('img') && node.closest('figure')) continue;
@@ -2839,7 +2904,7 @@ function blocksFromDom(root, documentUrl) {
         blockIndex -= 1;
         continue;
       }
-      blocks.push({ id, order: blocks.length, type: 'figure', ...figure });
+      push({ id, order: blocks.length, type: 'figure', ...figure }, node);
       continue;
     }
     if (node.matches('table')) {
@@ -2848,7 +2913,7 @@ function blocksFromDom(root, documentUrl) {
         blockIndex -= 1;
         continue;
       }
-      blocks.push({ id, order: blocks.length, type: 'table', ...table });
+      push({ id, order: blocks.length, type: 'table', ...table }, node);
       continue;
     }
     if (node.matches('pre')) {
@@ -2857,7 +2922,7 @@ function blocksFromDom(root, documentUrl) {
         blockIndex -= 1;
         continue;
       }
-      blocks.push({ id, order: blocks.length, type: 'code', text: code });
+      push({ id, order: blocks.length, type: 'code', text: code }, node);
       continue;
     }
     if (node.matches('.ltx_equationgroup,.ltx_equation,math[display="block"]')) {
@@ -2866,7 +2931,7 @@ function blocksFromDom(root, documentUrl) {
         blockIndex -= 1;
         continue;
       }
-      blocks.push({ id, order: blocks.length, type: 'equation', tex });
+      push({ id, order: blocks.length, type: 'equation', tex }, node);
       continue;
     }
     if (node.matches('.ltx_bibitem')) {
@@ -2875,7 +2940,7 @@ function blocksFromDom(root, documentUrl) {
         blockIndex -= 1;
         continue;
       }
-      blocks.push({ id, order: blocks.length, type: 'reference', text: rich.text, fragments: rich.fragments });
+      push({ id, order: blocks.length, type: 'reference', translationPolicy: 'preserve-original', text: rich.text, fragments: rich.fragments }, node);
       continue;
     }
 
@@ -2885,10 +2950,7 @@ function blocksFromDom(root, documentUrl) {
       blockIndex -= 1;
       continue;
     }
-    if (/^H[1-6]$/.test(node.tagName) && isReferencesHeading(text)) {
-      referencesStarted = true;
-    }
-    let type = referencesStarted ? 'reference' : 'paragraph';
+    let type = 'paragraph';
     const block = {};
     if (/^H[1-6]$/.test(node.tagName)) {
       type = 'heading';
@@ -2905,14 +2967,14 @@ function blocksFromDom(root, documentUrl) {
       for (let parent = node.parentElement?.closest('li'); parent; parent = parent.parentElement?.closest('li')) depth += 1;
       block.depth = depth;
     }
-    blocks.push({
+    push({
       id,
       order: blocks.length,
       type,
       ...block,
       text,
       fragments: rich.fragments,
-    });
+    }, node);
   }
   return blocks;
 }
@@ -3447,8 +3509,17 @@ function shouldUseBrowser(document, html) {
     && /<(?:script|div)[^>]+id=["'](?:__next|__nuxt|app|root)["']/i.test(html);
 }
 
-function isReferencesHeading(text) {
-  return /^(?:references|bibliography|works cited|参考文献|引用文献)\s*[:：]?$/i.test(cleanText(text));
+function academicMetadataFromDom(document) {
+  return Boolean(document.querySelector('meta[name="citation_title" i],meta[name="citation_doi" i],.ltx_document'))
+    || [...document.querySelectorAll('script[type="application/ld+json"]')].some(node => {
+      try { return containsScholarlyArticle(JSON.parse(node.textContent)); } catch { return false; }
+    });
+}
+
+function containsScholarlyArticle(value) {
+  if (!value || typeof value !== 'object') return false;
+  if ([value['@type']].flat().includes('ScholarlyArticle')) return true;
+  return Object.values(value).some(item => item && typeof item === 'object' && containsScholarlyArticle(item));
 }
 
 function isMarkdownTableStart(lines, index) {
@@ -3486,14 +3557,22 @@ function isReferenceCitationLink(label, href) {
   return /^(?:fn|footnote|bib|ref|cite|citation|b)[._:-]?(?:bib)?\d+(?:[._:-].*)?$/i.test(fragment);
 }
 
-function cleanMarkdownText(value, { omitCitations = true } = {}) {
-  return cleanText(String(value || '')
+function cleanMarkdownText(value, { omitCitations = true, preserveLinks = false } = {}) {
+  const links = [];
+  const protectedValue = preserveLinks
+    ? String(value || '').replace(/(?<!!)\[(?:\[[^\]]*\]|[^\]]*)\]\([^)]+\)/g, link => {
+      links.push(link);
+      return `⟦SLBIBLINK${links.length}⟧`;
+    })
+    : String(value || '');
+  const text = cleanText(protectedValue
     .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
     .replace(/\[(\[\s*\d+\s*\]|【\s*\d+\s*】|\(\s*\d+\s*\)|（\s*\d+\s*）)\]\(([^)]*)\)/gu,
       (_, label, href) => omitCitations && isReferenceCitationLink(label, href) ? '' : label)
     .replace(/\[([^\]]+)\]\(([^)]*)\)/g, (_, label, href) => omitCitations && isReferenceCitationLink(label, href) ? '' : label)
     .replace(/[*_~`]/g, '')
     .replace(/<[^>]+>/g, ' '));
+  return text.replace(/⟦SLBIBLINK(\d+)⟧/g, (token, number) => links[Number(number) - 1] || token);
 }
 
 function sourceAttribution(document) {

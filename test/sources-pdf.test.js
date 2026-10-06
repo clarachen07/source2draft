@@ -133,3 +133,51 @@ test('PDF section selection validates full extraction before cropping and proces
     assert.equal(rasterizations, 0);
   }
 });
+
+test('PDF paper defaults crop after original bibliography only after full page validation; explicit pages/full retain appendix', {
+  skip: hasPoppler ? false : 'PDF integration verification requires Poppler (pdfinfo and pdftotext)',
+}, async (t) => {
+  const sourceUrl = 'https://93.184.216.34/paper.pdf';
+  for (const scope of [{ kind: 'auto' }, { kind: 'all' }, { kind: 'pages', startPage: 1, endPage: 1 }]) {
+    const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'source-pdf-paper-'));
+    t.after(() => fs.rmSync(workDir, { recursive: true, force: true }));
+    const html = `<div class="page" data-page-id="0"><h1>Paper fixture</h1><h2>Abstract</h2>
+      <p>A complete source paragraph for PDF acquisition.</p><h2>1 Introduction</h2>
+      <p>${'Main research content. '.repeat(12)}</p><h2>7 Conclusion</h2><p>Main conclusion.</p>
+      <h2>8 References</h2><p>ORIGINAL_REFERENCE_PDF <a href="https://example.com/source">Original source</a>.</p>
+      <h2>A Appendix</h2><p>${'APPENDIX_PDF_BODY '.repeat(80)}</p>
+      ${scope.kind === 'auto' ? '<figure><img src="appendix.webp"><figcaption>Appendix chart</figcaption></figure><table><tr><td>Appendix table</td></tr></table>' : ''}</div>`;
+    const document = await acquireSourceDocument({
+      sourceUrl, workDir, scope,
+      config: { datalabApiKey: 'fixture-key', browserEnabled: false,
+        imageRasterizer: async () => { throw new Error('excluded appendix image must not be rasterized'); },
+        tableRasterizer: async () => { throw new Error('excluded appendix table must not be rasterized'); },
+      },
+      fetchFn: async (url, options = {}) => {
+        if (url === sourceUrl) return new Response(onePagePdf(), { headers: { 'content-type': 'application/pdf' } });
+        if (url === 'https://www.datalab.to/api/v1/convert') {
+          assert.equal(options.body.get('page_range'), scope.kind === 'pages' ? '0' : null);
+          return Response.json({ success: true, request_id: 'paper-fixture', request_check_url: 'https://www.datalab.to/api/v1/convert/paper-fixture' });
+        }
+        assert.equal(url, 'https://www.datalab.to/api/v1/convert/paper-fixture', 'no appendix asset download');
+        return Response.json({ status: 'complete', success: true, page_count: 1, parse_quality_score: 4.5, html,
+          images: scope.kind === 'auto' ? { 'appendix.webp': Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(4), Buffer.from('WEBPVP8 ')]).toString('base64') } : {} });
+      },
+    });
+    assert.equal(document.sourceType, 'pdf');
+    assert.deepEqual(document.pageCoverage.pagesFound, [1]);
+    assert.ok(document.pageCoverage.extractedCharacters > 1000, 'full coverage is measured before cropping');
+    const reference = document.blocks.find(block => /ORIGINAL_REFERENCE_PDF/.test(block.text || ''));
+    assert.equal(reference.translationPolicy, 'preserve-original');
+    if (scope.kind === 'auto') {
+      assert.equal(document.scope.kind, 'paper-main');
+      assert.equal(document.blocks.at(-1).id, reference.id);
+      assert.equal(document.blocks.some(block => /APPENDIX_PDF_BODY/.test(block.text || '')), false);
+      assert.equal(document.blocks.some(block => ['figure', 'table'].includes(block.type)), false);
+    } else {
+      assert.equal(document.scope.kind, scope.kind);
+      assert.equal(document.blocks.at(-1).type, 'paragraph');
+      assert.match(document.blocks.at(-1).text, /APPENDIX_PDF_BODY/);
+    }
+  }
+});

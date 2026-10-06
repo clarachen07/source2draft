@@ -7,7 +7,7 @@ export function parseTranslationScope(input) {
     const scope = parseInstructionScope(instructions[index], { followup: index > 0 });
     if (scope) return scope;
   }
-  return { kind: 'all', requestedText: '' };
+  return { kind: 'auto', requestedText: '' };
 }
 
 function parseInstructionScope(input, { followup = false } = {}) {
@@ -35,6 +35,11 @@ function parseInstructionScope(input, { followup = false } = {}) {
     /\bpage\s*(\d{1,4})\b/i,
   ]);
   if (singlePage) return pageScope(singlePage[1], singlePage[1], singlePage[0]);
+
+  // This selects body translation plus an unchanged bibliography, not the
+  // bibliography section itself. Match it before the named-section patterns.
+  const beforeReferences = /(?:翻译|直译)\s*(?:范围\s*[:：]?\s*)?[“"'《]?(?:参考文献|引用文献|references?|bibliography)[”"'》]?\s*(?:之前|以前|前)(?:[。.!！]|\s|$)/i.exec(text);
+  if (beforeReferences) return { kind: 'paper-main', requestedText: beforeReferences[0].trim() };
 
   const sectionRange = firstMatch(text, [
     /(?:只\s*)?翻译\s*(?:从\s*)?[“"'《]?([^“”"'《》]{1,80}?)[”"'》]?\s*(?:到|至)\s*[“"'《]?([^“”"'《》]{1,80}?)[”"'》]?(?:\s*(?:章节|部分))?(?:\s|$)/i,
@@ -75,7 +80,36 @@ function parseInstructionScope(input, { followup = false } = {}) {
 }
 
 export function applyTranslationScope(document, scope) {
-  if (!scope || scope.kind === 'all' || scope.kind === 'pages') return document;
+  const annotated = annotateBibliography(document.blocks);
+  const referenceRanges = bibliographyRanges(annotated);
+  const paperDetected = isPaperDocument({ ...document, blocks: annotated }, referenceRanges);
+  scope = scope || { kind: 'auto', requestedText: '' };
+  const requestedKind = scope.kind;
+  if (requestedKind === 'auto') scope = { ...scope, kind: paperDetected ? 'paper-main' : 'all' };
+  const resolvedScope = {
+    ...scope,
+    requestedKind,
+    paperDetected,
+    referencePolicy: 'preserve-original',
+  };
+  document = { ...document, blocks: annotated, scope: resolvedScope };
+  if (scope.kind === 'paper-main') {
+    const boundary = referenceRanges[0];
+    if (!boundary) {
+      return { ...document, scope: { ...resolvedScope, kind: 'all', referenceBoundaryMissing: true } };
+    }
+    return {
+      ...document,
+      blocks: annotated.slice(0, boundary.end).map((block, order) => ({ ...block, order })),
+      scope: {
+        ...resolvedScope,
+        referenceStartBlockId: annotated[boundary.start].id,
+        referenceEndBlockId: annotated[boundary.end - 1].id,
+        appliedEndHeading: annotated[boundary.start].text || '参考文献',
+      },
+    };
+  }
+  if (scope.kind === 'all' || scope.kind === 'pages') return document;
   if (scope.kind !== 'sections') throw new Error(`不支持的翻译范围:${scope.kind}`);
   const headings = document.blocks
     .map((block, index) => ({ block, index }))
@@ -101,7 +135,7 @@ export function applyTranslationScope(document, scope) {
     ...document,
     blocks,
     scope: {
-      ...scope,
+      ...resolvedScope,
       appliedStartHeading: start.block.text,
       appliedEndHeading: end.block.text,
     },
@@ -110,6 +144,8 @@ export function applyTranslationScope(document, scope) {
 
 export function scopeLabel(scope) {
   if (!scope || scope.kind === 'all') return '全文';
+  if (scope.kind === 'auto') return '自动识别：论文正文翻译、参考文献原文保留；普通网页全文';
+  if (scope.kind === 'paper-main') return '论文正文翻译、参考文献原文保留，文献之后停止';
   if (scope.kind === 'pages') {
     return scope.startPage === scope.endPage
       ? `第 ${scope.startPage} 页`
@@ -146,6 +182,9 @@ function findHeading(headings, target, afterIndex = -1) {
     return candidates.find(({ block }) => sectionNumber(block.text) === wantedNumber);
   }
   if (!wanted) return undefined;
+  if (isReferencesHeading(target)) {
+    return candidates.find(({ block }) => isReferencesHeading(block.text));
+  }
   return candidates.find(({ block }) => {
     const actual = normalizeHeading(block.text);
     return actual && (actual === wanted || actual.includes(wanted) || wanted.includes(actual));
@@ -166,6 +205,71 @@ function normalizeHeading(value) {
     .toLowerCase()
     .replace(/^\s*(?:第\s*)?(?:[a-z]|\d+(?:\.\d+)*)(?:\s*[章节.:：-]|\s+|$)/i, '')
     .replace(/[^\p{L}\p{N}]+/gu, '');
+}
+
+export function isReferencesHeading(value) {
+  return /^(?:references?|bibliography|works\s+cited|参考文献|引用文献)$/i.test(
+    String(value || '').trim()
+      .replace(/^(?:(?:第\s*)?\d+(?:\.\d+)*(?:\s*[章节.:：、-]\s*|\s+)|[A-Z](?:[.:：]\s*|\s+))/i, '')
+      .replace(/[.:：。\s]+$/, ''),
+  );
+}
+
+// Container membership survives HTML extraction, so the same boundary logic
+// also works for heading-only PDF and Markdown extraction.
+function bibliographyRanges(blocks) {
+  const ranges = [];
+  for (let index = 0; index < blocks.length; index++) {
+    const block = blocks[index];
+    if (block.bibliographyId) {
+      let end = index + 1;
+      while (end < blocks.length && blocks[end].bibliographyId === block.bibliographyId) end++;
+      ranges.push({ start: index, end });
+      index = end - 1;
+    } else if (block.type === 'heading' && isReferencesHeading(block.text)) {
+      const container = blocks[index + 1]?.bibliographyId;
+      let end = index + 1;
+      if (container) {
+        while (end < blocks.length && blocks[end].bibliographyId === container) end++;
+      } else {
+        while (end < blocks.length) {
+          const candidate = blocks[end];
+          if (candidate.type === 'heading' && Number(candidate.level || 2) <= Number(block.level || 2)) break;
+          end++;
+        }
+      }
+      ranges.push({ start: index, end });
+      index = end - 1;
+    }
+  }
+  return ranges;
+}
+
+function annotateBibliography(blocks) {
+  const result = blocks.map(block => ({ ...block }));
+  for (const { start, end } of bibliographyRanges(result)) {
+    for (let index = start; index < end; index++) {
+      const block = result[index];
+      block.translationPolicy = 'preserve-original';
+      if (['paragraph', 'list_item'].includes(block.type)) block.type = 'reference';
+    }
+  }
+  return result;
+}
+
+function isPaperDocument(document, referenceRanges) {
+  for (const address of [document.sourceUrl, document.documentUrl]) {
+    try {
+      const url = new URL(address);
+      if (['arxiv.org', 'www.arxiv.org', 'alphaxiv.org', 'www.alphaxiv.org'].includes(url.hostname.toLowerCase())
+        && /^\/(?:abs|pdf|html)\/\d{4}\.\d{4,5}(?:v\d+)?(?:\.pdf)?(?:\/|$)/i.test(url.pathname)) return true;
+    } catch { /* Not a known paper URL. */ }
+  }
+  if (document.academicMetadata) return true;
+  const headings = document.blocks.filter(block => block.type === 'heading');
+  return referenceRanges.length > 0
+    && headings.some(block => /^(?:abstract|摘要)$/i.test(normalizeHeading(block.text)))
+    && headings.some(block => /^\s*(?:第\s*)?\d+(?:\.\d+)*(?:\s*[章节.:：、-]|\s+)\s*\S/.test(block.text));
 }
 
 function cleanSectionTarget(value) {

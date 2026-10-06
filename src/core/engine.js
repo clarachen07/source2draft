@@ -10,6 +10,9 @@ import { prepareArticle } from '../lib/wechat-render.js';
 import { createWechat } from '../channels/wechat.js';
 import { redact } from '../config/index.js';
 import { createTelemetry, measureStage } from '../lib/telemetry.js';
+import { withRuntimeResource } from '../config/runtime.js';
+import { prepareModelRecovery } from './model-recovery.js';
+import { modelIdentity } from './model-identity.js';
 
 export function routeMode(input) {
   for (const instruction of input.split(/\n\n补充指令：\n/).reverse()) {
@@ -90,29 +93,59 @@ export function findPreviousArticle(run, store, workDirFor) {
   }
   return '';
 }
-export function createEngine({ config, store, modelFactory = createModel, wechat = createWechat(config), prepare = prepareArticle }) {
-  let active = null, stopped = false, ticking = false;
+export function createEngine({ config, store, modelFactory = createModel, wechat = createWechat(config), prepare = prepareArticle,
+  dailyResearch = async args => (await import('../workflows/daily-research.js')).runDailyResearch(args) }) {
+  const activeRuns = new Map();
+  let stopped = false, scheduling = false;
+  const laneFor = run => run.profile === 'llm-quant-daily' ? 'daily' : 'manual';
   const workDirFor = id => path.join(config.dataDir, 'runs', id);
   function progress(run, text) {
     const current = store.get(run.id);
     if (!['running', 'publishing'].includes(current?.status)) return;
     store.notice(run, `progress:${text}`, text);
   }
-  async function execute(run) {
-    const controller = new AbortController();
-    const timeout = AbortSignal.timeout(config.taskTimeout);
+  async function processRun(initialRun, controller) {
+    let run = initialRun;
+    const timeout = AbortSignal.timeout(run.profile === 'llm-quant-daily'
+      ? (config.daily?.taskTimeout || 3600000) : config.taskTimeout);
     const signal = AbortSignal.any([controller.signal, timeout]);
-    active = { id: run.id, controller };
     const workDir = workDirFor(run.id);
-    fs.mkdirSync(workDir, { recursive: true, mode: 0o700 });
     const onTelemetry = createTelemetry(workDir), started = performance.now();
+    function complete(result, title, warnings = []) {
+      const preview = path.join(workDir, 'preview.html');
+      store.complete(run.id, { result: JSON.stringify(result), title, ...(result.mediaId ? { media_id: result.mediaId } : {}) },
+        `${run.dry_run ? '模拟完成（未上传公众号）' : '公众号草稿已创建并核对'}：${title}\n修订 ${run.revision} · 任务 ${run.id}${result.mediaId ? `\nmedia_id：${result.mediaId}` : ''}${fs.existsSync(preview) ? `\n本机预览：${preview}` : ''}${warnings.length ? `\n待复核：${warnings.slice(0, 5).join('；')}` : ''}`);
+    }
     try {
+      const current = store.get(run.id);
+      if (!current || ['cancelled', 'superseded', 'done'].includes(current.status)) return;
+      run = current;
+      const operation = store.operation(run.id);
+      if (operation && operation.state !== 'rejected') {
+        // Once dispatched, the persisted operation is sufficient for readback;
+        // missing or damaged generation caches must not block recovery.
+        store.update(run.id, { status: 'publishing' });
+        progress(run, '正在回读核对已有公众号草稿');
+        const result = await measureStage(onTelemetry, 'wechat', () => wechat.publish({ run, store, workDir, signal, onTelemetry }));
+        let warnings;
+        try { warnings = readJson(path.join(workDir, 'artifact.json'))?.warnings; }
+        catch { /* Optional review notes cannot block a verified remote result. */ }
+        complete(result, result.title || JSON.parse(operation.payload).title, Array.isArray(warnings) ? warnings : []);
+        return;
+      }
+      signal.throwIfAborted();
+      if (run.profile === 'llm-quant-daily') {
+        store.freezeDailyContext(run.id);
+        run = store.get(run.id);
+      }
+      fs.mkdirSync(workDir, { recursive: true, mode: 0o700 });
+      prepareModelRecovery({ workDir, modelConfig: config.model, profile: run.profile });
       const recoveringPublish = run.status === 'publishing';
       if (!recoveringPublish) store.update(run.id, { status: 'running' });
-      const mode = run.mode || routeMode(run.input);
+      const mode = run.profile === 'llm-quant-daily' ? 'analysis' : run.mode || routeMode(run.input);
       store.update(run.id, { mode });
       const events = readJson(path.join(workDir, 'usage.json'), []);
-      const model = modelFactory(config, { onTelemetry,
+      const model = modelFactory(config, { onTelemetry, workDir,
         onUsage: data => { events.push(data); writeAtomic(path.join(workDir, 'usage.json'), events); } });
       let artifact = readJson(path.join(workDir, 'artifact.json'));
       onTelemetry({ stage: 'artifact', cacheHit: Boolean(artifact) });
@@ -121,7 +154,7 @@ export function createEngine({ config, store, modelFactory = createModel, wechat
           const source = chooseTranslationSource(run, config);
           artifact = await measureStage(onTelemetry, 'translation', () => generateStructuredTranslation({ input: run.input, ...source,
             workflow: { workDir, model: config.model.models.translation, timeoutMs: 300000 },
-            writer: { model: config.model.models.translation },
+            writer: { model: config.model.models.translation, modelIdentity: modelIdentity(config.model) },
             fetchFn: withTaskCancellation(globalThis.fetch, signal), fetchWithRetry: fetchRetry,
             completeArticle: args => model.complete({ ...args, role: 'translation', signal }),
             onProgress: event => progress(run, event.message),
@@ -129,6 +162,10 @@ export function createEngine({ config, store, modelFactory = createModel, wechat
             translationConfig: { ...translationConfig(config), onTelemetry }, resumeFromCheckpoint: true, signal,
           }));
           writeAtomic(path.join(workDir, 'research-trace.json'), { prompt: run.input, manifest: artifact.manifest, completeness: artifact.completeness, warnings: artifact.warnings });
+        } else if (run.profile === 'llm-quant-daily') {
+          artifact = await measureStage(onTelemetry, 'daily', () => dailyResearch({ run, config, store, workDir, model, signal,
+            onTelemetry, previousArticle: findPreviousArticle(run, store, workDirFor), progress: text => progress(run, text) }));
+          store.recordDailyEvents(run.id, artifact.eventIds || []);
         } else {
           artifact = await measureStage(onTelemetry, 'analysis', () => runAnalysis({ run, config, workDir, model, signal, onTelemetry,
             previousArticle: findPreviousArticle(run, store, workDirFor), progress: text => progress(run, text) }));
@@ -144,8 +181,8 @@ export function createEngine({ config, store, modelFactory = createModel, wechat
       onTelemetry({ stage: 'prepared', cacheHit: Boolean(prepared) });
       if (!prepared && !recoveringPublish) {
         progress(run, '正在准备朴素排版、原图表和封面');
-        prepared = await measureStage(onTelemetry, 'render', () => prepare({ markdown: artifact.article, workDir, config,
-          signal, onTelemetry, cover: chooseCover(run, config) }));
+        prepared = await measureStage(onTelemetry, 'render', () => withRuntimeResource('render', () => prepare({
+          markdown: artifact.article, workDir, config, signal, onTelemetry, cover: chooseCover(run, config) }), signal));
       }
       if (!prepared) throw new Error('恢复任务缺少排版文件');
       if (!recoveringPublish) signal.throwIfAborted();
@@ -156,9 +193,7 @@ export function createEngine({ config, store, modelFactory = createModel, wechat
         progress(run, '正在上传公众号草稿并回读核对');
         result = await measureStage(onTelemetry, 'wechat', () => wechat.publish({ run, store, prepared, workDir, signal, onTelemetry }));
       }
-      const warnings = artifact.warnings || [];
-      store.complete(run.id, { result: JSON.stringify(result), title, ...(result.mediaId ? { media_id: result.mediaId } : {}) },
-        `${run.dry_run ? '模拟完成（未上传公众号）' : '公众号草稿已创建并核对'}：${title}\n修订 ${run.revision} · 任务 ${run.id}${result.mediaId ? `\nmedia_id：${result.mediaId}` : ''}\n本机预览：${path.join(workDir, 'preview.html')}${warnings.length ? `\n待复核：${warnings.slice(0, 5).join('；')}` : ''}`);
+      complete(result, title, artifact.warnings || []);
     } catch (error) {
       const current = store.get(run.id);
       if (['cancelled', 'superseded'].includes(current?.status)) return;
@@ -168,26 +203,54 @@ export function createEngine({ config, store, modelFactory = createModel, wechat
       const operation = store.operation(run.id);
       const status = error.needsInput ? 'needs_input' : error.needsReview || (operation && operation.state !== 'rejected') ? 'needs_review' : 'failed';
       const message = timeout.aborted ? '任务超过时间上限，已保存已有进度，可在本线程发送“重试”' : redact(error, config);
-      store.update(run.id, { status, error: message });
+      const errorCode = timeout.aborted ? 'TASK_TIMEOUT' : String(error.code || error.cause?.code || 'TASK_FAILED').slice(0, 80);
+      const retryable = run.profile === 'llm-quant-daily' && status === 'failed'
+        && !operation
+        && (error.retryable === true || timeout.aborted
+          || ['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN', 'ENETUNREACH', 'ECONNREFUSED'].includes(errorCode));
+      store.update(run.id, { status, error: message, error_code: errorCode, retryable: Number(retryable) });
       store.notice(run, `${status}:${Date.now()}`, `${status === 'needs_input' ? '需要补充' : status === 'needs_review' ? '需要核对' : '任务失败'}：${message}\n任务 ${run.id}`);
     } finally {
-      onTelemetry({ stage: 'task', durationMs: performance.now() - started, outcome: store.get(run.id)?.status || 'unknown' });
-      active = null;
+      if (fs.existsSync(workDir)) onTelemetry({ stage: 'task', durationMs: performance.now() - started,
+        outcome: store.get(run.id)?.status || 'unknown' });
     }
+  }
+  function execute(run) {
+    if (activeRuns.has(run.id)) return activeRuns.get(run.id).promise;
+    const lane = laneFor(run);
+    if (stopped || [...activeRuns.values()].some(active => active.lane === lane)) return Promise.resolve();
+    // Claim the lane synchronously. A second timer tick cannot dispatch the
+    // same task while its first source or model request is still awaiting.
+    const active = { id: run.id, lane, controller: new AbortController(), promise: null };
+    activeRuns.set(run.id, active);
+    active.promise = Promise.resolve().then(() => processRun(run, active.controller))
+      .finally(() => activeRuns.delete(run.id));
+    return active.promise;
   }
   return {
     workDirFor, execute,
     async tick() {
-      if (stopped || ticking) return;
-      ticking = true;
-      try { const run = store.pending(); if (run) await execute(run); } finally { ticking = false; }
+      if (stopped || scheduling) return;
+      scheduling = true;
+      const started = [];
+      try {
+        for (const lane of ['daily', 'manual']) {
+          if ([...activeRuns.values()].some(active => active.lane === lane)) continue;
+          const run = store.pending(lane);
+          if (run) started.push(execute(run));
+        }
+      } finally { scheduling = false; }
+      await Promise.all(started);
     },
-    abort(id) { if (active?.id === id) active.controller.abort(new Error('任务已取消或由最新修订替换')); },
+    abort(id) { activeRuns.get(id)?.controller.abort(new Error('任务已取消或由最新修订替换')); },
     async stop() {
       stopped = true;
-      if (active && store.get(active.id)?.status !== 'publishing') active.controller.abort(new Error('服务正在停止，任务稍后恢复'));
-      while (active) await new Promise(resolve => setTimeout(resolve, 100));
+      for (const active of activeRuns.values()) {
+        if (store.get(active.id)?.status !== 'publishing') active.controller.abort(new Error('服务正在停止，任务稍后恢复'));
+      }
+      await Promise.allSettled([...activeRuns.values()].map(active => active.promise));
     },
-    get activeId() { return active?.id; },
+    get activeId() { return activeRuns.keys().next().value; },
+    get activeIds() { return [...activeRuns.keys()]; },
   };
 }

@@ -119,6 +119,18 @@ test('citations use actual source IDs and secrets are redacted', () => {
   assert.equal(redact('test-secret access_token=secret', config()), '[REDACTED] access_token=[REDACTED]');
 });
 
+test('redaction preserves Musk and task source URLs but removes token prefixes at credential boundaries', () => {
+  const cfg = config();
+  const sources = '[马斯克](https://example.org/elon-musk-power-shortage-data-centers.htm) https://example.org/task-infrastructure-and-electricity';
+  assert.equal(redact(sources, cfg), sources);
+  for (const token of ['sk-fixture1234567890', 'sk-proj-fixture1234567890', 'sk-ant-fixture1234567890',
+    ...['b', 'a', 'p', 'r', 's'].map(kind => `xox${kind}-fixture1234567890`), 'xapp-fixture1234567890']) {
+    assert.equal(redact(`密钥${token} Bearer ${token} "${token}" https://example.org/${token}/article`, cfg),
+      '密钥[REDACTED] Bearer [REDACTED] "[REDACTED]" https://example.org/[REDACTED]/article');
+  }
+  assert.equal(redact('prefixtest-secretsuffix', cfg), 'prefix[REDACTED]suffix');
+});
+
 test('single instance lock rejects concurrent process ownership', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'shallow-lock-'));
   const release = await acquireInstanceLock(root);

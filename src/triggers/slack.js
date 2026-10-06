@@ -1,7 +1,8 @@
 import bolt from '@slack/bolt';
+import crypto from 'node:crypto';
 import { normalizeFiles } from '../core/sources.js';
 import { redact } from '../config/index.js';
-const { App, LogLevel } = bolt;
+const { App, LogLevel, SocketModeReceiver } = bolt;
 
 export async function verifySlackIdentity(client, config) {
   const auth = await client.auth.test();
@@ -28,7 +29,7 @@ export function createEventHandler({ config, store, engine, botId, now = () => D
     if (message.subtype && message.subtype !== 'file_share') return;
     if (!message.ts) return;
     const root = message.thread_ts || message.ts;
-    const key = `${event.channel}:${root}`, previous = store.latest(key);
+    const key = store.resolveThreadKey?.(event.channel, root) || `${event.channel}:${root}`, previous = store.latest(key);
     const mention = new RegExp(`<@${botId}>`, 'g');
     if (!previous && !(message.text || '').includes(`<@${botId}>`)) return;
     if (message.thread_ts && !previous) return;
@@ -59,39 +60,177 @@ export function createEventHandler({ config, store, engine, botId, now = () => D
     if (result.run) store.notice(result.run, 'accepted', `已收到修订 ${result.run.revision}${config.dryRun ? '（模拟模式）' : ''}。完成后${config.dryRun ? '保存本机预览' : '创建新的公众号草稿'}。\n任务 ${result.run.id}`);
   };
 }
-export async function createSlack({ config, store, engine }) {
+export async function createSlack({ config, store, engine, now = () => Date.now(),
+  appFactory, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), log = text => console.error(text) }) {
   // SDK errors may carry request metadata; only emit redacted messages.
   const logger = Object.fromEntries(['debug', 'info', 'warn', 'error'].map(level => [level, (...args) => {
-    if (['warn', 'error'].includes(level)) console.error(args.map(a => redact(a, config)).join(' '));
+    if (['warn', 'error'].includes(level)) log(args.map(a => redact(a, config)).join(' '));
   }]));
   Object.assign(logger, { setLevel() {}, getLevel() { return LogLevel.WARN; }, setName() {} });
-  const app = new App({ token: config.slack.botToken, appToken: config.slack.appToken, socketMode: true, logger });
-  const auth = await verifySlackIdentity(app.client, config);
-  const receive = createEventHandler({ config, store, engine, botId: auth.user_id });
-  app.message(async ({ message, body }) => receive(message, body));
-  app.event('app_mention', async ({ event, body }) => receive(event, body));
-  app.error(async error => console.error(redact(error, config)));
-  let flushing = false;
-  async function flush() {
-    if (flushing) return;
-    flushing = true;
+  // One remote write per recorded operation. WebClient's default retry policy
+  // can repeat chat.postMessage after a lost response; it is disabled here.
+  const clientOptions = { retryConfig: { retries: 0 }, rejectRateLimitedCalls: true, timeout: 20000 };
+  let app, auth, receive, connecting, flushing, stopping = false, connected = false, attempts = 0, nextAttemptAt = 0;
+  const reconcileAfter = new Map();
+  function construct() {
+    const options = { token: config.slack.botToken, appToken: config.slack.appToken,
+      socketMode: true, deferInitialization: true, clientOptions, logger };
+    // Reconnection belongs to the service's bounded retry loop, including an
+    // identity check on every new session, rather than SDK background retries.
+    app = appFactory ? appFactory(options) : new App({ ...options, receiver: new SocketModeReceiver({
+      appToken: config.slack.appToken, autoReconnectEnabled: false, logger, installerOptions: { clientOptions },
+    }) });
+    app.message(async ({ message, body }) => { if (connected && receive) await receive(message, body); });
+    app.event('app_mention', async ({ event, body }) => { if (connected && receive) await receive(event, body); });
+    app.error(async error => log(redact(error, config)));
+    for (const event of ['disconnected', 'close', 'error']) app.receiver?.client?.on(event, () => { connected = false; });
+  }
+  async function connect() {
+    if (stopping || connected || connecting || now() < nextAttemptAt) return connecting;
+    connecting = (async () => {
+      try {
+        if (!config.slack.botToken || !config.slack.appToken || !config.slack.team || !config.slack.channel || !config.slack.user) {
+          throw new Error('Slack 个人账号配置不完整；日报继续处理，通知等待配置');
+        }
+        if (!app) construct(); else await app.stop();
+        await app.init();
+        auth = await verifySlackIdentity(app.client, config);
+        if (stopping) return;
+        receive = createEventHandler({ config, store, engine, botId: auth.user_id, now });
+        let timeout;
+        try {
+          await Promise.race([app.start(), new Promise((_, reject) => {
+            timeout = setTimeout(() => reject(new Error('Slack Socket Mode 连接超过时间上限')), 30000);
+          })]);
+        } finally { clearTimeout(timeout); }
+        if (stopping) { await app.stop(); return; }
+        connected = true; attempts = 0; nextAttemptAt = 0;
+      } catch (error) {
+        connected = false; auth = undefined;
+        try { await app?.stop(); } catch { /* A failed connection must not stop the daily worker. */ }
+        if (!stopping) {
+          nextAttemptAt = now() + Math.min(300000, 5000 * 2 ** Math.min(attempts++, 6));
+          log(`Slack 连接待重试，日报继续处理：${redact(error, config)}`);
+        }
+      }
+    })();
+    try { await connecting; } finally { connecting = undefined; }
+  }
+  async function reconcileRoot(threadKey, state) {
+    if (now() < (reconcileAfter.get(threadKey) || 0)) return false;
+    reconcileAfter.set(threadKey, now() + 300000);
+    const started = Number(state.started_at ?? state.startedAt);
+    // This is an operation receipt lookup, never a source of article context.
+    if (!Number.isFinite(started) || started < now() - 48 * 3600000 || state.channel !== config.slack.channel) return false;
+    const matches = new Set();
+    let cursor, complete = false;
+    for (let page = 0; page < 3; page++) {
+      const history = await app.client.conversations.history({ channel: config.slack.channel,
+        oldest: String((started - 60000) / 1000), latest: String(Math.min(now() + 60000, started + 600000) / 1000),
+        inclusive: true, limit: 100, ...(cursor ? { cursor } : {}) });
+      for (const message of history.messages || []) {
+        if (message.user === auth.user_id && message.bot_id === auth.bot_id && message.ts
+          && (!message.thread_ts || message.thread_ts === message.ts) && String(message.text || '').includes(state.marker)) matches.add(message.ts);
+      }
+      cursor = history.response_metadata?.next_cursor;
+      if (!history.has_more) { complete = true; break; }
+      if (!cursor) break;
+    }
+    if (!complete || matches.size !== 1) return false;
+    store.completeNoticeRoot(threadKey, config.slack.channel, [...matches][0]);
+    return true;
+  }
+  async function sendDailyRoot(item, run) {
+    const marker = noticeMarker(item, run);
+    const existing = store.getNoticeRootState(run.thread_key);
+    const operation = store.beginNoticeRoot({ threadKey: run.thread_key, channel: config.slack.channel, marker: existing?.marker || marker });
+    if (operation.state === 'sent') return true;
+    if (operation.started) {
+      try {
+        const response = await app.client.chat.postMessage({ channel: config.slack.channel,
+          text: `${item.text}\n${marker}`, mrkdwn: false, unfurl_links: false, unfurl_media: false });
+        if (response.ok === false || !response.ts || (response.channel && response.channel !== config.slack.channel)) throw new Error('Slack 根通知缺少可核对的消息标识');
+        store.completeNoticeRoot(run.thread_key, config.slack.channel, response.ts);
+        const saved = store.getNoticeRootState(run.thread_key);
+        if (saved?.state !== 'sent' || saved.ts !== response.ts) throw new Error('Slack 根通知标识未持久保存');
+        return true;
+      } catch (error) {
+        store.failNoticeRoot(run.thread_key, { uncertain: true, error: redact(error, config) });
+        log(`日报通知需要核对；不会重复发送：${redact(error, config)}`);
+      }
+    }
+    try {
+      if (await reconcileRoot(run.thread_key, store.getNoticeRootState(run.thread_key))) {
+        if (operation.marker !== marker) {
+          // A newer terminal revision can arrive while an older root receipt
+          // needs reconciliation. Its result belongs in the recovered thread.
+          const route = store.noticeRoute(run.thread_key);
+          await app.client.chat.postMessage({ channel: route.channel, thread_ts: route.thread_ts,
+            text: item.text, mrkdwn: false, unfurl_links: false, unfurl_media: false });
+        }
+        return true;
+      }
+    } catch (error) { log(`日报通知核对暂不可用：${redact(error, config)}`); }
+    store.failNoticeRoot(run.thread_key, { uncertain: true, error: '无法唯一核对已发送的日报通知；需要人工检查，禁止盲目重发' });
+    return false;
+  }
+  async function deliverNotices() {
     try {
       for (const item of store.notices()) {
+        if (stopping || !connected) break;
         if (item.thread_key.startsWith('local:')) { store.sent(item.id); continue; }
         const run = store.get(item.run_id);
-        if (run.status === 'superseded' || (item.kind.startsWith('progress:') && !['running', 'publishing'].includes(run.status))
+        if (!run || run.status === 'superseded' || (item.kind.startsWith('progress:') && !['running', 'publishing'].includes(run.status))
           || (item.kind.startsWith('failed:') && run.status !== 'failed')
+          || (item.kind === 'done' && run.status !== 'done')
           || (item.kind.startsWith('needs_review:') && run.status !== 'needs_review')
           || (item.kind.startsWith('needs_input:') && run.status !== 'needs_input')) { store.sent(item.id); continue; }
-        const [channel, ts] = item.thread_key.split(':');
+        const daily = item.thread_key.startsWith('daily:');
+        if (daily && store.latest(item.thread_key)?.id !== run.id) { store.sent(item.id); continue; }
+        if (daily && !['done', 'failed', 'needs_review', 'needs_input'].includes(item.kind.split(':')[0])) { store.sent(item.id); continue; }
+        if (daily && run.status === 'failed' && store.isDailyRetryPending?.(run.id)) continue;
+        const route = store.noticeRoute?.(item.thread_key) || (!daily ? (() => {
+          const [channel, thread_ts] = item.thread_key.split(':'); return { channel, thread_ts };
+        })() : null);
+        if (route && route.channel !== config.slack.channel) { log('Slack 通知目标不属于配置的个人频道；保留待处理记录'); continue; }
+        // A crash between persisting ts and marking the outbox row as sent
+        // must consume that row without posting its result again in the thread.
+        const rootState = daily && store.getNoticeRootState(run.thread_key);
+        if (daily && route && rootState?.state === 'sent' && rootState.marker === noticeMarker(item, run)) {
+          store.sent(item.id); continue;
+        }
         try {
-          await app.client.chat.postMessage({ channel, thread_ts: ts, text: item.text,
-            mrkdwn: false, unfurl_links: false, unfurl_media: false });
+          if (daily && !route) {
+            if (!await sendDailyRoot(item, run)) continue;
+          } else {
+            await app.client.chat.postMessage({ channel: route.channel, thread_ts: route.thread_ts, text: item.text,
+              mrkdwn: false, unfurl_links: false, unfurl_media: false });
+          }
           store.sent(item.id);
-        } catch (error) { console.error(`Slack 通知待重试：${redact(error, config)}`); break; }
-        await new Promise(resolve => setTimeout(resolve, 1100));
+        } catch (error) { log(`Slack 通知待重试：${redact(error, config)}`); break; }
+        await sleep(1100);
       }
-    } finally { flushing = false; }
+    } finally { flushing = undefined; }
   }
-  return { app, flush, receive };
+  function flush() {
+    if (!connected || stopping || flushing) return flushing;
+    flushing = Promise.resolve().then(deliverNotices).finally(() => { flushing = undefined; }); return flushing;
+  }
+  return {
+    get app() { return app; }, get connected() { return connected; },
+    get status() { return { connected, nextAttemptAt, needsReview: store.notices().filter(item => item.thread_key.startsWith('daily:')
+      && store.getNoticeRootState?.(item.thread_key)?.state === 'needs_review').length }; },
+    connect, tick: connect, flush,
+    receive: (event, body) => connected && receive ? receive(event, body) : undefined,
+    async stop() {
+      stopping = true; connected = false;
+      const results = await Promise.allSettled([app?.stop(), connecting, flushing]);
+      const failure = results.find(result => result.status === 'rejected');
+      if (failure) throw failure.reason;
+    },
+  };
+}
+
+function noticeMarker(item, run) {
+  return `[Source2Draft daily:${crypto.createHash('sha256').update(`${run.thread_key}\0${run.id}\0${item.id}`).digest('hex').slice(0, 24)}]`;
 }

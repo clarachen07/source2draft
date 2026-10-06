@@ -3,6 +3,7 @@ import path from 'node:path';
 import { JSDOM } from 'jsdom';
 import { raceWithSignal, readLimitedResponse, withDeadline } from '../lib/http-deadline.js';
 import { throwIfTaskCancelled } from '../lib/task-cancellation.js';
+import { hash, readJson, writeAtomic } from '../lib/io.js';
 
 const DEFAULT_BASE_URL = 'https://www.datalab.to/api/v1';
 
@@ -25,6 +26,12 @@ export async function convertPdfWithDatalab({
   const baseUrl = trustedBaseUrl(config.datalabBaseUrl || DEFAULT_BASE_URL);
   const modes = unique([config.datalabMode || 'balanced', 'accurate']);
   const expectedPageIds = pageIdsFromRange(pageRange);
+  const imageOptions = {
+    workDir,
+    maxCount: positive(config.maxAssetCount, 80),
+    maxTotalBytes: positive(config.maxAssetBytes, 40 * 1024 * 1024),
+    maxSingleBytes: positive(config.maxSingleAssetBytes, 10 * 1024 * 1024),
+  };
   let result;
   const attempts = [];
 
@@ -37,6 +44,7 @@ export async function convertPdfWithDatalab({
       pdfBuffer,
       filename,
       pageRange,
+      workDir,
       mode,
       baseUrl,
       apiKey,
@@ -45,6 +53,7 @@ export async function convertPdfWithDatalab({
       timeoutMs: positive(config.datalabTimeoutMs, 5 * 60 * 1000),
       pollIntervalMs: positive(config.datalabPollIntervalMs, 2000),
       expectedPageIds,
+      imageOptions,
       maxResponseBytes: positive(config.maxDatalabResponseBytes, 64 * 1024 * 1024),
       signal,
     });
@@ -66,15 +75,9 @@ export async function convertPdfWithDatalab({
     throw new Error(`Datalab PDF 解析质量不足:${quality ?? '缺失'}/5（已尝试 ${attempts.map((item) => item.mode).join('、')}）`);
   }
   const coverage = assertDatalabResultComplete(result, { expectedPageIds });
-  const assets = writeExtractedImages(result.images, {
-    workDir,
-    maxCount: positive(config.maxAssetCount, 80),
-    maxTotalBytes: positive(config.maxAssetBytes, 40 * 1024 * 1024),
-    maxSingleBytes: positive(config.maxSingleAssetBytes, 10 * 1024 * 1024),
-  });
   return {
     html: result.html,
-    images: assets,
+    images: result.localImages,
     metadata: result.metadata || {},
     pageCount: numberOrUndefined(result.page_count),
     parseQualityScore: numberOrUndefined(result.parse_quality_score),
@@ -90,6 +93,7 @@ async function submitAndPoll({
   pdfBuffer,
   filename,
   pageRange,
+  workDir,
   mode,
   baseUrl,
   apiKey,
@@ -98,32 +102,52 @@ async function submitAndPoll({
   timeoutMs,
   pollIntervalMs,
   expectedPageIds,
+  imageOptions,
   maxResponseBytes,
   signal,
 }) {
+  const parameters = {
+    output_format: 'html', mode, paginate: 'true', add_block_ids: 'true',
+    disable_image_extraction: 'false', disable_image_captions: 'true', extras: 'extract_links',
+    ...(pageRange ? { page_range: String(pageRange) } : {}),
+  };
+  const key = hash({ version: 1, pdfHash: hash(pdfBuffer), filename: safeFilename(filename), baseUrl, parameters });
+  const checkpointFile = path.join(workDir, 'datalab-requests', `${key}.json`);
+  let checkpoint = readJson(checkpointFile);
+  const persist = () => writeAtomic(checkpointFile, JSON.stringify(checkpoint));
+  if (checkpoint) {
+    if (checkpoint.key !== key || !['pending', 'complete', 'failed'].includes(checkpoint.status)) {
+      throw new Error('Datalab 解析记录无效，无法安全恢复');
+    }
+    checkpoint.checkUrl = validateCheckUrl(checkpoint.checkUrl, baseUrl, checkpoint.requestId);
+    if (checkpoint.status === 'complete') {
+      if (Buffer.byteLength(JSON.stringify(checkpoint.result)) > maxResponseBytes) throw new Error('Datalab 缓存结果超过大小上限');
+      assertDatalabResultComplete(checkpoint.result, { expectedPageIds });
+      const localImages = checkpoint.result.parse_quality_score >= 3
+        ? writeExtractedImages(checkpoint.result.images, imageOptions) : undefined;
+      return { ...checkpoint.result, localImages, requestId: checkpoint.requestId, completionWaits: checkpoint.completionWaits || 0 };
+    }
+  }
   // Submission and polling share one absolute budget, including response bodies.
   return withDeadline({ signal, timeoutMs, message: 'Datalab PDF 解析超时' }, async (requestSignal) => {
     const deadline = Date.now() + timeoutMs;
-    const form = new FormData();
-    form.append('file', new Blob([pdfBuffer], { type: 'application/pdf' }), safeFilename(filename));
-    form.append('output_format', 'html');
-    form.append('mode', mode);
-    form.append('paginate', 'true');
-    form.append('add_block_ids', 'true');
-    form.append('disable_image_extraction', 'false');
-    form.append('disable_image_captions', 'true');
-    form.append('extras', 'extract_links');
-    if (pageRange) form.append('page_range', pageRange);
-
-    const submitted = await fetchJson(fetchFn, `${baseUrl}/convert`, {
-      method: 'POST',
-      headers: { 'X-API-Key': apiKey },
-      body: form,
-    }, { timeoutMs, signal: requestSignal, maxResponseBytes });
-    if (!submitted?.success || !submitted.request_id || !submitted.request_check_url) {
-      throw new Error(`Datalab PDF 解析提交失败:${safeError(submitted?.error || '响应缺少 request_id')}`);
+    if (!checkpoint || checkpoint.status === 'failed') {
+      const form = new FormData();
+      form.append('file', new Blob([pdfBuffer], { type: 'application/pdf' }), safeFilename(filename));
+      for (const [name, value] of Object.entries(parameters)) form.append(name, value);
+      const submitted = await fetchJson(fetchFn, `${baseUrl}/convert`, {
+        method: 'POST',
+        headers: { 'X-API-Key': apiKey },
+        body: form,
+      }, { timeoutMs, signal: requestSignal, maxResponseBytes });
+      if (!submitted?.success || !submitted.request_id || !submitted.request_check_url) {
+        throw new Error(`Datalab PDF 解析提交失败:${safeError(submitted?.error || '响应缺少 request_id')}`);
+      }
+      const checkUrl = validateCheckUrl(submitted.request_check_url, baseUrl, submitted.request_id);
+      checkpoint = { key, status: 'pending', requestId: submitted.request_id, checkUrl };
+      // Keep the paid request before polling: interruption resumes its existing ID.
+      persist();
     }
-    const checkUrl = validateCheckUrl(submitted.request_check_url, baseUrl, submitted.request_id);
     let completionWaits = 0;
     let lastIncomplete = [];
     for (;;) {
@@ -134,18 +158,34 @@ async function submitAndPoll({
         }
         throw new Error(`Datalab PDF 解析超时:${timeoutMs}ms`);
       }
-      const status = await fetchJson(fetchFn, checkUrl, {
-        headers: { 'X-API-Key': apiKey },
-      }, { timeoutMs: Math.min(30000, Math.max(1, deadline - Date.now())), signal: requestSignal, maxResponseBytes });
+      let status;
+      try {
+        status = await fetchJson(fetchFn, checkpoint.checkUrl, {
+          headers: { 'X-API-Key': apiKey },
+        }, { timeoutMs: Math.min(30000, Math.max(1, deadline - Date.now())), signal: requestSignal, maxResponseBytes });
+      } catch (error) {
+        // Expired/deleted remote jobs may be resubmitted on a later user retry.
+        // Network failures, authentication errors and timeouts keep the paid ID.
+        if ([404, 410].includes(error.status)) { checkpoint.status = 'failed'; persist(); }
+        throw error;
+      }
       if (status?.status === 'failed' || status?.success === false) {
+        checkpoint.status = 'failed'; persist();
         throw new Error(`Datalab PDF 解析失败:${safeError(status?.error || status?.status)}`);
       }
       if (status?.status === 'complete' || (status?.success === true && status?.html)) {
         const inspected = inspectDatalabResult(status, { expectedPageIds });
         if (!inspected.issues.length) {
+          // Validate and write accepted images once before caching a usable result.
+          // Low-quality attempts are only evidence to upgrade; their images are unused.
+          const localImages = status.parse_quality_score >= 3
+            ? writeExtractedImages(status.images, imageOptions) : undefined;
+          checkpoint = { ...checkpoint, status: 'complete', result: status, completionWaits };
+          persist();
           return {
             ...status,
-            requestId: submitted.request_id,
+            localImages,
+            requestId: checkpoint.requestId,
             completionWaits,
           };
         }
@@ -290,7 +330,7 @@ async function fetchJson(fetchFn, url, options, { timeoutMs, signal, maxResponse
     if (requestSignal.aborted) void response.body?.cancel?.().catch(() => {});
     throwIfTaskCancelled(requestSignal);
     const body = await readLimitedResponse(response, response.ok ? maxResponseBytes : 64 * 1024, requestSignal);
-    if (!response.ok) throw new Error(`Datalab HTTP ${response.status}:${safeError(body.toString('utf8') || response.statusText)}`);
+    if (!response.ok) throw Object.assign(new Error(`Datalab HTTP ${response.status}:${safeError(body.toString('utf8') || response.statusText)}`), { status: response.status });
     try { return JSON.parse(body.toString('utf8')); }
     catch { throw new Error('Datalab 返回了无效 JSON'); }
   });

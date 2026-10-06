@@ -8,11 +8,12 @@
   },
   "scripts": {
     "start": "node src/index.js",
-    "test": "node --test test/*.test.js",
+    "test": "node --test --test-concurrency=1 test/*.test.js",
     "check": "node scripts/check.mjs && npm test && npm audit --omit=dev --audit-level=high",
     "setup": "node scripts/manage.mjs setup",
     "check:config": "node scripts/manage.mjs config",
     "check:connections": "node scripts/manage.mjs connections",
+    "check:model": "node scripts/manage.mjs model",
     "status": "node scripts/manage.mjs status",
     "retry": "node scripts/manage.mjs retry",
     "preview": "node scripts/manage.mjs preview",
@@ -22,7 +23,11 @@
     "service:restart": "node scripts/service.mjs restart",
     "service:stop": "node scripts/service.mjs stop",
     "service:status": "node scripts/service.mjs status",
-    "service:uninstall": "node scripts/service.mjs uninstall"
+    "service:uninstall": "node scripts/service.mjs uninstall",
+    "daily:run": "node scripts/daily.mjs run",
+    "daily:status": "node scripts/daily.mjs status",
+    "daily:enable": "node scripts/daily.mjs enable",
+    "daily:disable": "node scripts/daily.mjs disable"
   },
   "dependencies": {
     "@mozilla/readability": "^0.6.0",

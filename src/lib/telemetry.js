@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 // Keep diagnostics useful without storing prompts, URLs, credentials or provider responses.
-const LABELS = new Set(['stage', 'role', 'outcome', 'finishReason']);
+const LABELS = new Set(['stage', 'role', 'outcome', 'finishReason', 'provider']);
 const NUMBERS = new Set(['durationMs', 'waitMs', 'attempt', 'attempts', 'status', 'count', 'bytes',
   'completed', 'total', 'cacheHits', 'browserLaunches', 'checkpointWrites', 'batchIndex', 'batchTotal',
   'itemCount', 'inputCharacters']);

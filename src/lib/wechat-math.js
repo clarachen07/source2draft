@@ -18,7 +18,7 @@ import { cancellationErrorFromSignal, throwIfTaskCancelled } from './task-cancel
 // <em>), which fragments formulas, leaks raw LaTeX into body copy, and renders CJK
 // fallback text that overlaps under WeChat's reader font scaling. This module
 // protects math before markdown parsing (placeholders that survive marked intact),
-// renders each formula to a 3x transparent PNG via the same MathJax + Chromium stack
+// renders each formula to a high-density transparent PNG via MathJax + Chromium
 // used for tables and heading cards, and restores validated <img> nodes afterwards.
 
 export const MATH_TOKEN_RE = /SLMATH\d{4}XSLMATH/g;
@@ -27,11 +27,21 @@ const MATH_TOKEN_PREFIX = 'SLMATH';
 const MATH_TOKEN_SUFFIX = 'XSLMATH';
 
 export const MATH_INK_COLOR = '#2B3645';
+// The reader displays images at device pixels on high-density screens. Capture
+// at 3x, then declare both logical dimensions on each image. WeChat's reader
+// can override a height-only image with height:auto; a width declaration keeps
+// the high-density bitmap at its intended reading size.
 export const MATH_CAPTURE_SCALE = 3;
 const MATH_BASE_FONT_PX = 16;
 const MATH_CAPTURE_PADDING = { x: 3, y: 2 };
 const MAX_INLINE_TEX_LENGTH = 1000;
 const MAX_DISPLAY_TEX_LENGTH = 4000;
+// Long aligned derivations legitimately exceed the 40em plausibility gate, so their
+// declared width is capped at MATH_DISPLAY_FIT_EM
+// instead of failing the render. Past twice the cap the shrunken type would be
+// unreadable, so such TeX must be split by a human rather than shrunk silently.
+const MATH_DISPLAY_FIT_EM = 38;
+const MATH_DISPLAY_MIN_SCALE = 0.5;
 
 const TEX_FEATURE_RE = /\\[a-zA-Z]+|[_^]\s*[{A-Za-z0-9]|\{/;
 // Single variables ($t$, $N$, $W$, $x_i$) carry no TeX feature characters but are
@@ -252,11 +262,21 @@ function buildEquationImage(document, equation) {
   node.setAttribute('src', image.src);
   node.setAttribute('data-sl-math', 'true');
   node.setAttribute('alt', '');
-  // image.width/height are CSS pixels measured at MATH_BASE_FONT_PX in the capture
-  // page, so dividing by the base font alone yields reader-font-relative em sizing.
+  // Captured dimensions exclude transparent padding; include it in the logical
+  // dimensions so width and height match the bitmap's aspect ratio exactly.
+  const logicalWidth = image.width + MATH_CAPTURE_PADDING.x * 2;
+  const logicalHeight = image.height + MATH_CAPTURE_PADDING.y * 2;
+  const naturalEm = logicalWidth / MATH_BASE_FONT_PX;
+  if (equation.display && naturalEm > MATH_DISPLAY_FIT_EM / MATH_DISPLAY_MIN_SCALE) {
+    throw new Error(`公式 ${equation.token} 自然宽度 ${naturalEm.toFixed(1)}em 过宽，等比缩小后不可读，请拆分该公式`);
+  }
+  const em = equation.display ? Math.min(naturalEm, MATH_DISPLAY_FIT_EM)
+    : logicalHeight / MATH_BASE_FONT_PX;
+  node.setAttribute('width', String(Math.ceil(equation.display ? Math.min(logicalWidth, MATH_DISPLAY_FIT_EM * MATH_BASE_FONT_PX) : logicalWidth)));
+  if (!equation.display) node.setAttribute('height', String(Math.ceil(logicalHeight)));
   const style = equation.display
-    ? `width:${(image.width / MATH_BASE_FONT_PX).toFixed(4)}em;max-width:100%;height:auto;margin:1em auto;display:block;`
-    : `height:${(image.height / MATH_BASE_FONT_PX).toFixed(4)}em;vertical-align:middle;max-width:100%;`;
+    ? `width:${em.toFixed(4)}em!important;max-width:100%!important;height:auto!important;margin:1em auto;display:block;`
+    : `width:${naturalEm.toFixed(4)}em!important;height:${em.toFixed(4)}em!important;vertical-align:middle;max-width:100%;`;
   node.setAttribute('style', style);
   return node;
 }
@@ -313,12 +333,13 @@ export function validateMathRestored(html, { equations = [] } = {}) {
   }
   // Plausible rendered-size bounds catch sizing regressions (e.g. em divisors)
   // before a draft with invisible formulas can be published.
-  const readEm = (image) => parseFloat(/([\d.]+)em/.exec(image.getAttribute('style') || '')?.[1] ?? 'NaN');
+  const readEm = (image, property) => parseFloat(new RegExp(`${property}:([\\d.]+)em`).exec(image.getAttribute('style') || '')?.[1] ?? 'NaN');
   for (const [index, image] of images.entries()) {
-    const em = readEm(image);
+    const display = image.getAttribute('data-sl-math-display') || image.closest('[data-sl-math-display]');
+    const em = readEm(image, display ? 'width' : 'height');
     if (Number.isNaN(em)) {
       errors.push(`第 ${index + 1} 张公式图片缺少 em 尺寸`);
-    } else if (image.getAttribute('data-sl-math-display') || image.closest('[data-sl-math-display]')) {
+    } else if (display) {
       if (em < 1 || em > 40) errors.push(`第 ${index + 1} 张显示公式宽度 ${em}em 超出合理范围`);
     } else if (em < 0.4 || em > 8) {
       errors.push(`第 ${index + 1} 张行内公式高度 ${em}em 超出合理范围`);
@@ -348,7 +369,7 @@ export function validateMathRestored(html, { equations = [] } = {}) {
   return { equations: equations.length, images: images.length };
 }
 
-// ---- Offline MathJax TeX -> SVG compilation (same packages as wenyan-core) ----
+// ---- Offline MathJax TeX -> SVG compilation ----
 
 let mathJaxState;
 function ensureMathJax() {
@@ -364,7 +385,17 @@ function ensureMathJax() {
     inlineMath: [['\\(', '\\)']],
     displayMath: [['\\[', '\\]']],
     processEscapes: false,
-    packages: AllPackages,
+    // Undefined commands must produce a real MathJax error, rather than red text.
+    packages: AllPackages.filter((name) => name !== 'noundefined'),
+    // AllPackages contains MathJax extensions, not every LaTeX package or
+    // author-defined operator used in papers. Keep source TeX intact and define
+    // these common commands in the compiler. Boldsymbol preserves bold Greek
+    // and italic vectors; mathbf would silently change their notation.
+    macros: {
+      bm: ['\\boldsymbol{#1}', 1],
+      argmax: '\\operatorname*{arg\\,max}',
+      argmin: '\\operatorname*{arg\\,min}',
+    },
   });
   const svgJax = new SVG({ fontCache: 'none' });
   mathJaxState = { texJax, svgJax };
@@ -378,10 +409,9 @@ export function compileEquationSvg(tex, display) {
   doc.render();
   const adaptor = doc.adaptor;
   const html = adaptor.innerHTML(adaptor.body(doc.document));
-  // Unknown macros render as red mtext (fill="red") in SVG output; merror covers
-  // other compile failures. Either means the formula would publish broken glyphs.
+  // Explicit equation colors are valid; only compiler errors block rendering.
   const error = /data-mjx-error="([^"]*)"/.exec(html);
-  if (error || html.includes('<merror') || /fill="red"/.test(html)) {
+  if (error || html.includes('<merror')) {
     throw new Error(`公式编译失败:${error?.[1] || 'MathJax 无法识别的命令或语法错误'}`);
   }
   const svg = /<svg[\s\S]*?<\/svg>/.exec(html)?.[0];
@@ -450,7 +480,7 @@ async function captureEquationsWithBrowser(items, { outDir, executablePath, colo
   }
 }
 
-// Render every unique formula to a 3x transparent PNG under the run directory.
+// Render every unique formula to a transparent PNG under the run directory.
 // Identical TeX reuses one file. MathJax compilation errors hard-fail the task.
 export async function renderEquationPngs(equations, {
   outDir,
@@ -492,18 +522,20 @@ export async function renderEquationPngs(equations, {
     signal,
   );
   throwIfTaskCancelled(signal);
-  emitTelemetry(onTelemetry, { stage: 'math-rasterize', count: compiled.length, durationMs: performance.now() - started });
   if (!Array.isArray(captured) || captured.length !== compiled.length) {
     throw new Error('公式截图数量与公式数量不一致');
   }
+  let fitted = 0;
   compiled.forEach((group, index) => {
     const image = captured[index];
     if (!image?.src || !(image.width > 0) || !(image.height > 0)) {
       throw new Error(`公式 ${index + 1} 截图结果无效`);
     }
+    if (group.display && image.width / MATH_BASE_FONT_PX > MATH_DISPLAY_FIT_EM) fitted += 1;
     for (const member of group.members) {
       member.image = { src: image.src, width: image.width, height: image.height };
     }
   });
+  emitTelemetry(onTelemetry, { stage: 'math-rasterize', count: compiled.length, fitted, durationMs: performance.now() - started });
   return list;
 }

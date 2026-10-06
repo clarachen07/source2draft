@@ -1,9 +1,11 @@
 import fs from 'node:fs';
+import net from 'node:net';
 import path from 'node:path';
 import { JSDOM } from 'jsdom';
 import { fetchRetry, hash, readJson, writeAtomic } from '../lib/io.js';
-import { imageType, safeLocalAsset } from '../lib/wechat-render.js';
+import { imageType, normalizeWechatLists, safeLocalAsset } from '../lib/wechat-render.js';
 import { emitTelemetry } from '../lib/telemetry.js';
+import { withRuntimeResource } from '../config/runtime.js';
 
 export function contentIdentity(article) {
   const doc = new JSDOM(article.content || '').window.document;
@@ -31,16 +33,25 @@ export function createWechat(config, { fetchFn = globalThis.fetch } = {}) {
     if (token && tokenUntil > Date.now()) return token;
     if (!config.wechat.appId || !config.wechat.secret) throw new Error('缺少个人公众号 AppID 或 AppSecret');
     const response = await fetchRetry(fetchFn, 'https://api.weixin.qq.com/cgi-bin/stable_token', {
-      method: 'POST', signal, headers: { 'Content-Type': 'application/json' },
+      method: 'POST', signal, redirect: 'error', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ grant_type: 'client_credential', appid: config.wechat.appId, secret: config.wechat.secret, force_refresh: false }),
     });
     const data = await response.json();
-    if (!response.ok || !data.access_token) throw new Error(`微信公众号认证失败，错误码 ${data.errcode || response.status}；请检查个人账号凭据与后台接口配置`);
+    if (!response.ok || !data.access_token) {
+      if (Number(data.errcode) === 40164) {
+        // Extract only a validated address; the remote errmsg may contain
+        // account details or request hints and must not be logged verbatim.
+        const address = /\binvalid ip\s+([\da-fA-F:.]+)/i.exec(String(data.errmsg || ''))?.[1];
+        const ip = address && net.isIP(address) ? ` ${address}` : '';
+        throw new Error(`微信公众号认证失败，错误码 40164：当前出口 IP${ip} 不在白名单；请在该公众号后台接口 IP 白名单中添加此地址，再在原 Slack 线程回复“重试”`);
+      }
+      throw new Error(`微信公众号认证失败，错误码 ${data.errcode || response.status}；请检查个人账号凭据与后台接口配置`);
+    }
     token = data.access_token; tokenUntil = Date.now() + (data.expires_in - 120) * 1000; return token;
   }
   async function api(endpoint, body, { signal, mutation = false, form = false } = {}) {
     const t = await accessToken(signal);
-    const request = { method: 'POST', signal, headers: form ? {} : { 'Content-Type': 'application/json' }, body: form ? body : JSON.stringify(body) };
+    const request = { method: 'POST', signal, redirect: 'error', headers: form ? {} : { 'Content-Type': 'application/json' }, body: form ? body : JSON.stringify(body) };
     const response = await fetchRetry(fetchFn, `https://api.weixin.qq.com/cgi-bin/${endpoint}${endpoint.includes('?') ? '&' : '?'}access_token=${encodeURIComponent(t)}`, request,
       { attempts: mutation ? 1 : 3, timeout: 30000 });
     if (!response.ok) throw new Error(`微信接口 HTTP ${response.status}`);
@@ -99,6 +110,7 @@ export function createWechat(config, { fetchFn = globalThis.fetch } = {}) {
       return receipts.uploads[key];
     }
     try {
+      normalizeWechatLists(doc.body);
       for (const image of doc.querySelectorAll('img')) {
         image.setAttribute('src', (await uploadedAsset(image.getAttribute('src'), false)).url);
       }
@@ -108,10 +120,23 @@ export function createWechat(config, { fetchFn = globalThis.fetch } = {}) {
     } finally { doc.defaultView.close(); }
   }
   async function publish({ run, store, prepared, workDir, signal, onTelemetry }) {
+    return withRuntimeResource('wechat', () => publishLocked({ run, store, prepared, workDir, signal, onTelemetry }), signal);
+  }
+  async function publishLocked({ run, store, prepared, workDir, signal, onTelemetry }) {
     if (config.dryRun || run.dry_run) throw new Error('模拟模式禁止调用微信写入');
     let op = store.operation(run.id);
     if (!op) {
       const article = await payload(prepared, workDir, signal, onTelemetry);
+      // An unresolved identical write from another task must not acquire the
+      // same remote identity during its later recovery.
+      if (store.db) {
+        const unresolved = store.db.prepare("SELECT payload FROM operations WHERE run_id<>? AND state='requesting' AND media_id IS NULL").all(run.id);
+        if (unresolved.some(other => contentIdentity(JSON.parse(other.payload)) === contentIdentity(article))) {
+          const error = new Error('相同内容的另一草稿创建结果尚未确认，请先核对该任务');
+          error.needsReview = true;
+          throw error;
+        }
+      }
       const snapshot = (await listDrafts(signal)).map(d => d.media_id);
       signal?.throwIfAborted();
       store.beginPublish(run, article, snapshot);

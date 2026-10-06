@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { marked } from 'marked';
+import { renderArticleMarkdown } from './article-markdown.js';
 import { JSDOM } from 'jsdom';
 import { protectMathInMarkdown, renderEquationPngs, restoreMathInHtml, validateMathRestored } from './wechat-math.js';
 import { escapeHtml, hash, parseArticle, writeAtomic } from './io.js';
@@ -41,7 +41,9 @@ export function validatePreparedWechatHtml(html) {
 }
 export function assertSafeArticle(markdown, config) {
   for (const secret of secretValues(config)) if (secret.length >= 8 && markdown.includes(secret)) throw new Error('成稿含有运行凭据，禁止上传');
-  if (/xox[baprs]-[\w-]{12,}|xapp-[\w-]{12,}|sk-[\w-]{16,}/.test(markdown)) throw new Error('成稿含疑似凭据，禁止上传');
+  // Match a token prefix, not the suffix of a word such as "musk-" in a
+  // source URL. Keep scanning URLs: a path or query can still leak a key.
+  if (/(?<![a-zA-Z0-9_])(?:xox[baprs]-[\w-]{12,}|xapp-[\w-]{12,}|sk-[\w-]{16,})/.test(markdown)) throw new Error('成稿含疑似凭据，禁止上传');
 }
 export function imageType(buffer) {
   if (buffer.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10]))) return 'image/png';
@@ -57,26 +59,39 @@ export function safeLocalAsset(src, workDir) {
 function referencesHeading(element) {
   return /^(?:references|bibliography|works cited|参考来源|参考文献|引用文献)\s*[:：]?$/i.test(element.textContent.trim());
 }
-function renderNumberedParagraphs(list, { references = false, depth = 0 } = {}) {
+const visibleText = node => node.textContent.replace(/[\s\u200b\u200c\u200d\u2060\ufeff]/g, '');
+const hasListContent = node => visibleText(node) || node.querySelector?.('img,hr');
+function renderListParagraphs(list, { references = false, depth = 0 } = {}) {
   const document = list.ownerDocument;
   const paragraphs = document.createDocumentFragment();
-  const items = [...list.children].filter(item => item.tagName === 'LI');
+  const ordered = references || list.tagName === 'OL';
+  const items = [...list.children].filter(item => item.tagName === 'LI' && hasListContent(item));
   const reversed = !references && list.hasAttribute('reversed');
   const parsedStart = Number.parseInt(list.getAttribute('start') || '', 10);
-  const populatedItems = items.filter(item => item.textContent.trim() || item.querySelector('img,ol,ul')).length;
+  const populatedItems = items.length;
   let number = references ? 1 : Number.isInteger(parsedStart) ? parsedStart : reversed ? populatedItems : 1;
   for (const item of items) {
     const explicit = Number.parseInt(item.getAttribute('value') || '', 10);
     if (!references && Number.isInteger(explicit)) number = explicit;
-    const paragraph = document.createElement('p');
-    paragraph.setAttribute('style', `${STYLES.p}margin:.35em 0;${depth ? `padding-left:${depth * 1.5}em;` : ''}`);
-    paragraph.append(`${number}. `);
-    const nested = [];
+    let paragraph;
+    let markerWritten = false;
+    const newParagraph = () => {
+      paragraph = document.createElement('p');
+      paragraph.setAttribute('style', `${STYLES.p}margin:.35em 0;${depth ? `padding-left:${depth * 1.5}em;` : ''}`);
+      if (!markerWritten) paragraph.append(ordered ? `${number}. ` : '• ');
+    };
+    newParagraph();
     let hasContent = false;
+    const flush = () => {
+      if (hasContent) { paragraphs.appendChild(paragraph); markerWritten = true; }
+      hasContent = false;
+      newParagraph();
+    };
     const children = [...item.childNodes];
     for (const [index, child] of children.entries()) {
       if (child.nodeType === 1 && ['OL', 'UL'].includes(child.tagName)) {
-        nested.push(child);
+        flush();
+        paragraphs.appendChild(renderListParagraphs(child, { depth: depth + 1 }));
         continue;
       }
       if (child.nodeType === 3 && !child.textContent.trim()) {
@@ -84,7 +99,7 @@ function renderNumberedParagraphs(list, { references = false, depth = 0 } = {}) 
         if (hasContent && next && !(next.nodeType === 1 && ['OL', 'UL', 'P'].includes(next.tagName))) paragraph.append(' ');
         continue;
       }
-      if (child.nodeType === 1 && !child.textContent.trim() && !child.matches('img') && !child.querySelector('img')) continue;
+      if (child.nodeType === 1 && !hasListContent(child) && !child.matches('img,hr')) continue;
       if (child.nodeType === 1 && child.tagName === 'P') {
         if (!child.textContent.trim() && !child.querySelector('img')) continue;
         if (hasContent) paragraph.appendChild(document.createElement('br'));
@@ -96,18 +111,28 @@ function renderNumberedParagraphs(list, { references = false, depth = 0 } = {}) 
       }
       hasContent = true;
     }
-    if (hasContent) paragraphs.appendChild(paragraph);
-    for (const child of nested) {
-      if (child.tagName === 'OL') paragraphs.appendChild(renderNumberedParagraphs(child, { depth: depth + 1 }));
-      else paragraphs.appendChild(child);
-    }
-    if (hasContent || nested.length) number += reversed ? -1 : 1;
+    flush();
+    number += reversed ? -1 : 1;
   }
   return paragraphs;
 }
 // Apply typography only after the Markdown DOM exists. This makes research and
 // faithful-translation output share one presentation contract. Fixed numbers in
 // ordinary paragraphs survive WeChat's editor and remain stable after editing.
+// Native list markup (including whitespace between li elements) is rewritten by
+// the editor into extra empty bullets. Normalize both list types at preparation
+// and before a new upload, so cached HTML cannot reintroduce that structure.
+export function normalizeWechatLists(body) {
+  for (const heading of body.querySelectorAll('h1,h2,h3,h4,h5,h6')) {
+    if (!referencesHeading(heading)) continue;
+    const list = heading.nextElementSibling;
+    if (!list || !['OL', 'UL'].includes(list.tagName)) continue;
+    list.replaceWith(renderListParagraphs(list, { references: true }));
+  }
+  for (const list of [...body.querySelectorAll('ol,ul')]) {
+    if (list.isConnected) list.replaceWith(renderListParagraphs(list));
+  }
+}
 export function applyWechatArticleStyles(body) {
   for (const el of [...body.querySelectorAll('*')]) {
     const originalStyle = el.hasAttribute('data-sl-math') ? el.getAttribute('style') : '';
@@ -116,15 +141,7 @@ export function applyWechatArticleStyles(body) {
     if (el.hasAttribute('href') && !/^https?:\/\//i.test(el.getAttribute('href'))) el.removeAttribute('href');
   }
   for (const paragraph of body.querySelectorAll('li > p')) paragraph.setAttribute('style', `${STYLES.p}margin:0;`);
-  for (const heading of body.querySelectorAll('h1,h2,h3,h4,h5,h6')) {
-    if (!referencesHeading(heading)) continue;
-    const list = heading.nextElementSibling;
-    if (!list || !['OL', 'UL'].includes(list.tagName)) continue;
-    list.replaceWith(renderNumberedParagraphs(list, { references: true }));
-  }
-  for (const list of [...body.querySelectorAll('ol')]) {
-    if (list.isConnected) list.replaceWith(renderNumberedParagraphs(list));
-  }
+  normalizeWechatLists(body);
 }
 export async function prepareArticle({ markdown, workDir, config, signal, cover, onTelemetry }) {
   signal?.throwIfAborted();
@@ -134,7 +151,7 @@ export async function prepareArticle({ markdown, workDir, config, signal, cover,
   if (protectedMath.equations.length) await renderEquationPngs(protectedMath.equations, {
     outDir: workDir, executablePath: config.browser, signal, onTelemetry,
   });
-  let html = marked.parse(protectedMath.markdown, { gfm: true });
+  let html = renderArticleMarkdown(protectedMath.markdown);
   html = restoreMathInHtml(html, protectedMath);
   const mathErrors = validateMathRestored(html, protectedMath);
   if (mathErrors?.errors?.length) throw new Error(mathErrors.errors.join('；'));
@@ -145,29 +162,52 @@ export async function prepareArticle({ markdown, workDir, config, signal, cover,
       if (/^on/i.test(attr.name)) throw new Error('正文含事件处理属性');
       const listNumbering = (el.tagName === 'OL' && ['start', 'reversed'].includes(attr.name))
         || (el.tagName === 'LI' && attr.name === 'value');
+      const mathDimensions = el.tagName === 'IMG' && el.hasAttribute('data-sl-math')
+        && ['width', 'height'].includes(attr.name);
       if (!['href', 'src', 'alt', 'style', 'colspan', 'rowspan'].includes(attr.name)
-        && !listNumbering && !attr.name.startsWith('data-sl-math')) el.removeAttribute(attr.name);
+        && !listNumbering && !mathDimensions && !attr.name.startsWith('data-sl-math')) el.removeAttribute(attr.name);
     }
   }
   applyWechatArticleStyles(doc.body);
   const assets = [];
+  const localAssets = new Map();
+  const remoteAssets = new Map();
+  const uploadContents = new Set();
   let assetBytes = 0;
   for (const img of doc.querySelectorAll('img')) {
     signal?.throwIfAborted();
     let src = img.getAttribute('src');
     if (!src) throw new Error('正文图片缺少地址');
     if (/^https?:\/\//i.test(src)) {
-      const fetched = await download(src, { signal, limits: { maxSourceBytes: 10 * 1024 * 1024, maxRedirects: 5, fetchTimeoutMs: 45000 } });
-      const mime = imageType(fetched.buffer);
-      src = path.join(workDir, `image-${hash(fetched.buffer).slice(0, 16)}.${mime.split('/')[1]}`);
-      fs.writeFileSync(src, fetched.buffer, { mode: 0o600 });
+      const remoteUrl = src;
+      src = remoteAssets.get(remoteUrl);
+      if (!src) {
+        const fetched = await download(remoteUrl, { signal, limits: { maxSourceBytes: 10 * 1024 * 1024, maxRedirects: 5, fetchTimeoutMs: 45000 } });
+        const mime = imageType(fetched.buffer);
+        src = path.join(workDir, `image-${hash(fetched.buffer).slice(0, 16)}.${mime.split('/')[1]}`);
+        fs.writeFileSync(src, fetched.buffer, { mode: 0o600 });
+        remoteAssets.set(remoteUrl, src);
+      }
     }
     const local = safeLocalAsset(src, workDir);
-    imageType(fs.readFileSync(local));
-    if (fs.statSync(local).size > 10 * 1024 * 1024) throw new Error('正文单张图片超过 10 MB');
-    if (!assets.includes(local)) assets.push(local);
-    assetBytes += fs.statSync(local).size;
-    if (assets.length > 80 || assetBytes > 40 * 1024 * 1024) throw new Error('正文图片总量超过单篇上限');
+    if (!localAssets.has(local)) {
+      const size = fs.statSync(local).size;
+      if (size > 10 * 1024 * 1024) throw new Error('正文单张图片超过 10 MB');
+      const buffer = fs.readFileSync(local);
+      imageType(buffer);
+      const digest = hash(buffer);
+      localAssets.set(local, digest);
+      assets.push(local);
+      // This is a local resource budget, not a WeChat image-count quota.
+      // Papers may legitimately contain hundreds of formula PNGs. Count bytes
+      // once per content hash, matching the uploader's persisted receipt cache,
+      // while retaining every image occurrence and its placement in the HTML.
+      if (!uploadContents.has(digest)) {
+        uploadContents.add(digest);
+        assetBytes += size;
+        if (assetBytes > 40 * 1024 * 1024) throw new Error(`正文不重复图片总量 ${(assetBytes / 1048576).toFixed(1)} MB 超过本地处理预算 40 MB`);
+      }
+    }
     img.setAttribute('src', path.relative(workDir, local));
   }
   if (/\/(?:Users|home|private|var|srv)\/|[A-Z]:\\Users\\/.test(doc.body.textContent)) throw new Error('正文泄漏本机路径，禁止上传');

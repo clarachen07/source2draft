@@ -1,7 +1,23 @@
 const URL_RE = /https?:\/\/[^\s<>()，。；：！？】【、】【【】）》〉]+/gi;
 
 export function parseTranslationScope(input) {
-  const text = String(input || '').replace(URL_RE, ' ').replace(/\s+/g, ' ').trim();
+  // A follow-up changes scope only when it explicitly names a new one.
+  const instructions = String(input || '').split(/\n\n补充指令：\n/);
+  for (let index = instructions.length - 1; index >= 0; index--) {
+    const scope = parseInstructionScope(instructions[index], { followup: index > 0 });
+    if (scope) return scope;
+  }
+  return { kind: 'all', requestedText: '' };
+}
+
+function parseInstructionScope(input, { followup = false } = {}) {
+  const text = String(input || '').replace(URL_RE, ' ').replace(/\s+/g, ' ').trim()
+    .replace(/[‘’]/g, '"')
+    .replace(/^(?:请\s*)?(?:(?:把|将)?(?:翻译)?范围\s*)?(?:改为|改成|换成|改译|调整为)\s*(.*)$/, (_, rest) =>
+      /^(?:只|仅)?(?:翻译|直译)/.test(rest) ? rest : `翻译 ${rest}`)
+    .replace(/^(?:只要|仅要)\s*/, '翻译 ');
+  // Page references inside terminology/title edits do not select a new scope.
+  if (followup && !/^(?:请|帮我|麻烦)?\s*(?:只|仅|全文|完整)?\s*(?:翻译|直译)|^(?:please\s+)?translate\b|^(?:全文|全部|整篇|整个文档)[。.!！]?$|^(?:第?\s*\d+\s*(?:[-–—~～到至]\s*\d+\s*)?页|前\s*\d+\s*页)[。.!！]?$/i.test(text)) return undefined;
   const pageRange = firstMatch(text, [
     /第?\s*(\d{1,4})\s*(?:[-–—~～]|到|至)\s*第?\s*(\d{1,4})\s*页/i,
     /\bpages?\s*(\d{1,4})\s*(?:[-–—~]|to|through)\s*(\d{1,4})\b/i,
@@ -52,7 +68,10 @@ export function parseTranslationScope(input) {
     return { kind: 'sections', start: target, end: target, requestedText: namedSection[0].trim() };
   }
 
-  return { kind: 'all', requestedText: '' };
+  if (/^(?:全文|全部|整篇|整个文档)[。.!！]?$|(?:翻译|直译)\s*(?:全文|全部|整篇|整个文档)|(?:全文|全部|整篇|整个文档)\s*(?:翻译|直译)|\btranslate\s+(?:the\s+)?(?:whole|entire|full)\s+(?:text|article|document|paper)|\btranslate\s+(?:everything|all)\b/i.test(text)) {
+    return { kind: 'all', requestedText: text };
+  }
+  return undefined;
 }
 
 export function applyTranslationScope(document, scope) {
@@ -124,12 +143,12 @@ function findHeading(headings, target, afterIndex = -1) {
   const wantedNumber = sectionNumber(target);
   const candidates = headings.filter(({ index }) => index >= afterIndex);
   if (wantedNumber) {
-    const numbered = candidates.find(({ block }) => sectionNumber(block.text) === wantedNumber);
-    if (numbered) return numbered;
+    return candidates.find(({ block }) => sectionNumber(block.text) === wantedNumber);
   }
+  if (!wanted) return undefined;
   return candidates.find(({ block }) => {
     const actual = normalizeHeading(block.text);
-    return actual === wanted || actual.includes(wanted) || wanted.includes(actual);
+    return actual && (actual === wanted || actual.includes(wanted) || wanted.includes(actual));
   });
 }
 

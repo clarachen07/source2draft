@@ -14,6 +14,7 @@ import {
   assertSafeHttpUrl,
   buildDocumentManifest,
   captureEmbeddedChartFrames,
+  generateStructuredTranslation,
   hasPdfSignature,
   inspectEmbeddedChartFrames,
   isPrivateIp,
@@ -1888,6 +1889,24 @@ test('URL 安全拦截 localhost、私网和保留地址', async () => {
   await assert.doesNotReject(() => assertSafeHttpUrl('https://public.example/a', { dnsLookup: PUBLIC_DNS }));
 });
 
+test('IPv6 的站点本地和旧兼容保留段在直接地址和 DNS 入口均被拒绝', async () => {
+  for (const address of ['fec0::1', 'feff:ffff::1', '::10.0.0.1', '::93.184.216.34', '::ffff']) {
+    assert.equal(isPrivateIp(address), true, address);
+    await assert.rejects(() => assertSafeHttpUrl(`http://[${address}]/article`), /私网或保留地址/);
+    let fetched = false;
+    await assert.rejects(() => safeFetchResource({
+      url: 'https://example.com/article',
+      dnsLookup: async () => [{ address, family: 6 }],
+      fetchFn: async () => { fetched = true; throw new Error('must not fetch'); },
+    }), /私网或保留地址/);
+    assert.equal(fetched, false);
+  }
+  for (const address of ['2606:4700:4700::1111', '2001:4860:4860::8888', '::ffff:93.184.216.34']) {
+    assert.equal(isPrivateIp(address), false, address);
+    await assert.doesNotReject(() => assertSafeHttpUrl(`https://[${address}]/article`));
+  }
+});
+
 test('代理合成 DNS 仅在公共 DNS 返回安全公网地址时放行，下载仍固定到公网地址', async () => {
   const syntheticDns = async () => [{ address: '198.18.1.82', family: 4 }];
   const publicDnsLookup = async () => [{ address: '93.184.216.34', family: 4 }];
@@ -2031,6 +2050,110 @@ test('checkpoint 每个成功批次只写一次，恢复时复用全部已验证
   assert.equal(checkpoint.translations.length, 8);
   await translateDocument({ ...args, resumeFromCheckpoint: true, completeArticle: () => { throw new Error('cache miss'); } });
   assert.equal(events.filter(event => event.cacheHit).at(-1).count, 8);
+});
+
+test('同任务原文快照跨重试复用，翻译补充要求更新时仅重做翻译', async (t) => {
+  const workDir = tempDir();
+  t.after(() => fs.rmSync(workDir, { recursive: true, force: true }));
+  const sourceUrl = 'https://example.com/stable-article';
+  const html = `<html><head><title>Stable Article</title><script>const nonce = 'changing';</script></head><body><article><h1>Stable Article</h1><p>${'A full paragraph about inference and preserving the source. '.repeat(10)}</p></article></body></html>`;
+  let downloads = 0;
+  const requests = [];
+  const args = {
+    input: `翻译 ${sourceUrl}\n\n补充指令：\n术语 inference 统一译为推理`, sourceUrl,
+    workflow: { workDir, model: 'fixture' }, writer: {}, resumeFromCheckpoint: true,
+    translationConfig: { dnsLookup: PUBLIC_DNS, browserEnabled: false, datalabApiKey: 'fixture-secret' },
+    fetchFn: async () => { downloads++; return new Response(html, { headers: { 'content-type': 'text/html' } }); },
+    completeArticle: async () => { throw new Error('fixture interruption after acquisition'); },
+  };
+  await assert.rejects(() => generateStructuredTranslation(args), /fixture interruption/);
+  assert.equal(downloads, 1);
+  const snapshotPath = path.join(workDir, 'translation-source-document.json');
+  assert.doesNotMatch(fs.readFileSync(snapshotPath, 'utf8'), /fixture-secret/);
+  const translate = jsonTranslator((payload, prompt) => requests.push({ payload, prompt }));
+  await generateStructuredTranslation({ ...args, completeArticle: translate });
+  assert.equal(downloads, 1);
+  assert.ok(requests.every(({ prompt }) => prompt.includes('术语 inference 统一译为推理')));
+  const completedRequests = requests.length;
+  await generateStructuredTranslation({ ...args, completeArticle: () => { throw new Error('unexpected repeated translation'); } });
+  assert.equal(downloads, 1);
+  await generateStructuredTranslation({ ...args, input: `${args.input}\n\n补充指令：\n标题改为《推理研究》`, completeArticle: translate });
+  assert.equal(downloads, 1);
+  assert.ok(requests.length > completedRequests);
+  assert.ok(requests.at(-1).prompt.includes('标题改为《推理研究》'));
+
+  const otherDir = tempDir();
+  t.after(() => fs.rmSync(otherDir, { recursive: true, force: true }));
+  fs.copyFileSync(snapshotPath, path.join(otherDir, 'translation-source-document.json'));
+  await assert.rejects(() => generateStructuredTranslation({ ...args, workflow: { ...args.workflow, workDir: otherDir } }), /fixture interruption/);
+  assert.equal(downloads, 2, 'copied snapshot cannot serve another task');
+  await assert.rejects(() => generateStructuredTranslation({ ...args, sourceUrl: `${sourceUrl}?revision=new` }), /fixture interruption/);
+  assert.equal(downloads, 3, 'changed source cannot reuse the snapshot');
+  await assert.rejects(() => generateStructuredTranslation({ ...args, sourceUrl: `${sourceUrl}?revision=new`,
+    translationConfig: { ...args.translationConfig, datalabMode: 'accurate' } }), /fixture interruption/);
+  assert.equal(downloads, 4, 'changed extraction options cannot reuse the snapshot');
+  await assert.rejects(() => generateStructuredTranslation({ ...args, sourceUrl: `${sourceUrl}?revision=new`,
+    input: `只翻译“Stable Article” ${sourceUrl}?revision=new`, translationConfig: { ...args.translationConfig, datalabMode: 'accurate' } }), /fixture interruption/);
+  assert.equal(downloads, 5, 'changed scope cannot reuse the snapshot');
+});
+
+test('原文快照缺失或空资产会重新获取，逃逸任务目录的符号链接不会被复用或覆写', async (t) => {
+  for (const damage of ['missing', 'empty', 'escape']) {
+    const workDir = tempDir(), outsideDir = tempDir();
+    t.after(() => { fs.rmSync(workDir, { recursive: true, force: true }); fs.rmSync(outsideDir, { recursive: true, force: true }); });
+    const sourceUrl = 'https://example.com/with-chart';
+    const html = `<html><head><title>Chart Article</title></head><body><article><h1>Chart Article</h1><p>${'Source text for a complete article with chart. '.repeat(10)}</p><figure><img src="chart.png" alt="Chart"><figcaption>Chart caption</figcaption></figure></article></body></html>`;
+    let downloads = 0;
+    const args = {
+      input: `翻译 ${sourceUrl}`, sourceUrl, workflow: { workDir, model: 'fixture' }, writer: {}, resumeFromCheckpoint: true,
+      translationConfig: { dnsLookup: PUBLIC_DNS, browserEnabled: false },
+      fetchFn: async (url) => { downloads++; return String(url).endsWith('.png')
+        ? new Response(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB', 'base64'), { headers: { 'content-type': 'image/png' } })
+        : new Response(html, { headers: { 'content-type': 'text/html' } }); },
+      completeArticle: async () => { throw new Error('fixture interruption'); },
+    };
+    await assert.rejects(() => generateStructuredTranslation(args), /fixture interruption/);
+    const saved = JSON.parse(fs.readFileSync(path.join(workDir, 'translation-source-document.json'), 'utf8'));
+    const asset = saved.document.blocks.find(block => block.type === 'figure').images[0].localPath;
+    const initialDownloads = downloads;
+    if (damage === 'empty') fs.writeFileSync(asset, '');
+    else fs.unlinkSync(asset);
+    if (damage === 'escape') {
+      const outside = path.join(outsideDir, 'user-asset.png');
+      fs.writeFileSync(outside, 'preserve this asset');
+      fs.symlinkSync(outside, asset);
+      await assert.rejects(() => generateStructuredTranslation(args), /任务目录之外/);
+      assert.equal(downloads, initialDownloads);
+      assert.equal(fs.readFileSync(outside, 'utf8'), 'preserve this asset');
+    } else {
+      await assert.rejects(() => generateStructuredTranslation(args), /fixture interruption/);
+      assert.equal(downloads, initialDownloads * 2);
+      assert.ok(fs.statSync(asset).size);
+    }
+  }
+});
+
+test('翻译补充要求贯穿截断后的拆批和局部修复', async (t) => {
+  const workDir = tempDir();
+  t.after(() => fs.rmSync(workDir, { recursive: true, force: true }));
+  const source = { version: 5, sourceType: 'html', title: 'Instructions', sourceUrl: 'https://example.com/instructions', sha256: 'instructions',
+    blocks: Array.from({ length: 8 }, (_, index) => ({ id: `b${index}`, type: 'paragraph', text: `Inference step ${index + 1}.` })) };
+  const translationInstructions = '术语 inference 统一译为推理';
+  const phases = [];
+  await translateDocument({ source, workDir, model: 'fixture', translationInstructions,
+    completeArticle: async ({ prompt, inferenceContext }) => {
+      assert.ok(prompt.includes(translationInstructions));
+      phases.push(inferenceContext);
+      const { units } = JSON.parse(/输入 JSON:\n([\s\S]+)$/.exec(prompt)[1]);
+      if (units.length > 6) return '{"translations":[';
+      const repair = inferenceContext.phase === 'repair';
+      return JSON.stringify({ translations: units.filter(unit => repair || unit.id !== 'b0').map(unit => ({
+        id: unit.id, text: unit.kind === 'title' ? '翻译要求' : `推理步骤 ${repair ? '⟦SL_KEEP_1⟧' : unit.text.match(/\d+/)[0]}。`,
+      })) });
+    },
+  });
+  assert.ok(phases.some(context => context.splitBatchIndex));
+  assert.ok(phases.some(context => context.phase === 'repair'));
 });
 
 test('真实 DeepSeek 适配器 length 响应触发有界拆批，持续截断仍硬失败', async () => {

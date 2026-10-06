@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { documentText, readSource } from '../src/core/sources.js';
+import { acquireSourceDocument } from '../src/workflows/translation-source-text.js';
 
 test('analysis source text restores PDF inline fragments, table cells, and equations', () => {
   const text = documentText({ blocks: [
@@ -83,4 +84,52 @@ test('analysis PDF reader downloads once through the real acquisition and parser
     assert.deepEqual(document.pageCoverage.processedPageIds, [0]);
     assert.ok(events.some(event => event.cacheHit && event.count === 1));
   } finally { fs.rmSync(workDir, { recursive: true, force: true }); }
+});
+
+test('PDF section selection validates full extraction before cropping and processes only selected assets', {
+  skip: hasPoppler ? false : 'PDF integration verification requires Poppler (pdfinfo and pdftotext)',
+}, async (t) => {
+  const sourceUrl = 'https://93.184.216.34/sections.pdf';
+  const intro = 'This introduction explains the requested part of a complete source document. '.repeat(6);
+  const methods = 'The remaining methods and experimental results are outside the requested section. '.repeat(180);
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB', 'base64');
+  const webp = Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(4), Buffer.from('WEBPVP8 ')]);
+  for (const incomplete of [false, true]) {
+    const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'source-pdf-section-'));
+    t.after(() => fs.rmSync(workDir, { recursive: true, force: true }));
+    let rasterizations = 0;
+    const html = `<div class="page" data-page-id="0"><h1>Section fixture</h1><h2>1 Introduction</h2><p>${intro}</p>
+      <figure><img src="inside.png"><figcaption>Introduction chart</figcaption></figure>
+      <h2>2 Methods</h2>${incomplete ? `<script>${methods}</script>` : `<p>${methods}</p>`}
+      <figure><img src="outside.webp"><figcaption>Methods chart</figcaption></figure>
+      <table><tr><th>Unselected table</th><td>Evidence</td></tr></table></div>`;
+    const operation = acquireSourceDocument({
+      sourceUrl, workDir, scope: { kind: 'sections', start: 'Introduction', end: 'Introduction' },
+      config: { datalabApiKey: 'fixture-key', browserEnabled: false,
+        imageRasterizer: async () => { rasterizations++; throw new Error('unselected image must not be rasterized'); },
+        tableRasterizer: async () => { rasterizations++; throw new Error('unselected table must not be rasterized'); },
+      },
+      fetchFn: async (url) => {
+        if (url === sourceUrl) return new Response(onePagePdf(), { headers: { 'content-type': 'application/pdf' } });
+        if (url === 'https://www.datalab.to/api/v1/convert') return Response.json({
+          success: true, request_id: 'section-fixture', request_check_url: 'https://www.datalab.to/api/v1/convert/section-fixture',
+        });
+        assert.equal(url, 'https://www.datalab.to/api/v1/convert/section-fixture', 'no out-of-scope asset download');
+        return Response.json({ status: 'complete', success: true, page_count: 1, parse_quality_score: 4.5,
+          images: { 'inside.png': png.toString('base64'), 'outside.webp': webp.toString('base64') }, html });
+      },
+    });
+    if (incomplete) {
+      await assert.rejects(operation, /PDF 页级完整性校验失败.*结构化正文仅保留 Datalab 文本/);
+    } else {
+      const document = await operation;
+      assert.equal(document.scope.appliedStartHeading, '1 Introduction');
+      assert.equal(document.scope.appliedEndHeading, '1 Introduction');
+      assert.deepEqual(document.blocks.filter(block => block.type === 'heading').map(block => block.text), ['1 Introduction']);
+      assert.equal(document.blocks.some(block => block.type === 'table'), false);
+      assert.ok(fs.existsSync(document.blocks.find(block => block.type === 'figure').images[0].localPath));
+      assert.ok(document.pageCoverage.extractedCharacters > intro.length * 10, 'coverage describes the complete uncropped extraction');
+    }
+    assert.equal(rasterizations, 0);
+  }
 });

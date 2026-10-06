@@ -98,3 +98,31 @@ test('指定章节不存在时列出可用标题并失败', () => {
     end: 'Results',
   }), /未找到指定翻译章节.*Introduction/);
 });
+
+test('补充范围覆盖旧范围，全文重置，无关补充继承范围', () => {
+  const original = '翻译前3页 https://example.com/paper.pdf';
+  const followup = (text) => `${original}\n\n补充指令：\n${text}`;
+  assert.equal(parseTranslationScope(followup('改为翻译前5页')).endPage, 5);
+  assert.equal(parseTranslationScope(followup('改为只翻译“Introduction”')).start, 'Introduction');
+  assert.equal(parseTranslationScope(followup('改为全文')).kind, 'all');
+  assert.equal(parseTranslationScope(followup('Translate the entire document')).kind, 'all');
+  assert.equal(parseTranslationScope(followup('术语 inference 统一译为推理')).endPage, 3);
+  assert.equal(parseTranslationScope(followup('改为第2节')).start, '2');
+  assert.equal(parseTranslationScope(followup('改成‘Introduction’章节')).start, 'Introduction');
+  assert.equal(parseTranslationScope(followup('全文')).kind, 'all');
+  assert.equal(parseTranslationScope(followup('第2页里的 inference 统一译为推理，其他保持不变')).endPage, 3);
+  assert.equal(parseTranslationScope(followup('标题保留原文第1页的写法')).endPage, 3);
+  assert.equal(parseTranslationScope(followup('改为只翻译第2页')).startPage, 2);
+  assert.equal(parseTranslationScope(`${followup('改为全文')}\n\n补充指令：\n标题改短一些`).kind, 'all');
+});
+
+test('缺失数字章节不得回退到第一标题，空标题不参加模糊匹配', () => {
+  const document = { blocks: [
+    { id: 'b1', type: 'heading', level: 2, text: '1 Introduction' },
+    { id: 'b2', type: 'paragraph', text: 'Introduction body' },
+    { id: 'b3', type: 'heading', level: 2, text: '2' },
+  ] };
+  assert.throws(() => applyTranslationScope(document, parseTranslationScope('翻译第9节')), /未找到指定翻译章节.*9/);
+  assert.throws(() => applyTranslationScope(document, { kind: 'sections', start: '9 Introduction', end: '9 Introduction' }), /未找到指定翻译章节/);
+  assert.throws(() => applyTranslationScope(document, { kind: 'sections', start: 'Methods', end: 'Methods' }), /未找到指定翻译章节/);
+});

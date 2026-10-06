@@ -7,6 +7,19 @@ import { contentIdentity, createWechat } from '../src/channels/wechat.js';
 import { openStore } from '../src/core/store.js';
 
 const png = Buffer.from('89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000a49444154789c6360000002000148afa4710000000049454e44ae426082', 'hex');
+test('公众号 40164 明确说明出口 IP 白名单，诊断不泄漏服务端原始错误内容', async () => {
+  for (const address of ['198.51.100.23', '2001:db8::23', 'not-an-ip']) {
+    const client = createWechat({ wechat: { appId: 'fixture-account', secret: 'fixture-secret' } }, {
+      fetchFn: async () => Response.json({ errcode: 40164, errmsg: `invalid ip ${address}, not in whitelist hint: fixture-secret` }),
+    });
+    await assert.rejects(client.accessToken(), error => {
+      assert.match(error.message, /40164.*白名单.*原 Slack 线程回复“重试”/);
+      assert.doesNotMatch(error.message, /fixture-secret|hint:|not-an-ip/);
+      if (address !== 'not-an-ip') assert.ok(error.message.includes(address));
+      return true;
+    });
+  }
+});
 test('公众号回读将图片移至 data-src 并改成 /640 时仍核对同一素材', () => {
   const base = { title: '文章', thumb_media_id: 'cover', content: '<p>正文</p><img src="http://mmbiz.qpic.cn/mmbiz_jpg/abc/0">' };
   const readback = { ...base, content: '<p>正文</p><img data-src="https://mmbiz.qpic.cn/mmbiz_jpg/abc/640">' };
@@ -45,6 +58,22 @@ test('successful draft persists media ID before readback and does not duplicate 
     const result = await f.client.publish(f.args); assert.equal(result.mediaId, 'draft-id');
     assert.equal(f.store.get(f.run.id).media_id, 'draft-id');
     await f.client.publish(f.args); assert.equal(f.created, 1);
+  } finally { f.close(); }
+});
+test('new draft normalizes cached native lists before saving its operation; recovery uses the saved payload', async () => {
+  const f = fixture('success');
+  try {
+    f.args.prepared.html = '<ul>\n<li><br></li>\n<li>DPO 阶段</li>\n<li>最终模型</li>\n</ul>';
+    await f.client.publish(f.args);
+    const payload = JSON.parse(f.store.operation(f.run.id).payload);
+    assert.doesNotMatch(payload.content, /<\/?(?:ul|ol|li)\b/);
+    assert.match(payload.content, /• DPO 阶段/);
+    assert.match(payload.content, /• 最终模型/);
+    assert.equal((payload.content.match(/• /g) || []).length, 2);
+    f.args.prepared.html = '<ul><li> changed cache </li></ul>';
+    await f.client.publish(f.args);
+    assert.equal(f.created, 1);
+    assert.deepEqual(JSON.parse(f.store.operation(f.run.id).payload), payload);
   } finally { f.close(); }
 });
 test('lost create response reconciles uniquely by snapshot and full content', async () => {

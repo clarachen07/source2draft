@@ -3,12 +3,15 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { JSDOM } from 'jsdom';
+import { chromium } from 'playwright-core';
+import { resolveBrowserExecutable } from '../src/lib/browser.js';
 import {
   protectMathInMarkdown,
   restoreMathInHtml,
   validateMathRestored,
   compileEquationSvg,
   equationCaptureHtml,
+  renderEquationPngs,
 } from '../src/lib/wechat-math.js';
 import { validatePreparedWechatHtml } from '../src/lib/wechat-render.js';
 
@@ -86,6 +89,63 @@ test('TeX 编译:合法公式产出 SVG,非法公式抛错', () => {
   assert.match(ok.svg, /^<svg[\s\S]*<\/svg>$/);
 
   assert.throws(() => compileEquationSvg('\\notARealCommand{1}', false), /公式编译失败/);
+  assert.throws(() => compileEquationSvg('\\frac{1}', false), /公式编译失败/);
+});
+
+test('TeX 编译:合法红色公式保留颜色，未知命令仍产生真实编译错误', () => {
+  for (const tex of ['\\color{red}{x+1}', '\\textcolor{red}{loss}']) {
+    const { svg } = compileEquationSvg(tex, false);
+    assert.match(svg, /fill="red"/);
+    assert.doesNotMatch(svg, /data-mjx-error/);
+  }
+  assert.throws(() => compileEquationSvg('\\color{red}{\\notARealCommand{x}}', false), /公式编译失败/);
+});
+
+test('TeX 编译:论文 bm 保留粗体希腊字母、嵌套分组及未分组参数', () => {
+  for (const [source, equivalent] of [
+    ['{\\bm{f}}', '{\\boldsymbol{f}}'],
+    ['\\bm{\\alpha + {x_i}}', '\\boldsymbol{\\alpha + {x_i}}'],
+    ['\\bm\\theta', '\\boldsymbol{\\theta}'],
+    ['p({\\mathbf{a}},{\\mathbf{b}})=wp({\\mathbf{a}})\\delta({\\bm{b}})+(1-w)p({\\mathbf{a}},{\\mathbf{b}})',
+      'p({\\mathbf{a}},{\\mathbf{b}})=wp({\\mathbf{a}})\\delta({\\boldsymbol{b}})+(1-w)p({\\mathbf{a}},{\\mathbf{b}})'],
+  ]) {
+    for (const display of [false, true]) {
+      assert.equal(compileEquationSvg(source, display).svg, compileEquationSvg(equivalent, display).svg);
+    }
+  }
+  assert.throws(() => compileEquationSvg('\\bm{\\notARealCommand{x}}', false), /Undefined control sequence/);
+  assert.throws(() => compileEquationSvg('\\bm', false), /公式编译失败/);
+});
+
+test('TeX 编译:argmax 与 argmin 保留运算符间距和显示模式下标', () => {
+  for (const name of ['max', 'min']) {
+    for (const display of [false, true]) {
+      for (const suffix of ['', '_{\\bm{x}\\in\\mathbb{R}^{d}} f(\\bm{x})']) {
+        assert.equal(compileEquationSvg(`\\arg${name}${suffix}`, display).svg,
+          compileEquationSvg(`\\operatorname*{arg\\,${name}}${suffix}`, display).svg);
+      }
+    }
+  }
+  assert.throws(() => compileEquationSvg('\\argmaximum', false), /Undefined control sequence/);
+});
+
+test('真实截图:论文 bm 与 argmax 完整恢复为公式图片且原始 TeX 不变', async () => {
+  const dir = await fs.mkdtemp(path.join(process.cwd(), 'test', '.tmp-math-paper-'));
+  try {
+    const protectedMath = protectMathInMarkdown('向量 ${\\bm{f}}$，选择 $\\argmax$。\n\n$$\\argmax_{\\bm{x}} f(\\bm{x})$$');
+    const source = protectedMath.equations.map(({ tex }) => tex);
+    await renderEquationPngs(protectedMath.equations, { outDir: dir });
+    assert.deepEqual(protectedMath.equations.map(({ tex }) => tex), source);
+    const html = restoreMathInHtml(`<p>${protectedMath.markdown}</p>`, protectedMath);
+    assert.deepEqual(validateMathRestored(html, protectedMath), { equations: 3, images: 3 });
+    for (const { image } of protectedMath.equations) {
+      const png = await fs.readFile(path.join(dir, image.src));
+      assert.equal(png.subarray(1, 4).toString(), 'PNG');
+      assert.ok(png.readUInt32BE(16) > 0 && png.readUInt32BE(20) > 0);
+    }
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 test('公式截图 HTML:使用主题墨色且背景透明', () => {
@@ -93,6 +153,44 @@ test('公式截图 HTML:使用主题墨色且背景透明', () => {
   const html = equationCaptureHtml(svg);
   assert.ok(html.includes('background:transparent'));
   assert.ok(html.includes('#2B3645'));
+});
+
+test('真实截图:公式保留 3 倍像素，明确的显示宽高压过阅读端图片样式', async () => {
+  const dir = await fs.mkdtemp(path.join(process.cwd(), 'test', '.tmp-math-size-'));
+  try {
+    const { equations } = protectMathInMarkdown('布尔变量 $A$ 和 $B$，以及 $A\\Rightarrow B$。');
+    await renderEquationPngs(equations, { outDir: dir });
+    for (const equation of equations) {
+      const png = await fs.readFile(path.join(dir, equation.image.src));
+      const width = png.readUInt32BE(16);
+      const height = png.readUInt32BE(20);
+      const logicalWidth = equation.image.width + 6;
+      const logicalHeight = equation.image.height + 4;
+      assert.ok(Math.abs(width - logicalWidth * 3) <= 3, 'PNG 宽度应为显示宽度的三倍');
+      assert.ok(Math.abs(height - logicalHeight * 3) <= 3, 'PNG 高度应为显示高度的三倍');
+      const html = restoreMathInHtml(equation.token, { equations: [equation] });
+      const image = new JSDOM(html).window.document.querySelector('img');
+      assert.equal(Number(image.getAttribute('width')), logicalWidth);
+      assert.equal(Number(image.getAttribute('height')), logicalHeight);
+      assert.match(image.getAttribute('style'), /width:[\d.]+em!important;height:[\d.]+em!important/);
+    }
+    const first = equations[0];
+    const png = await fs.readFile(path.join(dir, first.image.src));
+    const html = restoreMathInHtml(first.token, { equations: [first] })
+      .replace(first.image.src, `data:image/png;base64,${png.toString('base64')}`);
+    const browser = await chromium.launch({ executablePath: resolveBrowserExecutable(), headless: true });
+    try {
+      const page = await browser.newPage({ viewport: { width: 390, height: 200 }, deviceScaleFactor: 2 });
+      await page.setContent(`<style>img{width:auto!important;height:auto!important}</style>${html}`);
+      const size = await page.locator('img').evaluate(img => ({ width: img.getBoundingClientRect().width, height: img.getBoundingClientRect().height }));
+      assert.ok(Math.abs(size.width - (first.image.width + 6)) < 1);
+      assert.ok(Math.abs(size.height - (first.image.height + 4)) < 1);
+    } finally {
+      await browser.close();
+    }
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 function fakeEquationImage(equation) {
@@ -149,7 +247,7 @@ test('恢复与校验:残留占位符或 TeX 必须硬失败', () => {
   assert.doesNotThrow(() => validateMathRestored('<pre><code>\\mathbf{X}</code></pre>', { equations: [] }));
 });
 
-test('恢复与校验:公式 em 尺寸 = 像素 / 16(随读者字号缩放,不得缩小)', () => {
+test('恢复与校验:公式 em 尺寸包含截图留白并随读者字号缩放', () => {
   const protection = protectMathInMarkdown('设 $\\mathbf{X}_{\\leq t}$ 与显示公式\n\n$$\\max f$$\n\n结束。\n');
   withImages(protection.equations);
   const html = restoreMathInHtml(
@@ -159,17 +257,48 @@ test('恢复与校验:公式 em 尺寸 = 像素 / 16(随读者字号缩放,不�
   const document = new JSDOM(html).window.document;
   for (const image of document.querySelectorAll('img[data-sl-math="true"]')) {
     const style = image.getAttribute('style');
-    const em = parseFloat(/([\d.]+)em/.exec(style)[1]);
+    const em = parseFloat(new RegExp(`${image.closest('[data-sl-math-display]') ? 'width' : 'height'}:([\\d.]+)em`).exec(style)[1]);
     const isDisplay = Boolean(image.closest('[data-sl-math-display]'));
-    if (isDisplay) assert.equal(em, 96 / 16, '显示宽度应为 px/16');
-    else assert.equal(em, 32 / 16, '行内高度应为 px/16');
+    if (isDisplay) assert.equal(em, (96 + 6) / 16, '显示宽度应包含左右各 3px 的留白');
+    else assert.equal(em, (32 + 4) / 16, '行内高度应包含上下各 2px 的留白');
   }
 });
 
 test('恢复与校验:公式尺寸超出合理范围必须硬失败', () => {
-  const tiny = [{ token: 'SLMATH0001XSLMATH', tex: 'x_t', display: false, hasCjk: false, image: { src: 'm.png', width: 96, height: 6 } }];
+  const tiny = [{ token: 'SLMATH0001XSLMATH', tex: 'x_t', display: false, hasCjk: false, image: { src: 'm.png', width: 96, height: 1 } }];
   const restoredTiny = restoreMathInHtml('<p>A SLMATH0001XSLMATH B</p>', { equations: tiny });
   assert.throws(() => validateMathRestored(restoredTiny, { equations: tiny }), /超出合理范围/);
+});
+
+test('恢复与校验:超宽显示公式声明宽度封顶为 38em 并通过门禁', () => {
+  // 复现线上故障场景:自然宽度 648px = 40.5em,原样声明会触发 40em 门禁
+  const wide = [{ token: 'SLMATH0001XSLMATH', tex: '\\begin{aligned}a&=b\\end{aligned}', display: true, hasCjk: false, image: { src: 'm.png', width: 648, height: 110 } }];
+  const html = restoreMathInHtml('SLMATH0001XSLMATH', { equations: wide });
+  const image = new JSDOM(html).window.document.querySelector('img[data-sl-math="true"]');
+  const em = parseFloat(/([\d.]+)em/.exec(image.getAttribute('style'))[1]);
+  assert.equal(em, 38, '40.5em 的自然宽度应封顶为 38em');
+  assert.doesNotThrow(() => validateMathRestored(html, { equations: wide }));
+});
+
+test('恢复与校验:自然宽度不超过 38em 的显示公式保持 px/16 声明', () => {
+  const equations = [
+    { token: 'SLMATH0001XSLMATH', tex: 'a=b', display: true, hasCjk: false, image: { src: 'm.png', width: 608, height: 40 } },
+    { token: 'SLMATH0002XSLMATH', tex: 'c=d', display: true, hasCjk: false, image: { src: 'n.png', width: 320, height: 40 } },
+  ];
+  const html = restoreMathInHtml('SLMATH0001XSLMATH\n\nSLMATH0002XSLMATH', { equations });
+  const images = [...new JSDOM(html).window.document.querySelectorAll('img[data-sl-math="true"]')];
+  assert.equal(parseFloat(/([\d.]+)em/.exec(images[0].getAttribute('style'))[1]), 608 / 16, '恰好 38em 时不得再缩小');
+  assert.equal(parseFloat(/([\d.]+)em/.exec(images[1].getAttribute('style'))[1]), (320 + 6) / 16, '窄公式应包含左右截图留白');
+});
+
+test('恢复与校验:自然宽度超过可缩放上限的显示公式必须失败并提示拆分', () => {
+  const tooWide = [{ token: 'SLMATH0001XSLMATH', tex: 'x', display: true, hasCjk: false, image: { src: 'm.png', width: 1240, height: 40 } }];
+  assert.throws(() => restoreMathInHtml('SLMATH0001XSLMATH', { equations: tooWide }), /拆分/);
+});
+
+test('恢复与校验:显示公式声明宽度超过 40em 的门禁仍然硬失败', () => {
+  const html = '<section data-sl-math-display="true"><img data-sl-math="true" src="m.png" alt="" style="width:45em;max-width:100%;height:auto;display:block;"></section>';
+  assert.throws(() => validateMathRestored(html, { equations: [] }), /超出合理范围/);
 });
 
 test('公式去重:行内段落与相同 TeX 的显示块只保留显示版', () => {

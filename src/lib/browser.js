@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import { chromium } from 'playwright-core';
 import { emitTelemetry } from './telemetry.js';
 import { cancellationErrorFromSignal, throwIfTaskCancelled } from './task-cancellation.js';
+import { withRuntimeResource } from '../config/runtime.js';
 
 export function resolveBrowserExecutable(explicit) {
   const candidate = typeof explicit === 'string' ? explicit : explicit?.executablePath;
@@ -13,6 +14,10 @@ export function resolveBrowserExecutable(explicit) {
 }
 
 export async function screenshotHtml(html, target, config, { width = 900, height = 383, signal, onTelemetry } = {}) {
+  return withRuntimeResource('browser', () => screenshotLocked(html, target, config, { width, height, signal, onTelemetry }), signal);
+}
+
+async function screenshotLocked(html, target, config, { width, height, signal, onTelemetry }) {
   throwIfTaskCancelled(signal);
   const started = performance.now();
   const browser = await chromium.launch({ executablePath: resolveBrowserExecutable(config.browser), headless: true });

@@ -3,11 +3,39 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { runDailyResearch, dailyContext } from '../src/workflows/daily-research.js';
+import { runDailyResearch as runIncludingHeader, dailyContext } from '../src/workflows/daily-research.js';
 import { normalizeCandidate } from '../src/research/candidates.js';
 import { hash, parseArticle } from '../src/lib/io.js';
 import { dailyPlainLength, extractEvidenceCard, validateDailyDraft, verifyEvidenceClaims } from '../src/research/evidence.js';
 import { DAILY_REVIEW_POLICY } from '../src/research/review.js';
+
+// Legacy fixtures focus on per-item repairs. Header repair is exercised separately.
+const runDailyResearch = args => runIncludingHeader({ ...args, model: { ...args.model, json: request =>
+  request.prompt.startsWith('只审核整篇标题') ? Promise.resolve({ issues: [], warnings: [] }) : args.model.json(request) } });
+
+test('header factual correction spends the existing one correction budget without rewriting item bodies', async () => {
+  for (const persists of [false, true]) {
+    const f = fixture(), original = f.args.model.json;
+    let headers = 0, repairs = 0;
+    f.args.model.json = async request => {
+      if (request.role === 'planner') return { ...await original(request), title: '真实交易已被验证' };
+      if (request.prompt.startsWith('只修正标题和导语')) { repairs++; return { title: '金融预测方法与局限', intro: '作者报告了金融预测实验的方法与限制。' }; }
+      if (request.prompt.startsWith('只审核整篇标题')) {
+        headers++;
+        return { issues: persists || headers === 1 ? [{ severity: 'high', reason: '标题错误：原文仅报告预测评估，并非真实交易。' }] : [], warnings: [] };
+      }
+      return original(request);
+    };
+    try {
+      const result = runIncludingHeader(f.args);
+      if (persists) await assert.rejects(result, error => error.needsReview);
+      else assert.match((await result).article, /金融预测方法与局限/);
+      assert.equal(f.stats.writer, 1, 'the already reviewed item body stays unchanged');
+      assert.equal(repairs, 1); assert.equal(headers, 2);
+      assert.equal(JSON.parse(fs.readFileSync(path.join(f.args.workDir, 'research-trace.json'))).correctionCount, 1);
+    } finally { f.close(); }
+  }
+});
 
 const context = { issueDate: '2026-10-02', scheduledAt: '2026-10-03T00:00:00.000Z', cutoffAt: '2026-10-03T00:00:00.000Z',
   windowStart: '2026-10-02T00:00:00.000Z', supplementStart: '2026-09-26T00:00:00.000Z', isCatchup: false };

@@ -7,6 +7,8 @@ import { chooseTranslationSource, chooseCover, findPreviousArticle, createEngine
 import { createWechat } from '../src/channels/wechat.js';
 import { loadConfig } from '../src/config/index.js';
 import { openStore } from '../src/core/store.js';
+import { approveArtifact } from '../src/lib/artifact-cache.js';
+import { modelIdentity } from '../src/core/model-identity.js';
 import { writeAtomic } from '../src/lib/io.js';
 
 const config = loadConfig({ SLACK_BOT_TOKEN: 'fixture-token' });
@@ -171,11 +173,11 @@ test('retry after a definite rejection can still create a new operation from the
     f.store.update(f.task.id, { status: 'failed' });
     f.store.retry(f.task.id);
     assert.equal(f.store.operation(f.task.id), undefined);
-    writeAtomic(path.join(f.workDir, 'artifact.json'), { article: '# 已拒绝后重试\n\n完整正文。' });
+    writeAtomic(path.join(f.workDir, 'artifact.json'), approveArtifact({ article: '# 已拒绝后重试\n\n完整正文。' }, { input: f.store.get(f.task.id).input, mode: 'analysis', modelIdentity: modelIdentity(config.model, { mode: 'analysis' }) }));
     writeAtomic(path.join(f.workDir, 'prepared.json'), { title: '已拒绝后重试', html: '<p>完整正文。</p>' });
     let creates = 0;
     const engine = createEngine({ config: { ...config, dataDir: path.dirname(path.dirname(f.workDir)) }, store: f.store,
-      modelFactory: () => ({}), prepare: () => assert.fail('Saved formatting should be reused'),
+      modelFactory: () => ({}), prepare: async () => ({ title: '已拒绝后重试', html: '<p>完整正文。</p>' }),
       wechat: { publish: async ({ run, store, prepared }) => {
         creates++;
         store.beginPublish(run, prepared, []);

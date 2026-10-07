@@ -1,3 +1,4 @@
+import { assertProjectPath } from '../lib/project-path.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -8,14 +9,15 @@ const generated = ['research-trace.json', 'translation-checkpoint.json', 'artifa
   'article.html', 'preview.html', 'prepared.json', 'cover.png', 'model-identity.json'];
 
 // Called only before a new model stage, never before remote-operation recovery.
-export function prepareModelRecovery({ workDir, modelConfig, profile }) {
+export function prepareModelRecovery({ workDir, modelConfig, profile, mode }) {
   const filename = path.join(workDir, 'model-identity.json');
-  const identity = modelIdentity(modelConfig), saved = readJson(filename);
+  const identity = modelIdentity(modelConfig, { profile, mode }), saved = readJson(filename);
   const existing = generated.filter(name => fs.existsSync(path.join(workDir, name)));
   const changed = saved ? saved.fingerprint !== hash(identity)
     : identity.provider !== 'deepseek' && existing.length > 0;
   if (changed) {
     const historyRoot = path.join(workDir, 'model-history');
+    assertProjectPath(workDir, historyRoot);
     fs.mkdirSync(historyRoot, { recursive: true, mode: 0o700 });
     if (fs.lstatSync(historyRoot).isSymbolicLink()) throw new Error('模型历史目录不能是符号链接');
     const history = path.join(historyRoot, randomUUID()); fs.mkdirSync(history, { mode: 0o700 });

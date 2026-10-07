@@ -6,6 +6,8 @@ import path from 'node:path';
 import { createEngine } from '../src/core/engine.js';
 import { loadConfig } from '../src/config/index.js';
 import { openStore } from '../src/core/store.js';
+import { approveArtifact } from '../src/lib/artifact-cache.js';
+import { modelIdentity } from '../src/core/model-identity.js';
 import { writeAtomic } from '../src/lib/io.js';
 
 const deferred = () => {
@@ -25,7 +27,7 @@ function fixture(overrides = {}) {
     scheduledAt: Date.parse('2026-10-03T01:00:00Z'), cutoffAt: Date.now(), dryRun, manual: true }).run;
   const manual = () => {
     const run = store.enqueue({ threadKey: 'local:manual', ts: '1', version: 1, text: '手动文章', dryRun: true }).run;
-    writeAtomic(path.join(engine.workDirFor(run.id), 'artifact.json'), { article: '# 手动文章\n\n完整正文。' });
+    writeAtomic(path.join(engine.workDirFor(run.id), 'artifact.json'), approveArtifact({ article: '# 手动文章\n\n完整正文。' }, { input: run.input, mode: 'analysis', modelIdentity: modelIdentity(config.model, { mode: 'analysis' }) }));
     return run;
   };
   return { store, config, engine, daily, manual, close: async () => {

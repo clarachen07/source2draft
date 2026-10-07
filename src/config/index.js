@@ -3,6 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import dotenv from 'dotenv';
 import os from 'node:os';
+import { assertProjectPath } from '../lib/project-path.js';
 
 export const ROOT = fileURLToPath(new URL('../../', import.meta.url));
 export function loadConfig(env) {
@@ -13,7 +14,7 @@ export function loadConfig(env) {
     return value;
   };
   const dataDir = path.resolve(ROOT, env.DATA_DIR || 'runtime');
-  if (!dataDir.startsWith(ROOT) || dataDir === ROOT.replace(/\/$/, '')) throw new Error('DATA_DIR 必须在本项目的独立子目录内');
+  if (!dataDir.startsWith(path.resolve(ROOT) + path.sep) || dataDir === ROOT.replace(/\/$/, '')) throw new Error('DATA_DIR 必须在本项目的独立子目录内');
   if (!['true', 'false', undefined, ''].includes(env.HUB_DRY_RUN)) throw new Error('HUB_DRY_RUN 必须为 true 或 false');
   const effort = env.DEEPSEEK_REASONING_EFFORT || 'high';
   if (!['low', 'high', 'max'].includes(effort)) throw new Error('DEEPSEEK_REASONING_EFFORT 必须为 low、high 或 max');
@@ -97,6 +98,7 @@ export function redact(value, config, { maxLength = 1800 } = {}) {
     .replace(/(?<![a-zA-Z0-9_])(?:xox[baprs]-[\w-]+|xapp-[\w-]+|sk-[\w-]{12,})/g, '[REDACTED]').slice(0, maxLength);
 }
 export function prepareData(config) {
+  assertProjectPath(config.root, config.dataDir);
   fs.mkdirSync(config.dataDir, { recursive: true, mode: 0o700 });
   if (!fs.realpathSync(config.dataDir).startsWith(fs.realpathSync(config.root) + path.sep)) throw new Error('运行目录不能通过符号链接指向其他项目');
 }

@@ -1,3 +1,4 @@
+import { assertProjectPath } from './project-path.js';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { JSDOM } from 'jsdom';
@@ -10,6 +11,8 @@ import { RegisterHTMLHandler } from 'mathjax-full/js/handlers/html.js';
 import { chromium } from 'playwright-core';
 import { withRuntimeResource } from '../config/runtime.js';
 import { resolveBrowserExecutable } from './browser.js';
+import { fileRecord } from './artifact-cache.js';
+import { hash, readJson, writeAtomic } from './io.js';
 import { emitTelemetry } from './telemetry.js';
 import { cancellationErrorFromSignal, throwIfTaskCancelled } from './task-cancellation.js';
 
@@ -288,34 +291,36 @@ export function restoreMathInHtml(html, { equations = [] } = {}) {
   if (!equations.length) return String(html ?? '');
   const byToken = new Map(equations.map((equation) => [equation.token, equation]));
   const dom = new JSDOM(`<body>${String(html ?? '')}</body>`);
-  const window = dom.window;
-  const walker = window.document.createTreeWalker(window.document.body, window.NodeFilter.SHOW_TEXT);
-  const targets = [];
-  while (walker.nextNode()) {
-    if (MATH_TOKEN_ONE.test(walker.currentNode.nodeValue)) targets.push(walker.currentNode);
-  }
-  for (const node of targets) {
-    const parts = node.nodeValue.split(/(SLMATH\d{4}XSLMATH)/);
-    const fragment = window.document.createDocumentFragment();
-    for (const part of parts) {
-      const equation = byToken.get(part);
-      if (!equation) {
-        if (part) fragment.appendChild(window.document.createTextNode(part));
-        continue;
-      }
-      if (equation.display) {
-        const section = window.document.createElement('section');
-        section.setAttribute('data-sl-math-display', 'true');
-        section.setAttribute('style', 'text-align:left;margin:1em 0;');
-        section.appendChild(buildEquationImage(window.document, equation));
-        fragment.appendChild(section);
-      } else {
-        fragment.appendChild(buildEquationImage(window.document, equation));
-      }
+  try {
+    const window = dom.window;
+    const walker = window.document.createTreeWalker(window.document.body, window.NodeFilter.SHOW_TEXT);
+    const targets = [];
+    while (walker.nextNode()) {
+      if (MATH_TOKEN_ONE.test(walker.currentNode.nodeValue)) targets.push(walker.currentNode);
     }
-    node.parentNode.replaceChild(fragment, node);
-  }
-  return window.document.body.innerHTML;
+    for (const node of targets) {
+      const parts = node.nodeValue.split(/(SLMATH\d{4}XSLMATH)/);
+      const fragment = window.document.createDocumentFragment();
+      for (const part of parts) {
+        const equation = byToken.get(part);
+        if (!equation) {
+          if (part) fragment.appendChild(window.document.createTextNode(part));
+          continue;
+        }
+        if (equation.display) {
+          const section = window.document.createElement('section');
+          section.setAttribute('data-sl-math-display', 'true');
+          section.setAttribute('style', 'text-align:left;margin:1em 0;');
+          section.appendChild(buildEquationImage(window.document, equation));
+          fragment.appendChild(section);
+        } else {
+          fragment.appendChild(buildEquationImage(window.document, equation));
+        }
+      }
+      node.parentNode.replaceChild(fragment, node);
+    }
+    return window.document.body.innerHTML;
+  } finally { dom.window.close(); }
 }
 
 // Hard gate: every protected formula must come back as exactly one image, and no
@@ -323,50 +328,52 @@ export function restoreMathInHtml(html, { equations = [] } = {}) {
 export function validateMathRestored(html, { equations = [] } = {}) {
   const errors = [];
   const document = new JSDOM(`<body>${String(html ?? '')}</body>`).window.document;
-  const residue = document.body.textContent.match(MATH_TOKEN_RE);
-  if (residue?.length) {
-    errors.push(`最终 HTML 残留 ${new Set(residue).size} 个未恢复的公式占位符`);
-  }
-  const images = [...document.querySelectorAll('img[data-sl-math="true"]')];
-  if (images.length !== equations.length) {
-    errors.push(`公式图片恢复数量不符:提取 ${equations.length} 个,恢复 ${images.length} 个`);
-  }
-  // Plausible rendered-size bounds catch sizing regressions (e.g. em divisors)
-  // before a draft with invisible formulas can be published.
-  const readEm = (image, property) => parseFloat(new RegExp(`${property}:([\\d.]+)em`).exec(image.getAttribute('style') || '')?.[1] ?? 'NaN');
-  for (const [index, image] of images.entries()) {
-    const display = image.getAttribute('data-sl-math-display') || image.closest('[data-sl-math-display]');
-    const em = readEm(image, display ? 'width' : 'height');
-    if (Number.isNaN(em)) {
-      errors.push(`第 ${index + 1} 张公式图片缺少 em 尺寸`);
-    } else if (display) {
-      if (em < 1 || em > 40) errors.push(`第 ${index + 1} 张显示公式宽度 ${em}em 超出合理范围`);
-    } else if (em < 0.4 || em > 8) {
-      errors.push(`第 ${index + 1} 张行内公式高度 ${em}em 超出合理范围`);
+  try {
+    const residue = document.body.textContent.match(MATH_TOKEN_RE);
+    if (residue?.length) {
+      errors.push(`最终 HTML 残留 ${new Set(residue).size} 个未恢复的公式占位符`);
     }
-  }
-  for (const [index, image] of images.entries()) {
-    if (!image.getAttribute('src')) errors.push(`第 ${index + 1} 张公式图片缺少 src`);
-  }
-  if (document.querySelector('mjx-container')) {
-    errors.push('最终 HTML 残留 MathJax 渲染容器,公式必须为图片');
-  }
-  if ([...document.querySelectorAll('svg')].some((svg) => svg.querySelector('[data-mml-node="math"]'))) {
-    errors.push('最终 HTML 残留 MathJax 公式 SVG,公式必须为图片');
-  }
-  const texResidue = [];
-  const walker = document.createTreeWalker(document.body, 4 /* NodeFilter.SHOW_TEXT */);
-  while (walker.nextNode()) {
-    const parent = walker.currentNode.parentElement;
-    if (parent?.closest('pre,code,[data-sl-math]')) continue;
-    const match = TEX_COMMAND_RE.exec(walker.currentNode.nodeValue || '');
-    if (match) texResidue.push(match[0]);
-  }
-  if (texResidue.length) {
-    errors.push(`正文残留未渲染的 TeX 命令:${[...new Set(texResidue)].slice(0, 5).join(' ')}`);
-  }
-  if (errors.length) throw new Error(`公式渲染完整性校验失败:${errors.join('; ')}`);
-  return { equations: equations.length, images: images.length };
+    const images = [...document.querySelectorAll('img[data-sl-math="true"]')];
+    if (images.length !== equations.length) {
+      errors.push(`公式图片恢复数量不符:提取 ${equations.length} 个,恢复 ${images.length} 个`);
+    }
+    // Plausible rendered-size bounds catch sizing regressions (e.g. em divisors)
+    // before a draft with invisible formulas can be published.
+    const readEm = (image, property) => parseFloat(new RegExp(`${property}:([\\d.]+)em`).exec(image.getAttribute('style') || '')?.[1] ?? 'NaN');
+    for (const [index, image] of images.entries()) {
+      const display = image.getAttribute('data-sl-math-display') || image.closest('[data-sl-math-display]');
+      const em = readEm(image, display ? 'width' : 'height');
+      if (Number.isNaN(em)) {
+        errors.push(`第 ${index + 1} 张公式图片缺少 em 尺寸`);
+      } else if (display) {
+        if (em < 1 || em > 40) errors.push(`第 ${index + 1} 张显示公式宽度 ${em}em 超出合理范围`);
+      } else if (em < 0.4 || em > 8) {
+        errors.push(`第 ${index + 1} 张行内公式高度 ${em}em 超出合理范围`);
+      }
+    }
+    for (const [index, image] of images.entries()) {
+      if (!image.getAttribute('src')) errors.push(`第 ${index + 1} 张公式图片缺少 src`);
+    }
+    if (document.querySelector('mjx-container')) {
+      errors.push('最终 HTML 残留 MathJax 渲染容器,公式必须为图片');
+    }
+    if ([...document.querySelectorAll('svg')].some((svg) => svg.querySelector('[data-mml-node="math"]'))) {
+      errors.push('最终 HTML 残留 MathJax 公式 SVG,公式必须为图片');
+    }
+    const texResidue = [];
+    const walker = document.createTreeWalker(document.body, 4 /* NodeFilter.SHOW_TEXT */);
+    while (walker.nextNode()) {
+      const parent = walker.currentNode.parentElement;
+      if (parent?.closest('pre,code,[data-sl-math]')) continue;
+      const match = TEX_COMMAND_RE.exec(walker.currentNode.nodeValue || '');
+      if (match) texResidue.push(match[0]);
+    }
+    if (texResidue.length) {
+      errors.push(`正文残留未渲染的 TeX 命令:${[...new Set(texResidue)].slice(0, 5).join(' ')}`);
+    }
+    if (errors.length) throw new Error(`公式渲染完整性校验失败:${errors.join('; ')}`);
+    return { equations: equations.length, images: images.length };
+  } finally { document.defaultView.close(); }
 }
 
 // ---- Offline MathJax TeX -> SVG compilation ----
@@ -428,7 +435,7 @@ body{font-family:Georgia,"Times New Roman","Songti SC",serif}
 </style></head><body><div class="wrap">${svg}</div></body></html>`;
 }
 
-async function captureEquationsWithBrowser(items, { outDir, executablePath, color, signal }) {
+async function captureEquationsWithBrowser(items, { outDir, executablePath, color, signal, onCaptured = () => {} }) {
   throwIfTaskCancelled(signal);
   const browserPath = executablePath || resolveBrowserExecutable();
   await fs.mkdir(outDir, { recursive: true });
@@ -441,16 +448,19 @@ async function captureEquationsWithBrowser(items, { outDir, executablePath, colo
   signal?.addEventListener('abort', abortBrowser, { once: true });
   try {
     throwIfTaskCancelled(signal);
-    const page = await browser.newPage({
+    const context = await browser.newContext({ serviceWorkers: 'block',
       viewport: { width: 2400, height: 400 },
       deviceScaleFactor: MATH_CAPTURE_SCALE,
     });
-    await page.route('**/*', (route) => route.abort('blockedbyclient'));
+    await context.route('**/*', (route) => route.abort('blockedbyclient'));
+    await context.routeWebSocket('**/*', socket => socket.close());
+    const page = await context.newPage();
     const results = [];
     for (const [index, item] of items.entries()) {
       throwIfTaskCancelled(signal);
-      const src = `math-${String(index + 1).padStart(3, '0')}.png`;
+      const src = `math-${item.cacheKey || String(index + 1).padStart(3, '0')}.png`;
       const outPath = path.join(outDir, src);
+      assertProjectPath(outDir, outPath);
       await page.setContent(equationCaptureHtml(item.svg, color), { waitUntil: 'load' });
       const box = await page.locator('.wrap').boundingBox();
       if (!box || box.width <= 0 || box.height <= 0) {
@@ -462,13 +472,14 @@ async function captureEquationsWithBrowser(items, { outDir, executablePath, colo
         omitBackground: true,
         animations: 'disabled',
       });
-      throwIfTaskCancelled(signal);
       results.push({
         src,
         path: outPath,
         width: Math.ceil(box.width - MATH_CAPTURE_PADDING.x * 2),
         height: Math.ceil(box.height - MATH_CAPTURE_PADDING.y * 2),
       });
+      onCaptured(item, results.at(-1));
+      throwIfTaskCancelled(signal);
     }
     return results;
   } catch (error) {
@@ -510,20 +521,47 @@ export async function renderEquationPngs(equations, {
     group.members.push(equation);
   }
 
-  const compiled = [];
+  const filename = path.join(outDir, 'math-cache.json');
+  let saved;
+  try { saved = readJson(filename); } catch { /* Rebuild damaged derived cache. */ }
+  const records = saved?.version === 1 ? saved.records || {} : {};
+  const compiled = [], captured = [], pending = [], positions = [];
   for (const group of groups.values()) {
-    const { svg } = compileEquationSvg(group.tex, group.display);
-    compiled.push({ ...group, svg });
+    const cacheKey = hash({ version: 1, tex: group.tex, display: group.display, color,
+      font: MATH_BASE_FONT_PX, scale: MATH_CAPTURE_SCALE, padding: MATH_CAPTURE_PADDING });
+    let cached = records[cacheKey];
+    try {
+      if (!cached || cached.image.width <= 0 || cached.image.height <= 0
+        || hash(fileRecord(cached.image.src, outDir)) !== hash(cached.file)) cached = null;
+      if (cached) {
+        const buffer = await fs.readFile(path.join(outDir, cached.image.src));
+        if (buffer.length < 24 || !buffer.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10]))
+          || Math.abs(buffer.readUInt32BE(16) - (cached.image.width + MATH_CAPTURE_PADDING.x * 2) * MATH_CAPTURE_SCALE) > MATH_CAPTURE_SCALE
+          || Math.abs(buffer.readUInt32BE(20) - (cached.image.height + MATH_CAPTURE_PADDING.y * 2) * MATH_CAPTURE_SCALE) > MATH_CAPTURE_SCALE) cached = null;
+      }
+    } catch (error) { if (error.needsReview) throw error; cached = null; }
+    compiled.push(group);
+    if (cached) captured.push(cached.image);
+    else {
+      const { svg } = compileEquationSvg(group.tex, group.display);
+      pending.push({ ...group, svg, cacheKey }); positions.push(compiled.length - 1); captured.push(null);
+    }
   }
-
-  const captured = await withRuntimeResource(
-    'browser',
-    () => capture(compiled, { outDir, executablePath, signal, color }),
-    signal,
-  );
-  throwIfTaskCancelled(signal);
-  if (!Array.isArray(captured) || captured.length !== compiled.length) {
-    throw new Error('公式截图数量与公式数量不一致');
+  const persistImage = (key, image) => {
+    if (!image?.src || !(image.width > 0) || !(image.height > 0)) throw new Error('公式截图尺寸无效');
+    try {
+      records[key] = { image: { src: image.src, width: image.width, height: image.height }, file: fileRecord(image.src, outDir) };
+      writeAtomic(filename, { version: 1, records });
+    } catch (error) { if (error.needsReview) throw error; /* Injected captures may omit files. */ }
+  };
+  if (pending.length) {
+    const fresh = await withRuntimeResource('browser', () => capture(pending, { outDir, executablePath, signal, color, onCaptured: (item, image) => persistImage(item.cacheKey, image) }), signal);
+    throwIfTaskCancelled(signal);
+    if (!Array.isArray(fresh) || fresh.length !== pending.length) throw new Error('公式截图数量与公式数量不一致');
+    for (const [index, image] of fresh.entries()) {
+      captured[positions[index]] = image;
+      persistImage(pending[index].cacheKey, image);
+    }
   }
   let fitted = 0;
   compiled.forEach((group, index) => {

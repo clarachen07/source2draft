@@ -31,7 +31,7 @@ export function createEventHandler({ config, store, engine, botId, now = () => D
     const root = message.thread_ts || message.ts;
     const key = store.resolveThreadKey?.(event.channel, root) || `${event.channel}:${root}`, previous = store.latest(key);
     const mention = new RegExp(`<@${botId}>`, 'g');
-    if (!previous && !(message.text || '').includes(`<@${botId}>`)) return;
+    if ((!message.thread_ts || !previous) && !(message.text || '').includes(`<@${botId}>`)) return;
     if (message.thread_ts && !previous) return;
     const text = String(message.text || '').replace(mention, '').replace(/<(https?:\/\/[^>|]+)(?:\|[^>]*)?>/g, '$1')
       .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').trim();
@@ -176,7 +176,7 @@ export async function createSlack({ config, store, engine, now = () => Date.now(
   }
   async function deliverNotices() {
     try {
-      for (const item of store.notices()) {
+      for (const item of store.notices({ deliverable: true, now: now() })) {
         if (stopping || !connected) break;
         if (item.thread_key.startsWith('local:')) { store.sent(item.id); continue; }
         const run = store.get(item.run_id);
@@ -188,11 +188,11 @@ export async function createSlack({ config, store, engine, now = () => Date.now(
         const daily = item.thread_key.startsWith('daily:');
         if (daily && store.latest(item.thread_key)?.id !== run.id) { store.sent(item.id); continue; }
         if (daily && !['done', 'failed', 'needs_review', 'needs_input'].includes(item.kind.split(':')[0])) { store.sent(item.id); continue; }
-        if (daily && run.status === 'failed' && store.isDailyRetryPending?.(run.id)) continue;
+        if (daily && run.status === 'failed' && store.isDailyRetryPending?.(run.id)) { store.deferNotice?.(item.id, now() + 30000); continue; }
         const route = store.noticeRoute?.(item.thread_key) || (!daily ? (() => {
           const [channel, thread_ts] = item.thread_key.split(':'); return { channel, thread_ts };
         })() : null);
-        if (route && route.channel !== config.slack.channel) { log('Slack 通知目标不属于配置的个人频道；保留待处理记录'); continue; }
+        if (route && route.channel !== config.slack.channel) { log('Slack 通知目标不属于配置的个人频道；保留待处理记录'); store.blockNotice?.(item.id, 'invalid_route'); continue; }
         // A crash between persisting ts and marking the outbox row as sent
         // must consume that row without posting its result again in the thread.
         const rootState = daily && store.getNoticeRootState(run.thread_key);
@@ -201,13 +201,17 @@ export async function createSlack({ config, store, engine, now = () => Date.now(
         }
         try {
           if (daily && !route) {
-            if (!await sendDailyRoot(item, run)) continue;
+            if (!await sendDailyRoot(item, run)) { store.blockNotice?.(item.id, 'root_needs_review'); continue; }
           } else {
             await app.client.chat.postMessage({ channel: route.channel, thread_ts: route.thread_ts, text: item.text,
               mrkdwn: false, unfurl_links: false, unfurl_media: false });
           }
           store.sent(item.id);
-        } catch (error) { log(`Slack 通知待重试：${redact(error, config)}`); break; }
+        } catch (error) {
+          if (Number(error.retryAfter) > 0) store.deferNotice?.(item.id, now() + Math.min(86400, Number(error.retryAfter)) * 1000);
+          else if (!daily || store.getNoticeRootState?.(run.thread_key)?.state !== 'sent') store.deferNotice?.(item.id, now() + 30000);
+          log(`Slack 通知待重试：${redact(error, config)}`); break;
+        }
         await sleep(1100);
       }
     } finally { flushing = undefined; }

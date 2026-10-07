@@ -5,6 +5,8 @@ import { JSDOM } from 'jsdom';
 import { fetchRetry, hash, readJson, writeAtomic } from '../lib/io.js';
 import { imageType, normalizeWechatLists, safeLocalAsset } from '../lib/wechat-render.js';
 import { emitTelemetry } from '../lib/telemetry.js';
+import { mapBounded } from '../lib/bounded-map.js';
+import { raceWithSignal } from '../lib/http-deadline.js';
 import { withRuntimeResource } from '../config/runtime.js';
 
 export function contentIdentity(article) {
@@ -28,9 +30,13 @@ function imageIdentity(image) {
   return value;
 }
 export function createWechat(config, { fetchFn = globalThis.fetch } = {}) {
-  let token, tokenUntil = 0;
+  let token, tokenUntil = 0, tokenRequest;
   async function accessToken(signal) {
     if (token && tokenUntil > Date.now()) return token;
+    if (!tokenRequest) tokenRequest = refreshToken(signal).finally(() => { tokenRequest = null; });
+    return raceWithSignal(signal, () => tokenRequest);
+  }
+  async function refreshToken(signal) {
     if (!config.wechat.appId || !config.wechat.secret) throw new Error('缺少个人公众号 AppID 或 AppSecret');
     const response = await fetchRetry(fetchFn, 'https://api.weixin.qq.com/cgi-bin/stable_token', {
       method: 'POST', signal, redirect: 'error', headers: { 'Content-Type': 'application/json' },
@@ -91,16 +97,23 @@ export function createWechat(config, { fetchFn = globalThis.fetch } = {}) {
     const saved = readJson(receiptPath);
     const receipts = saved?.version === 1 && saved.account === account && saved.uploads
       ? saved : { version: 1, account, uploads: {} };
+    const files = new Map(), inFlight = new Map();
+    function asset(src) {
+      const file = safeLocalAsset(src, workDir);
+      if (!files.has(file)) { const buffer = fs.readFileSync(file); imageType(buffer); files.set(file, { file, buffer, digest: hash(buffer) }); }
+      return files.get(file);
+    }
     async function uploadedAsset(src, permanent) {
       signal?.throwIfAborted();
-      const file = safeLocalAsset(src, workDir), buffer = fs.readFileSync(file);
-      imageType(buffer);
-      const purpose = permanent ? 'cover' : 'body', key = `${purpose}:${hash(buffer)}`;
+      const { file, buffer, digest } = asset(src);
+      const purpose = permanent ? 'cover' : 'body', key = `${purpose}:${digest}`;
       const existing = receipts.uploads[key], field = permanent ? 'media_id' : 'url';
       if (typeof existing?.[field] === 'string' && existing[field]) {
         emitTelemetry(onTelemetry, { stage: 'wechat.asset', cacheHit: true, count: 1 });
         return existing;
       }
+      if (inFlight.has(key)) return inFlight.get(key);
+      const promise = (async () => {
       const started = performance.now();
       const data = await upload(file, buffer, permanent, signal);
       // Persist each known successful upload before doing any other remote work.
@@ -108,12 +121,17 @@ export function createWechat(config, { fetchFn = globalThis.fetch } = {}) {
       writeAtomic(receiptPath, receipts);
       emitTelemetry(onTelemetry, { stage: 'wechat.asset', cacheHit: false, count: 1, durationMs: performance.now() - started });
       return receipts.uploads[key];
+      })();
+      inFlight.set(key, promise);
+      try { return await promise; } finally { inFlight.delete(key); }
     }
     try {
       normalizeWechatLists(doc.body);
-      for (const image of doc.querySelectorAll('img')) {
-        image.setAttribute('src', (await uploadedAsset(image.getAttribute('src'), false)).url);
-      }
+      const images = [...doc.querySelectorAll('img')];
+      const sources = [...new Set(images.map(image => image.getAttribute('src')))];
+      const uploaded = await mapBounded(sources, 2, src => uploadedAsset(src, false), signal);
+      const urls = new Map(sources.map((src, index) => [src, uploaded[index].url]));
+      for (const image of images) image.setAttribute('src', urls.get(image.getAttribute('src')));
       const cover = await uploadedAsset(prepared.coverPath, true);
       return { title: prepared.title, author: config.wechat.author, digest: doc.body.textContent.trim().slice(0, 100),
         content: doc.body.innerHTML, thumb_media_id: cover.media_id, need_open_comment: 0, only_fans_can_comment: 0 };

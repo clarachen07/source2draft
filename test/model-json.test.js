@@ -77,6 +77,31 @@ test('daily diagnostics handle malformed nested claims without throwing or accep
   assert.deepEqual(dailyItemErrors(item, assigned, cards), []);
 });
 
+test('technical code editing does not waste the single JSON correction needed for an invalid quote', async t => {
+  const source = 'The model revises strategies through local code edits.';
+  const evidence = [{ id: 'C5', locators: [{ id: 'L1', text: source }], figures: [] }];
+  const sentence = '大模型通过局部代码编辑修改策略。';
+  const invalid = { ...item, body: sentence, claims: [{ sentence, refs: [{ cardId: 'C5', locatorId: 'L1', quote: 'A fabricated code editing result.' }] }] };
+  const corrected = structuredClone(invalid); corrected.claims[0].refs[0].quote = source;
+  const f = fixture(t, [JSON.stringify(invalid), JSON.stringify(corrected)]);
+  const errors = value => dailyItemErrors(value, assigned, evidence);
+  assert.deepEqual(await f.model.json({ prompt: '写本条JSON', validate: value => !errors(value).length, validationErrors: errors }), corrected);
+  assert.equal(f.requests.length, 2);
+  assert.match(f.requests[1].messages[1].content, /引用不存在或不是原文摘录/);
+  assert.doesNotMatch(f.requests[1].messages[1].content, /表达主体/);
+  assert.equal(corrected.body, sentence);
+});
+
+test('persistent narrator roles still stop after two responses and receive actionable style feedback', async t => {
+  const invalid = { ...item, body: '编辑认为需要验证，代码编辑本身不足以证明收益。' };
+  const f = fixture(t, [JSON.stringify(invalid), JSON.stringify(invalid)]);
+  const errors = value => dailyItemErrors(value, assigned, cards);
+  await assert.rejects(f.model.json({ prompt: '写本条JSON', validate: value => !errors(value).length, validationErrors: errors }),
+    error => error.code === 'MODEL_JSON_INVALID' && /命中表达=.*编辑认为/.test(error.message));
+  assert.equal(f.requests.length, 2);
+  assert.match(f.requests[1].messages[1].content, /保留技术术语和研究事实/);
+});
+
 test('per-item adapter repair checks exact locator quotes and every numeric sentence before accepting a response', async t => {
   const source = 'We optimize the mean of the lowest 30% of window scores.';
   const evidence = [{ id: 'C5', locators: [{ id: 'L39', text: 'The formula and its coefficients.' }, { id: 'L40', text: source }], figures: [] }];

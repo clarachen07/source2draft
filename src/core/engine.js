@@ -1,7 +1,9 @@
+import { assertProjectPath } from '../lib/project-path.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createModel } from './model.js';
 import { runAnalysis } from '../workflows/analysis.js';
+import { inheritTranslationRevision } from '../workflows/translation-cache.js';
 import { generateStructuredTranslation } from '../workflows/translation-source-text.js';
 import { attachmentHeaders, coverUrls, inputUrls, translationConfig } from './sources.js';
 import { withTaskCancellation } from '../lib/task-cancellation.js';
@@ -12,6 +14,7 @@ import { redact } from '../config/index.js';
 import { createTelemetry, measureStage } from '../lib/telemetry.js';
 import { withRuntimeResource } from '../config/runtime.js';
 import { prepareModelRecovery } from './model-recovery.js';
+import { approveArtifact, readArtifactCache, readPreparedCache } from '../lib/artifact-cache.js';
 import { modelIdentity } from './model-identity.js';
 
 export function routeMode(input) {
@@ -110,7 +113,7 @@ export function createEngine({ config, store, modelFactory = createModel, wechat
       ? (config.daily?.taskTimeout || 3600000) : config.taskTimeout);
     const signal = AbortSignal.any([controller.signal, timeout]);
     const workDir = workDirFor(run.id);
-    const onTelemetry = createTelemetry(workDir), started = performance.now();
+    const onTelemetry = createTelemetry(workDir, { root: config.dataDir }), started = performance.now();
     function complete(result, title, warnings = []) {
       const preview = path.join(workDir, 'preview.html');
       store.complete(run.id, { result: JSON.stringify(result), title, ...(result.mediaId ? { media_id: result.mediaId } : {}) },
@@ -138,23 +141,27 @@ export function createEngine({ config, store, modelFactory = createModel, wechat
         store.freezeDailyContext(run.id);
         run = store.get(run.id);
       }
+      assertProjectPath(config.dataDir, workDir);
       fs.mkdirSync(workDir, { recursive: true, mode: 0o700 });
-      prepareModelRecovery({ workDir, modelConfig: config.model, profile: run.profile });
+      const mode = run.profile === 'llm-quant-daily' ? 'analysis' : run.mode || routeMode(run.input);
+      prepareModelRecovery({ workDir, modelConfig: config.model, profile: run.profile, mode });
       const recoveringPublish = run.status === 'publishing';
       if (!recoveringPublish) store.update(run.id, { status: 'running' });
-      const mode = run.profile === 'llm-quant-daily' ? 'analysis' : run.mode || routeMode(run.input);
       store.update(run.id, { mode });
       const events = readJson(path.join(workDir, 'usage.json'), []);
       const model = modelFactory(config, { onTelemetry, workDir,
         onUsage: data => { events.push(data); writeAtomic(path.join(workDir, 'usage.json'), events); } });
-      let artifact = readJson(path.join(workDir, 'artifact.json'));
+      const identity = modelIdentity(config.model, { mode, profile: run.profile });
+      let artifact = readArtifactCache(workDir, { input: run.input, mode, modelIdentity: identity });
       onTelemetry({ stage: 'artifact', cacheHit: Boolean(artifact) });
       if (!artifact && !recoveringPublish) {
         if (mode === 'translation') {
           const source = chooseTranslationSource(run, config);
+          inheritTranslationRevision({ run, store, workDir, workDirFor, sourceUrl: source.sourceUrl,
+            config: { ...translationConfig(config), accountId: config.wechat.appId } });
           artifact = await measureStage(onTelemetry, 'translation', () => generateStructuredTranslation({ input: run.input, ...source,
             workflow: { workDir, model: config.model.models.translation, timeoutMs: 300000 },
-            writer: { model: config.model.models.translation, modelIdentity: modelIdentity(config.model) },
+            writer: { model: config.model.models.translation, modelIdentity: identity },
             fetchFn: withTaskCancellation(globalThis.fetch, signal), fetchWithRetry: fetchRetry,
             completeArticle: args => model.complete({ ...args, role: 'translation', signal }),
             onProgress: event => progress(run, event.message),
@@ -171,18 +178,20 @@ export function createEngine({ config, store, modelFactory = createModel, wechat
             previousArticle: findPreviousArticle(run, store, workDirFor), progress: text => progress(run, text) }));
         }
         signal.throwIfAborted();
+        artifact = approveArtifact(artifact, { input: run.input, mode, modelIdentity: identity });
         writeAtomic(path.join(workDir, 'article.md'), artifact.article);
         writeAtomic(path.join(workDir, 'artifact.json'), artifact);
       }
       if (!artifact) throw new Error('恢复任务缺少完整文章文件');
       const { title } = parseArticle(artifact.article);
       store.update(run.id, { title });
-      let prepared = readJson(path.join(workDir, 'prepared.json'));
+      const cover = chooseCover(run, config);
+      let prepared = readPreparedCache(workDir, { markdown: artifact.article, config, cover, repairOutputs: true });
       onTelemetry({ stage: 'prepared', cacheHit: Boolean(prepared) });
       if (!prepared && !recoveringPublish) {
         progress(run, '正在准备朴素排版、原图表和封面');
         prepared = await measureStage(onTelemetry, 'render', () => withRuntimeResource('render', () => prepare({
-          markdown: artifact.article, workDir, config, signal, onTelemetry, cover: chooseCover(run, config) }), signal));
+          markdown: artifact.article, workDir, config, signal, onTelemetry, cover }), signal));
       }
       if (!prepared) throw new Error('恢复任务缺少排版文件');
       if (!recoveringPublish) signal.throwIfAborted();

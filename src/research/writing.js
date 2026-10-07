@@ -1,11 +1,12 @@
 import { hash } from '../lib/io.js';
 import { DAILY_SYSTEM, dailyOutlinePrompt, dailyWriterPrompt, dailyPlainLength, numericTokens, dailyItemEvidenceErrors, dailyStyleErrors } from './evidence.js';
 import { modelIdentity } from '../core/model-identity.js';
+import { createDailyQuoteCatalog, resolveDailyQuoteReferences } from './quotes.js';
 
 const plainHeading = value => typeof value === 'string' && value.trim() && value.length <= 120 && !/[\r\n<>\[\]`]|https?:\/\//.test(value);
 
 export function dailyWritingIdentity({ run, context, cards, modelConfig, previousArticle = '', repair = [], previousDraft = null }) {
-  return hash({ version: 6, input: run.input, context, cards, modelConfig: modelIdentity(modelConfig), previousArticle, repair, previousDraft });
+  return hash({ version: 7, input: run.input, context, cards, modelConfig: modelIdentity(modelConfig, { mode: 'analysis' }), previousArticle, repair, previousDraft });
 }
 
 // Unscoped errors (e.g. issue length) require the whole draft. Item-local
@@ -13,12 +14,21 @@ export function dailyWritingIdentity({ run, context, cards, modelConfig, previou
 export function dailyRepairCardIds(errors, draft) {
   const known = new Set(draft.items.map(item => item.cardId)), targets = new Set();
   for (const error of errors) {
+    if (error.startsWith('HEADER：')) continue;
     const match = /^(?:条目"(C\d+)"|(C\d+)：)/.exec(error);
     const id = match?.[1] || match?.[2];
     if (!known.has(id)) return known;
     targets.add(id);
   }
   return targets;
+}
+
+function itemRepairErrors(errors, cardId) {
+  return errors.filter(error => {
+    if (error.startsWith('HEADER：')) return false;
+    const match = /^(?:条目"(C\d+)"|(C\d+)：)/.exec(error);
+    return !match || (match[1] || match[2]) === cardId;
+  });
 }
 
 function repairOutline(previousDraft, originalOutline, cards) {
@@ -105,9 +115,16 @@ export async function writeDailyDraft({ phase = 'writing', run, context, cards, 
   if (!writing.outline || writing.outlineHash !== hash(writing.outline) || !outlineShape(writing.outline, cards)) {
     signal?.throwIfAborted();
     progress(targets ? '正在保留选题并定位待修正条目' : '正在精选事件并分配篇幅');
-    const outline = targets ? repairOutline(previousDraft, checkpoint.writing?.outline, cards)
+    let outline = targets ? repairOutline(previousDraft, checkpoint.writing?.outline, cards)
       : await model.json({ role: 'planner', signal, onTelemetry, systemPrompt: DAILY_SYSTEM,
         prompt: dailyOutlinePrompt({ run, context, cards, previousArticle, repair, previousDraft }), validate: value => outlineShape(value, cards) });
+    const headerErrors = repair.filter(error => error.startsWith('HEADER：'));
+    if (targets && headerErrors.length) {
+      const header = await model.json({ role: 'writer', signal, onTelemetry, systemPrompt: DAILY_SYSTEM,
+        prompt: `只修正标题和导语中明确的事实错误，保留正文、选题和顺序。标题不超过64字符，导语不超过400字符，不添加具体数字；遵守现有朴素文风。返回JSON {"title":"标题","intro":"导语"}。\n${JSON.stringify({ errors: headerErrors, title: previousDraft.title, intro: previousDraft.intro, items: previousDraft.items, cards, context })}`,
+        validate: value => outlineShape({ ...outline, title: value?.title, intro: value?.intro }, cards) });
+      outline = { ...outline, title: header.title, intro: header.intro };
+    }
     // Adapter validation is also checked here for injected/nonstandard clients.
     if (!outlineShape(outline, cards)) throw new Error('日报分条提纲结构化结果不合格');
     writing.outline = outline; writing.outlineHash = hash(outline); writing.items = {}; persist();
@@ -126,11 +143,19 @@ export async function writeDailyDraft({ phase = 'writing', run, context, cards, 
     } else if (cached?.identity === itemIdentity && cached.valueHash === hash(cached.value) && itemShape(cached.value, assigned, relevant)) item = cached.value;
     else {
       progress(`正在${repair.length ? '修正' : '撰写'}事件 ${index + 1}/${writing.outline.items.length}`);
+      const catalog = createDailyQuoteCatalog(relevant);
+      const responseErrors = value => {
+        const resolved = resolveDailyQuoteReferences(value, catalog);
+        return [...resolved.errors, ...dailyItemErrors(resolved.item, assigned, relevant)];
+      };
       item = await model.json({ role: 'writer', signal, onTelemetry, systemPrompt: DAILY_SYSTEM,
-        prompt: dailyWriterPrompt({ run, context, cards: relevant, previousArticle, repair, outline: writing.outline, assigned,
+        prompt: dailyWriterPrompt({ run, context, cards: catalog.cards, previousArticle, repair: itemRepairErrors(repair, assigned.cardId), outline: writing.outline, assigned, excerptIds: true,
           previousItem: previousDraft?.items.find(value => value.cardId === assigned.cardId) }),
-        validate: value => itemShape(value, assigned, relevant),
-        validationErrors: value => dailyItemErrors(value, assigned, relevant) });
+        validate: value => responseErrors(value).length === 0,
+        validationErrors: responseErrors });
+      const resolved = resolveDailyQuoteReferences(item, catalog);
+      if (resolved.errors.length) throw new Error(`日报分条引用编号不合格：${resolved.errors.slice(0, 4).join('；')}`);
+      item = resolved.item;
       if (!itemShape(item, assigned, relevant)) throw new Error(`日报分条正文结构化结果不合格：${dailyItemErrors(item, assigned, relevant).slice(0, 4).join('；')}`);
       writing.items[assigned.cardId] = { identity: itemIdentity, valueHash: hash(item), value: item }; persist();
     }

@@ -34,6 +34,23 @@ function fixture(overrides = {}) {
     offline: value => { initFails = value; }, advance: ms => { clock += ms; } };
 }
 
+test('ordinary thread rate limits persist a delay and do not retry before Retry-After across client restart', async () => {
+  const f = fixture(); let attempts = 0;
+  f.app.client.chat.postMessage = async () => {
+    attempts++; if (attempts === 1) throw Object.assign(new Error('rate limited'), { retryAfter: 120 });
+    return { channel: 'C1', ts: '123' };
+  };
+  const run = f.store.enqueue({ threadKey: 'C1:100', ts: '100', text: 'test', version: 1, dryRun: true }).run;
+  f.store.update(run.id, { status: 'done' }); f.store.notice(run, 'done', '完成');
+  let slack = await f.create();
+  try {
+    await slack.tick(); await slack.flush(); assert.equal(attempts, 1);
+    const pending = f.store.notices()[0]; assert.ok(pending.due_at > Date.now() + 110000);
+    await slack.stop(); slack = await f.create(); f.advance(30000); await slack.tick(); await slack.flush(); assert.equal(attempts, 1);
+    f.advance(90001); await slack.tick(); await slack.flush(); assert.equal(attempts, 2); assert.equal(f.store.notices().length, 0);
+  } finally { await slack.stop(); f.store.close(); }
+});
+
 test('Slack defers initialization, disables SDK write retries, and reconnects after identity verification', async () => {
   const f = fixture(); const slack = await f.create();
   try {
@@ -107,7 +124,7 @@ test('ambiguous root recovery remains needs_review and preserves an accepted dra
     assert.equal(f.store.getNoticeRootState(run.thread_key).state, 'needs_review');
     assert.equal(f.store.noticeRoute(run.thread_key), null);
     f.advance(300001); await slack.flush();
-    assert.equal(f.writes.length, 1); assert.equal(f.reads.length, 2);
+    assert.equal(f.writes.length, 1); assert.equal(f.reads.length, 1);
     assert.equal(f.store.get(run.id).status, 'done'); assert.equal(f.store.get(run.id).media_id, 'fixture-draft');
     assert.equal(f.store.notices().length, 1);
   } finally { await slack.stop(); f.store.close(); }
@@ -170,7 +187,7 @@ test('daily automatic-retry failures wait for a final outcome before the root no
   const slack = await f.create();
   try {
     await slack.tick(); await slack.flush(); assert.equal(f.writes.length, 0);
-    pending = false; await slack.flush(); assert.equal(f.writes.length, 1);
+    pending = false; f.advance(30001); await slack.flush(); assert.equal(f.writes.length, 1);
     assert.match(f.writes[0].text, /最终失败/);
   } finally { await slack.stop(); f.store.close(); }
 });

@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { hash, readJson, writeAtomic } from '../lib/io.js';
 import { emitTelemetry } from '../lib/telemetry.js';
-import { sourcePolicy } from './analysis.js';
+import { sourcePolicy } from '../core/source-policy.js';
 import { attachmentHeaders, inputUrls, coverUrls } from '../core/sources.js';
 import { OFFICIAL_PROFILES, OFFICIAL_REPOSITORIES } from '../research/catalog.js';
 import { normalizeCandidate, deduplicateCandidates, selectDeepReads, temporalStatus } from '../research/candidates.js';
@@ -246,7 +246,7 @@ export async function runDailyResearch({ run, config, store, workDir, model, sig
       progress(corrections ? '正在复核唯一一次修正' : '正在逐条核验原文、数字与日期');
       const audit = await reviewDailyDraft({ draft: checkpoint.draft, cards, run, context, config, checkpoint, persist, model, signal, onTelemetry, progress });
       checkpoint.warnings.push(...audit.warnings);
-      errors = [...new Set([...errors, ...audit.issues.filter(issue => issue.severity === 'high').map(issue => `${issue.cardId}：${issue.reason}`)])];
+      errors = [...new Set([...errors, ...audit.issues.filter(issue => issue.severity === 'high').map(issue => `${issue.scope === 'header' ? 'HEADER' : issue.cardId}：${issue.reason}`)])];
       persist();
     }
     if (!errors.length) { checkpoint.approval = { version: 1, policy: DAILY_REVIEW_POLICY, fingerprint: fingerprint(), checkedAt: new Date().toISOString() }; persist(); break; }

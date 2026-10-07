@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { safeFetchResource, assertSafeHttpUrl } from '../workflows/translation-source-text.js';
+import { safeFetchResource, assertSafeHttpUrl } from '../lib/secure-http.js';
 import { hash, readJson, writeAtomic } from '../lib/io.js';
 import { emitTelemetry } from '../lib/telemetry.js';
 import { withRuntimeResource } from '../config/runtime.js';

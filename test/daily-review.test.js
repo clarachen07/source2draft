@@ -1,6 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { reviewDailyDraft } from '../src/research/review.js';
+import { reviewDailyDraft as reviewIncludingHeader } from '../src/research/review.js';
+
+// These legacy tests isolate item-review contracts; global headers have dedicated tests below.
+const reviewDailyDraft = args => reviewIncludingHeader({ ...args, model: { json: request =>
+  request.prompt.startsWith('只审核整篇标题') ? Promise.resolve({ issues: [], warnings: [] }) : args.model.json(request) } });
 
 function fixture() {
   const context = { issueDate: '2026-10-02', cutoffAt: '2026-10-03T01:00:00Z' };
@@ -63,10 +67,49 @@ test('review caches bind current draft, source, input, frozen window, model, pol
   f.args.context.cutoffAt = '2026-10-03T02:00:00Z'; await reviewDailyDraft(f.args);
   f.args.config.model.writerModel = 'changed-model'; await reviewDailyDraft(f.args);
   f.args.checkpoint.correctionCount = 1; await reviewDailyDraft(f.args);
-  assert.equal(f.calls.length, 14); assert.equal(f.args.checkpoint.audits.length, 7);
-  await reviewDailyDraft(f.args); assert.equal(f.calls.length, 14);
+  assert.equal(f.calls.length, 12); assert.equal(f.args.checkpoint.audits.length, 7);
+  await reviewDailyDraft(f.args); assert.equal(f.calls.length, 12);
   const latest = Object.values(f.args.checkpoint.reviewPasses).at(-1); latest.items.C1.value.warnings.push('tampered');
-  await assert.rejects(reviewDailyDraft(f.args), /断点校验失败/); assert.equal(f.calls.length, 14);
+  await assert.rejects(reviewDailyDraft(f.args), /断点校验失败/); assert.equal(f.calls.length, 12);
+});
+
+test('same-pass draft edits reuse unchanged isolated reviews while binding the aggregate to the current draft', async () => {
+  const f = fixture(); f.args.checkpoint.correctionCount = 1;
+  const first = await reviewDailyDraft(f.args);
+  f.args.draft.items[0].body += ' 新增了已核查的评估条件。';
+  const second = await reviewDailyDraft(f.args);
+  assert.notEqual(first.fingerprint, second.fingerprint);
+  assert.deepEqual(f.calls, ['C1', 'C2', 'C1']);
+  const latest = Object.values(f.args.checkpoint.reviewPasses).at(-1);
+  assert.ok(latest.items.C2.reusedFrom); assert.equal(latest.items.C1.reusedFrom, undefined);
+  assert.equal(second.warnings.length, 2); assert.equal(f.args.checkpoint.correctionCount, 1);
+});
+
+test('legacy receipts without a context identity are not reused across changed drafts', async () => {
+  const f = fixture(); await reviewDailyDraft(f.args);
+  delete Object.values(f.args.checkpoint.reviewPasses)[0].contextIdentity;
+  f.args.draft.items[0].body += ' 已更新。'; await reviewDailyDraft(f.args);
+  assert.deepEqual(f.calls, ['C1', 'C2', 'C1', 'C2']);
+});
+
+test('tampered unchanged-item receipts cannot be used to approve a new draft', async () => {
+  const f = fixture(); await reviewDailyDraft(f.args);
+  Object.values(f.args.checkpoint.reviewPasses)[0].items.C2.value.issues.push({severity: 'high', reason: 'tampered'});
+  f.args.draft.items[0].body += ' 已更新。';
+  await assert.rejects(reviewDailyDraft(f.args), /断点校验失败/);
+  assert.deepEqual(f.calls, ['C1', 'C2', 'C1']);
+});
+
+test('reused receipts retain blocking issues instead of granting approval to an unchanged bad item', async () => {
+  const f = fixture(); f.args.checkpoint.correctionCount = 1;
+  f.args.model.json = async request => {
+    const id = /^只审核本条事件(C\d+)/.exec(request.prompt)[1]; f.calls.push(id);
+    return { issues: id === 'C2' ? [{severity: 'high', reason: '关键事实未核实'}] : [], warnings: [] };
+  };
+  await reviewDailyDraft(f.args); f.args.draft.items[0].body += ' 已更新。';
+  const result = await reviewDailyDraft(f.args);
+  assert.deepEqual(result.issues, [{cardId: 'C2', severity: 'high', reason: '关键事实未核实'}]);
+  assert.deepEqual(f.calls, ['C1', 'C2', 'C1']);
 });
 
 test('only high semantic facts and grounded warnings are aggregated; style preferences cannot spend a correction', async () => {
@@ -77,4 +120,21 @@ test('only high semantic facts and grounded warnings are aggregated; style prefe
   const result = await reviewDailyDraft(f.args);
   assert.deepEqual(result.issues, [{ cardId: 'C1', severity: 'high', reason: 'L1减L0误标为L2减L0' }]);
   assert.deepEqual(result.warnings, ['C1：原文未评估LLM。']); assert.equal(f.args.checkpoint.correctionCount, undefined);
+});
+
+test('global header review catches unsupported titles, caches unchanged receipts and reuses isolated item reviews on title edits', async () => {
+  const f = fixture(), original = f.args.model.json; let headers = 0;
+  f.args.model.json = async request => {
+    if (!request.prompt.startsWith('只审核整篇标题')) return original(request);
+    headers++;
+    assert.ok(request.prompt.includes(f.args.cards[0].locators[0].text));
+    return { issues: f.args.draft.title.includes('实盘') ? [{ severity: 'high', reason: '标题声称实盘；C1原文仅为合成实验' }] : [], warnings: [] };
+  };
+  f.args.draft.title = '实盘收益得到验证';
+  const first = await reviewIncludingHeader(f.args);
+  assert.equal(first.issues[0].scope, 'header');
+  await reviewIncludingHeader(f.args); assert.equal(headers, 1);
+  f.args.draft.title = '研究方法与实验边界';
+  assert.deepEqual((await reviewIncludingHeader(f.args)).issues, []);
+  assert.equal(headers, 2); assert.deepEqual(f.calls, ['C1', 'C2']);
 });

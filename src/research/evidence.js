@@ -7,6 +7,7 @@ import { modelIdentity } from '../core/model-identity.js';
 export const DAILY_STYLE_RULES = `文章呈现为自然的研究分享。标题围绕当天核心关键词组织成自然标题，不堆列关键词，不出现日期、“日报”或期数；模型名称中必要的数字可以保留。
 导语用“以下……”等自然表达，标题、导语、小标题和正文不使用“本期”“日报”“近期补读”等定期汇编措辞。“样本期”是实验条件，可以正常使用。
 判断与建议直接写“判断：”“建议：”或相应内容，不带“编辑”“笔者”“我们”等表达主体；研究事实可以保留“论文提出”“研究团队发现”“作者报告”等必要归属。明确区分事实、作者观点和推断，不用虚构的人物身份标示推断。
+上述限制针对叙述者身份，不是关键词禁令。“代码编辑”“文本编辑”“编辑器”“编辑距离”等技术术语可以正常使用，不得为了避开“编辑”二字改写研究事实。
 每篇论文或事件后的来源标题、链接及真实发表/更新日期由程序添加，不加补读标签。较早材料不得写成当天发布。文章末尾由程序单独添加文章对应的YYYY-MM-DD日期，不加“日期：”、截止时间或固定说明。`;
 
 export const DAILY_SYSTEM = `你负责撰写中文 LLM 与量化金融研究分享。量化指投资、交易、风险与金融时间序列，不默认指模型权重量化。
@@ -19,7 +20,7 @@ export const DAILY_SYSTEM = `你负责撰写中文 LLM 与量化金融研究分�
 ${DAILY_STYLE_RULES}`;
 
 // Use the same experimental scope contract when extracting, writing and reviewing.
-export const DAILY_EXPERIMENT_RULES = `报告实验结果时，从完整locators核实并在正文紧邻结果交代数据来源/生成方式、比较指标和比较组、关键评估窗口及适用约束，不能只摘摘要中的结论。真实系统采集的遥测不等于生产环境自然故障记录：若原文是实验部署、基线工作负载及计划/受控注入异常，须明确交代这些条件，不能简称为生产观测或自然故障。
+export const DAILY_EXPERIMENT_RULES = `报告实验结果时，从完整locators核实并在正文紧邻结果交代数据来源/生成方式、比较指标和比较组、关键评估窗口及适用约束，不能只摘摘要中的结论。报告LLM评审或人工评分的数值时，须同时交代样本数量与抽样/配对方式、评审模型或人员、每项评估次数及评分量表范围；区分主生成模型与评审模型，不能把评审分数当成交易收益或自由文本真实性证明。真实系统采集的遥测不等于生产环境自然故障记录：若原文是实验部署、基线工作负载及计划/受控注入异常，须明确交代这些条件，不能简称为生产观测或自然故障。
 组合配置、策略收益和交易回测的定性结果也须交代评估条件，即使没有收益数字。合成实验须明确合成基准、比较指标（如Sharpe）、基线/受限与放宽动作集合、预热与评估窗口、交易成本假设和关键组合约束，不能凭一句“不是实盘证据”代替上述口径。真实金融实验须说明市场与标的范围、样本构造（如各时点指数成分股而非静态股票池）、样本期、测试划分或评估窗口、基准及预测评估/回测/实盘性质。比较结果还须交代影响可比性的模型与搜索预算；成本须说明计费对象与适用税费，换手约束须说明定义。合成组合结果须区分主指标与特定比较的无风险利率口径，并注明所报告比较的种子数与配对方式。只评估估值或预测误差、没有报告交易收益时不强套交易成本。不要搬入所有超参数；条件与结果可分句并分别映射原文，多定位块的事实用多条refs。原文未披露的适用条件须限定为本次已核查原文未披露；未核实则写本次未核实。`;
 
 const compact = text => String(text || '').replace(/\s+/g, ' ').trim();
@@ -201,7 +202,18 @@ export function dailyStyleErrors(text, { where = '正文', title = false } = {})
   if (typeof text !== 'string') return [];
   const errors = [];
   if (/(?<!样)本期|日报|近期补读/.test(text)) errors.push(`${where}不得出现“本期”“日报”“近期补读”等定期汇编措辞`);
-  if (/编辑|笔者|我们/.test(text)) errors.push(`${where}不得带“编辑”“笔者”“我们”等表达主体，判断和建议直接陈述`);
+  // Match narrator constructions rather than the verb/noun "编辑". Ignore
+  // Markdown emphasis around the role, and protect technical compounds before
+  // matching predicates (e.g. "代码编辑建议" is a feature, not a narrator).
+  const visible = text.replace(/[*_`~]/g, '');
+  const prose = visible.replace(
+    /(?:代码|文本|程序|文档|文件|源码|源代码|图像|图片|视频|音频|基因|模型|知识|批量|局部)编辑|编辑(?:器|距离|操作|功能|模式|工具|任务)/g,
+    value => value.replace('编辑', '··'));
+  const subject = /我们|笔者|小编|编者|编辑(?:部|团队)?(?:\s*(?:的\s*)?(?:(?:在此|这里|对此|进一步|也|则|仍|更|可以|可|将|应当|应该|应)\s*)?(?:判断|建议|认为|观点|看法|点评|评论|推荐|提醒|总结|推断|分析|评估|指出|表示|觉得|看来)|\s*[:：])|(?:作为|身为)\s*(?:一名|一个|本文的)?\s*编辑(?!器|距离)/.exec(prose);
+  if (subject) {
+    const snippet = visible.slice(Math.max(0, subject.index - 18), subject.index + subject[0].length + 36);
+    errors.push(`${where}不得带“编辑”“笔者”“我们”等表达主体，判断和建议直接陈述；命中表达=${diagnostic(subject[0], 80)}，上下文=${diagnostic(snippet, 140)}；仅改叙述主体，保留技术术语和研究事实`);
+  }
   if (title && /(?:19|20)\d{2}\s*[-/.年]|[\d一二三四五六七八九十〇零]+\s*月|第\s*[\d一二三四五六七八九十百〇零]+\s*期|(?:期数|期号)\s*[:：]?\s*\d+/.test(text)) {
     errors.push('标题不得出现日期或期数，应围绕核心关键词组织成自然标题');
   }
@@ -252,7 +264,7 @@ export function validateDailyDraft(draft, cards, { minimum = (draft?.items?.leng
 
 export function reviewFingerprint({ draft, cards, input, context, modelConfig }) {
   return hash({ version: 8, draft, cards,
-    input, context, modelConfig: modelIdentity(modelConfig) });
+    input, context, modelConfig: modelIdentity(modelConfig, { mode: 'analysis' }) });
 }
 
 // After the sole rewrite, discard at most two unsupported complete statements.
@@ -299,22 +311,25 @@ ${DAILY_STYLE_RULES}
 ${repair.length ? `这是已消耗的唯一一次语义修正，请修复这些问题后分条写作，不得再申请一轮：${JSON.stringify(repair)}` : ''}`;
 }
 
-export function dailyWriterPrompt({ run, context, cards, previousArticle, repair = [], outline, assigned, previousItem }) {
+export function dailyWriterPrompt({ run, context, cards, previousArticle, repair = [], outline, assigned, previousItem, excerptIds = false }) {
+  const reference = excerptIds ? '{"excerptId":"从本条locators.excerpts选择的完整编号，如C2/L13/Q1"}'
+    : '{"cardId":"允许引用的C编号","locatorId":"L编号","quote":"逐字原文摘录至少8字符"}';
   return `冻结的资料窗口：${JSON.stringify(context)}\n用户要求与本线程修改：${run.input}\n已核实证据卡：${JSON.stringify(cards)}
 ${previousArticle ? `上一修订文章（只供按用户指令修改，事实仍须由证据卡支持）：\n${previousArticle}\n` : ''}
-${assigned ? `写作提纲（选题与篇幅提示，不提供额外事实）：${JSON.stringify(outline)}\n分配条目：${JSON.stringify(assigned)}\n${previousItem ? `本条待修正内容：${JSON.stringify(previousItem)}\n` : ''}本次只生成分配条目，返回单个 JSON {"cardId":"${assigned.cardId}","heading":${JSON.stringify(assigned.heading)},"importance":"${assigned.importance}","body":"约${assigned.targetChars}字的完整中文Markdown段落","claims":[{"sentence":"body中的精确关键事实原句","refs":[{"cardId":"允许引用的C编号","locatorId":"L编号","quote":"逐字原文摘录至少8字符"}]}],"figureIds":[]}。不要返回title、intro、items或其它新闻。只可引用本次提供的${cards.map(card => card.id).join('、')}，不要引用提纲其它未提供卡片；不为任何数字补写原文不存在的证据。` : '返回 JSON {"title":"64字内中文标题","intro":"不含数值的简短导语","items":[{"cardId":"主事件C编号","heading":"条目标题","importance":"lead或medium或brief","body":"完整中文Markdown段落","claims":[{"sentence":"body中的精确关键事实原句","refs":[{"cardId":"C编号","locatorId":"L编号","quote":"逐字原文摘录至少8字符"}]}],"figureIds":["可选已授权原图ID"]}]}。'}
+${assigned ? `写作提纲（选题与篇幅提示，不提供额外事实）：${JSON.stringify(outline)}\n分配条目：${JSON.stringify(assigned)}\n${previousItem ? `本条待修正内容：${JSON.stringify(previousItem)}\n` : ''}本次只生成分配条目，返回单个 JSON {"cardId":"${assigned.cardId}","heading":${JSON.stringify(assigned.heading)},"importance":"${assigned.importance}","body":"约${assigned.targetChars}字的完整中文Markdown段落","claims":[{"sentence":"body中的精确关键事实原句","refs":[${reference}]}],"figureIds":[]}。不要返回title、intro、items或其它新闻。只可引用本次提供的${cards.map(card => card.id).join('、')}，不要引用提纲其它未提供卡片；不为任何数字补写原文不存在的证据。` : '返回 JSON {"title":"64字内中文标题","intro":"不含数值的简短导语","items":[{"cardId":"主事件C编号","heading":"条目标题","importance":"lead或medium或brief","body":"完整中文Markdown段落","claims":[{"sentence":"body中的精确关键事实原句","refs":[{"cardId":"C编号","locatorId":"L编号","quote":"逐字原文摘录至少8字符"}]}],"figureIds":["可选已授权原图ID"]}]}。'}
 总正文通常3000–5000字，精选4–7个事件；重要程度决定篇幅，重点条约900–1200字、其它条约300–600字。少于4个有价值事件时允许缩短（每个事件约300字以上），明确材料较少，不凑长度。不把所有卡片写一遍，不平均分配。
 每张证据卡最多对应一个items条目，cardId不得重复，条目数不得超过证据卡数和7的较小值。同一事件的研究方法、结果、工具与实践启示放在该条body的不同子段，不拆成多条新闻。
 每个条目说明事件/研究提出什么、方法与关键结果、对LLM或量化金融为何重要、可落地步骤与限制。强交叉主题优先；通用LLM发布需说明金融研究者的实际用途。区分作者报告和推断。locators保留完整取得的正文，精选claims只是提要，缺少摘录不代表论文未披露。陈述“未披露/未报告/缺少”前必须检查完整locators：只在原文明示限制或完整原文已核查后陈述，限定为所检查的正文，不能推定未核查的附录、代码仓库也缺失；没完成核查就写“本次未核实”。
-所有重要事实尤其数字、日期、模型版本和收益必须在claims中逐句给出原文quote及locatorId。body中每一句包含数字的文字都必须映射，包括模型名、版本号以及判断、实践建议和局限段。例如“建议：可用Qwen3.6-35B-A3B做对照”也须对模型名里的数字引用正文原文；没有可定位摘录就改用不含数字的称呼或删除该句。一个数字句同时使用多个定位块的信息时，refs须分别引用各块，不能只引其中一块。
+所有重要事实尤其数字、日期、模型版本和收益必须在claims中逐句${excerptIds ? '选择支持该句的原文excerptId，程序按编号写入原文quote及locatorId' : '给出原文quote及locatorId'}。body中每一句包含数字的文字都必须映射，包括模型名、版本号以及判断、实践建议和局限段。例如“建议：可用Qwen3.6-35B-A3B做对照”也须对模型名里的数字引用正文原文；没有可定位摘录就改用不含数字的称呼或删除该句。一个数字句同时使用多个定位块的信息时，refs须分别引用各块，不能只引其中一块。
 ${DAILY_EXPERIMENT_RULES}
-claims.sentence必须逐字复制body中的完整原句，包括中文逗号、分号、句号、括号和空格，不能把body的“；”改成“。”。quote也逐字取对应locators，不自行改上下标、Unicode符号、缩写或标点。货币金额写“0.24美元”等形式，不写美元符号$，避免被误解为数学公式。
-每条refs.quote按合并空白后的文本计至少8字符，摘录足以支持断言的相关原文；MAE、RMSE、MASE等指标不能只引用缩写或“MAE:”标签，应连同对应定义一起逐字摘录。检查所有claims，不因先发现句子不匹配而遗漏其它引用问题。
+claims.sentence必须逐字复制body中的完整原句，包括中文逗号、分号、句号、括号和空格，不能把body的“；”改成“。”。${excerptIds ? 'refs每项只返回excerptId，不复制旧稿的quote或locatorId，不手写摘录，不编造编号。locators.excerpts按原文顺序覆盖完整取得的正文，选取语义匹配的必要摘录，每句最多6条refs。表格比较必须同时选择包含市场/列定义的表头和对应方法的完整数据行，不能拼接成假想连续摘录；指数名里的300、500等数字也须出现在所选表头或相关原文中。不同市场、方法、行列的相同数字不能互换。' : 'quote也逐字取对应locators，不自行改上下标、Unicode符号、缩写或标点。'}货币金额写“0.24美元”等形式，不写美元符号$，避免被误解为数学公式。
+${excerptIds ? '每条所选excerptId对应的摘录' : '每条refs.quote'}按合并空白后的文本计至少8字符，摘录足以支持断言的相关原文；MAE、RMSE、MASE等指标不能只引用缩写或“MAE:”标签，应连同对应定义一起${excerptIds ? '选择原文摘录编号' : '逐字摘录'}。检查所有claims，不因先发现句子不匹配而遗漏其它引用问题。
 数值用原文数字和单位，不新增换算。元数据中的v1等版本号、发布日期、更新日期若不出现在locators原文，不得自行写入body；来源列表及真实发表/更新日期由程序添加，不添加补读标签。导语只概括主线，不添加数值。成稿前逐句检查全部body中的数字与claims映射，推断标签不能替代事实定位。
 ${DAILY_STYLE_RULES}
 只写卡片已核实的来源链接。不在body直接写图片；通过figureIds选择已授权原图。公式只可原样使用formula定位块里的明确TeX，不猜测公式。不得写刊物栏目模板、公众号推广或交易建议。
-${assigned ? `只完成本条约${assigned.targetChars}字，上限${Math.floor(assigned.targetChars * 1.15)}字。字数按正文字符计数，中文、英文字母、数字和标点均计入，剔除空白、Markdown标记和链接地址；不要把英文模型名或数字当成一个词。最多12条关键事实claims，claims中的证据摘录不算正文篇幅。每条quote只摘录支持该事实的必要原句，不重复整段或整篇原文；所有数字句仍须完整映射。其它条目的介绍、提纲、导语和来源页脚均不写。` : ''}
-${repair.length ? `这是唯一一次修正机会，请修复这些核验问题并保持其它有效内容：${JSON.stringify(repair)}` : ''}`;
+${assigned ? `只完成本条约${assigned.targetChars}字，上限${Math.floor(assigned.targetChars * 1.15)}字。字数按正文字符计数，中文、英文字母、数字和标点均计入，剔除空白、Markdown标记和链接地址；不要把英文模型名或数字当成一个词。最多24条关键事实claims，允许将长事实句拆成分别映射的短句；claims中的证据摘录不算正文篇幅。${excerptIds ? '只选择支持本句的必要摘录编号' : '每条quote只摘录支持该事实的必要原句'}，不重复整段或整篇原文；所有数字句仍须完整映射。其它条目的介绍、提纲、导语和来源页脚均不写。` : ''}
+${repair.length ? `这是唯一一次修正机会，请修复这些核验问题并保持其它有效内容：${JSON.stringify(repair)}
+以本条待修正内容为基础，优先局部补充或改正被指出的原句。除非核验明确指出对应事实错误，必须保留原稿已正确交代的市场与样本、评估窗口和划分、基准、成本对象与具体费率、持仓约束以及模型/搜索预算。补充新条件不得将已有数值条件改成含糊概括；例如已给出的滑点、佣金和印花税费率不能缩成“计入交易成本”。篇幅不足时先压缩重复的分析与建议，不删除必要的实验条件；仍不足时收缩结果范围，删除次要指标及其相关结论，完整交代核心结果的评估口径，不保留所有统计数字却省略条件。` : ''}`;
 }
 
 const label = value => String(value || '').replace(/[\r\n]/g, ' ').replace(/[&/\\`*_[\]<>!]/g, character => `&#${character.charCodeAt(0)};`);

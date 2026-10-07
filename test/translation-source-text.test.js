@@ -14,7 +14,7 @@ import {
   assertSafeHttpUrl,
   buildDocumentManifest,
   captureEmbeddedChartFrames,
-  generateStructuredTranslation,
+  generateStructuredTranslation as generateWithReview,
   hasPdfSignature,
   inspectEmbeddedChartFrames,
   isPrivateIp,
@@ -23,11 +23,14 @@ import {
   safeFetchResource,
   sourceDocumentFromHtml,
   sourceDocumentFromMarkdown,
-  translateDocument,
+  translateDocument as translateWithReview,
   renderTranslatedDocument,
   validateEmbeddedChartScreenshot,
   validateTranslationArtifact,
 } from '../src/workflows/translation-source-text.js';
+
+const translateDocument = args => translateWithReview({ semanticReview: false, ...args });
+const generateStructuredTranslation = args => generateWithReview({ ...args, translationConfig: { ...args.translationConfig, semanticReview: false } });
 
 const PUBLIC_DNS = async () => [{ address: '93.184.216.34', family: 4 }];
 
@@ -569,7 +572,7 @@ test('WebP 原图在本地化时转为微信支持的 PNG', async () => {
   });
 
   const imagePath = document.blocks.find((block) => block.type === 'figure').images[0].localPath;
-  assert.match(imagePath, /figure-001\.png$/);
+  assert.match(imagePath, /converted\/image-[a-f0-9]+\.png$/);
   assert.equal(fs.readFileSync(imagePath).subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
 });
 
@@ -600,7 +603,7 @@ test('映射得到的 WebP 资产也会转为微信支持的 PNG', async () => {
   });
 
   const imagePath = document.blocks.find((block) => block.type === 'figure').images[0].localPath;
-  assert.match(imagePath, /figure-001\.png$/);
+  assert.match(imagePath, /converted\/image-[a-f0-9]+\.png$/);
   assert.equal(fs.readFileSync(imagePath).subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
 });
 
@@ -1083,7 +1086,7 @@ test('长段落高亮不足不触发重译，也不阻断忠实译文', async ()
   assert.match(renderTranslatedDocument(translated), /\*\*核心观点\*\*/);
 });
 
-test('明确数字不一致经两轮修复后进入宽松复核，不丢结构', async () => {
+test('明确数字不一致经两轮修复后暂停，保留已通过单元', async () => {
   const source = {
     version: 5,
     contentMode: 'structured-document',
@@ -1101,7 +1104,7 @@ test('明确数字不一致经两轮修复后进入宽松复核，不丢结构',
     }],
   };
   const workDir = tempDir();
-  const translated = await translateDocument({
+  await assert.rejects(translateDocument({
     source,
     workDir,
     model: 'test-model',
@@ -1115,18 +1118,10 @@ test('明确数字不一致经两轮修复后进入宽松复核，不丢结构',
         })),
       });
     },
-  });
-  assert.equal(translated.validationExceptions.length, 1);
-  assert.equal(translated.validationExceptions[0].id, 'b000001');
-  assert.match(translated.validationWarnings.join(' '), /两轮聚焦修复后宽松放行/);
-  const completeness = validateTranslationArtifact({
-    source,
-    translated,
-    article: renderTranslatedDocument(translated),
-  });
-  assert.equal(completeness.errors.length, 0);
-  assert.equal(completeness.strictEquivalence, false);
-  assert.deepEqual(completeness.reviewRequiredUnits, ['b000001']);
+  }), error => error.needsReview && error.code === 'TRANSLATION_QUALITY');
+  const saved = JSON.parse(fs.readFileSync(path.join(workDir, 'translation-checkpoint.json')));
+  assert.deepEqual(saved.translations.map(item => item.id), ['meta:title']);
+  assert.equal(saved.candidates[0].round, 2);
 });
 
 test('K/M/B/T、中文数量单位、千分位和百分比只要数值等价即可通过', async () => {
@@ -1195,7 +1190,7 @@ test('数量级不等价在两轮修复后保留具体复核原因', async () =>
       text: 'The model supports about 50k possible tokens.',
     }],
   };
-  const translated = await translateDocument({
+  await assert.rejects(translateDocument({
     source,
     workDir: tempDir(),
     model: 'test-model',
@@ -1209,9 +1204,7 @@ test('数量级不等价在两轮修复后保留具体复核原因', async () =>
         })),
       });
     },
-  });
-  assert.equal(translated.validationExceptions.length, 1);
-  assert.match(translated.validationExceptions[0].reasons.join(' '), /数字或链接不等价/);
+  }), error => error.needsReview && error.code === 'TRANSLATION_QUALITY');
 });
 
 test('ProgramBench 回归:百分比不产生 100 误报，未展开宏和引用异常进入复核', async () => {
@@ -1250,7 +1243,7 @@ test('ProgramBench 回归:百分比不产生 100 误报，未展开宏和引用�
       },
     ],
   };
-  const translated = await translateDocument({
+  await assert.rejects(translateDocument({
     source,
     workDir: tempDir(),
     model: 'test-model',
@@ -1268,10 +1261,7 @@ test('ProgramBench 回归:百分比不产生 100 误报，未展开宏和引用�
         })),
       });
     },
-  });
-  assert.deepEqual(translated.validationExceptions.map((item) => item.id), ['b000066']);
-  assert.doesNotMatch(translated.validationWarnings.join(' '), /b000074:caption|b000075:caption|NUM:100/);
-  assert.match(translated.validationExceptions[0].reasons.join(' '), /URL、占位符、Ticker 或型号标识不一致/);
+  }), error => error.needsReview && error.code === 'TRANSLATION_QUALITY');
 });
 
 test('自动修复返回空数组时重试一次并要求完整 ID 集合', async () => {
@@ -1643,7 +1633,7 @@ test('低置信度数字差异不消耗修复请求，只告警并写入 checkpo
   assert.match(translated.validationWarnings[0], /低置信度数字格式差异/);
   const checkpoint = JSON.parse(fs.readFileSync(path.join(workDir, 'translation-checkpoint.json'), 'utf8'));
   assert.equal(checkpoint.warnings.length, 1);
-  assert.equal(checkpoint.validationExceptions.length, 1);
+  assert.equal(checkpoint.validationExceptions.length, 0);
 });
 
 test('同批缺失译文仍硬失败，已通过单元立即保留到 checkpoint', async () => {
@@ -1720,7 +1710,7 @@ test('金融语境 pre-fee 不得误译为税前，历史断点译文也会确�
     },
   });
   const checkpoint = JSON.parse(fs.readFileSync(path.join(workDir, 'translation-checkpoint.json'), 'utf8'));
-  assert.match(checkpoint.translations.find((item) => item.id === 'b000001').text, /税前回报/);
+  assert.match(checkpoint.translations.find((item) => item.id === 'b000001').text, /费用前回报/);
   const translated = await translateDocument({
     source,
     workDir,
@@ -1795,7 +1785,7 @@ test('旧 checkpoint 按新 token 规则重验，只重做异常单元并保留�
     },
   });
   assert.equal(calls, 1);
-  assert.match(progress[0], /1 个旧单元需重做/);
+  assert.match(progress[0], /已验证 1\/2/);
   assert.match(translated.blocks[0].translatedText, /\\bench/);
 });
 
@@ -1959,7 +1949,7 @@ test('结构化响应连续截断时自动缩小批次并完成翻译', async ()
     },
   });
 
-  assert.deepEqual(batchSizes, [9, 9, 6, 3]);
+  assert.deepEqual(batchSizes, [9, 6, 3]);
   assert.equal(translated.translatedTitle, '分批恢复');
   assert.equal(translated.blocks.length, 8);
   assert.equal(translated.blocks.at(-1).translatedText, '译文条目 8。');
@@ -2249,8 +2239,7 @@ test('同任务原文快照跨重试复用，翻译补充要求更新时仅重�
   assert.equal(downloads, 1);
   await generateStructuredTranslation({ ...args, input: `${args.input}\n\n补充指令：\n标题改为《推理研究》`, completeArticle: translate });
   assert.equal(downloads, 1);
-  assert.ok(requests.length > completedRequests);
-  assert.ok(requests.at(-1).prompt.includes('标题改为《推理研究》'));
+  assert.equal(requests.length, completedRequests, 'title changes make zero body translation calls');
 
   const otherDir = tempDir();
   t.after(() => fs.rmSync(otherDir, { recursive: true, force: true }));
@@ -2317,13 +2306,13 @@ test('翻译补充要求贯穿截断后的拆批和局部修复', async (t) => {
       const { units } = JSON.parse(/输入 JSON:\n([\s\S]+)$/.exec(prompt)[1]);
       if (units.length > 6) return '{"translations":[';
       const repair = inferenceContext.phase === 'repair';
-      return JSON.stringify({ translations: units.filter(unit => repair || unit.id !== 'b0').map(unit => ({
+      return JSON.stringify({ translations: units.filter(unit => repair || units.length === 1 || unit.id !== 'b0').map(unit => ({
         id: unit.id, text: unit.kind === 'title' ? '翻译要求' : `推理步骤 ${repair ? '⟦SL_KEEP_1⟧' : unit.text.match(/\d+/)[0]}。`,
       })) });
     },
   });
   assert.ok(phases.some(context => context.splitBatchIndex));
-  assert.ok(phases.some(context => context.phase === 'repair'));
+  assert.ok(phases.some(context => context.itemCount === 1));
 });
 
 test('真实 DeepSeek 适配器 length 响应触发有界拆批，持续截断仍硬失败', async () => {
@@ -2348,10 +2337,10 @@ test('真实 DeepSeek 适配器 length 响应触发有界拆批，持续截断�
     const operation = translateDocument({ source, workDir: tempDir(), model: 'fixture', writer: {}, completeArticle: args => model.complete(args) });
     if (alwaysTruncate) {
       await assert.rejects(operation, error => error.code === 'MODEL_TRUNCATED' && error.retryableTranslationResponse);
-      assert.deepEqual(sizes, [9, 9, 6, 6]);
+      assert.deepEqual(sizes, [9, 6, 6]);
     } else {
       const translated = await operation;
-      assert.deepEqual(sizes, [9, 9, 6, 3]);
+      assert.deepEqual(sizes, [9, 6, 3]);
       assert.equal(translated.blocks.at(-1).translatedText, '条目 8。');
     }
   }

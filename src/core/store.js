@@ -10,6 +10,13 @@ const stamp = value => {
 };
 export function openStore(filename, { maxQueue = 100, readonly = false } = {}) {
   const db = new Database(filename, { readonly, fileMustExist: readonly });
+  try { return initializeStore(db, { maxQueue, readonly }); }
+  catch (error) { if (db.open) db.close(); throw error; }
+}
+
+function initializeStore(db, { maxQueue, readonly }) {
+  const schemaVersion = db.pragma('user_version', { simple: true });
+  if (schemaVersion > 3) throw new Error('任务数据库版本较新，请使用匹配的程序版本');
   if (!readonly) db.pragma('journal_mode = WAL');
   db.pragma('busy_timeout = 5000'); db.pragma('foreign_keys = ON');
   if (!readonly) db.exec(`
@@ -36,8 +43,6 @@ export function openStore(filename, { maxQueue = 100, readonly = false } = {}) {
       UNIQUE(run_id, kind));
     CREATE INDEX IF NOT EXISTS queue ON runs(status, ready_at);
   `);
-  const schemaVersion = db.pragma('user_version', { simple: true });
-  if (schemaVersion > 2) { db.close(); throw new Error('任务数据库版本较新，请使用匹配的程序版本'); }
   if (!readonly && schemaVersion < 1) db.transaction(() => {
     const columns = new Set(db.prepare('PRAGMA table_info(runs)').all().map(column => column.name));
     for (const [name, definition] of Object.entries({ profile: 'TEXT', context_json: "TEXT NOT NULL DEFAULT '{}'",
@@ -88,6 +93,13 @@ export function openStore(filename, { maxQueue = 100, readonly = false } = {}) {
       PRAGMA user_version = 2;
     `);
   })();
+  if (!readonly && schemaVersion < 3) db.transaction(() => {
+    const columns = new Set(db.prepare('PRAGMA table_info(notices)').all().map(column => column.name));
+    if (!columns.has('due_at')) db.exec('ALTER TABLE notices ADD COLUMN due_at INTEGER NOT NULL DEFAULT 0');
+    if (!columns.has('blocked_reason')) db.exec('ALTER TABLE notices ADD COLUMN blocked_reason TEXT');
+    db.exec('PRAGMA user_version = 3');
+  })();
+  const outboxReady = !readonly || schemaVersion >= 3;
   const dailySchemaReady = !readonly || schemaVersion >= 1;
   const reservationsSchemaReady = !readonly || schemaVersion >= 2;
   const get = id => db.prepare('SELECT * FROM runs WHERE id=?').get(id);
@@ -383,7 +395,11 @@ export function openStore(filename, { maxQueue = 100, readonly = false } = {}) {
       update(id, { ...fields, status: 'done', error: null, error_code: null, retryable: 0 });
       notice(get(id), 'done', message);
     }),
-    notices: () => db.prepare('SELECT * FROM notices WHERE sent_at IS NULL ORDER BY id LIMIT 30').all(),
+    notices: ({ deliverable = false, now = Date.now() } = {}) => db.prepare(`SELECT * FROM notices WHERE sent_at IS NULL
+      ${deliverable && outboxReady ? 'AND blocked_reason IS NULL AND due_at<=?' : ''} ORDER BY id LIMIT 30`)
+      .all(...(deliverable && outboxReady ? [now] : [])),
+    deferNotice: (id, dueAt) => db.prepare('UPDATE notices SET due_at=? WHERE id=?').run(dueAt, id),
+    blockNotice: (id, reason) => db.prepare('UPDATE notices SET blocked_reason=? WHERE id=?').run(reason, id),
     sent: id => db.prepare('UPDATE notices SET sent_at=? WHERE id=?').run(Date.now(), id),
     close: () => db.close(),
   };

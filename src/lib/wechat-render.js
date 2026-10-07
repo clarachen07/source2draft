@@ -1,3 +1,4 @@
+import { assertProjectPath } from './project-path.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { renderArticleMarkdown } from './article-markdown.js';
@@ -5,7 +6,11 @@ import { JSDOM } from 'jsdom';
 import { protectMathInMarkdown, renderEquationPngs, restoreMathInHtml, validateMathRestored } from './wechat-math.js';
 import { escapeHtml, hash, parseArticle, writeAtomic } from './io.js';
 import { screenshotHtml } from './browser.js';
-import { download } from '../core/sources.js';
+import { safeFetchResource } from './secure-http.js';
+import { withTaskCancellation } from './task-cancellation.js';
+import { fetchRetry } from './io.js';
+import { fileRecord, preparedIdentity, preparedManifestHash, RENDER_VERSION } from './artifact-cache.js';
+const download = (url, { signal, headers = {}, limits } = {}) => safeFetchResource({ url, signal, headers, limits, fetchFn: withTaskCancellation(globalThis.fetch, signal), fetchWithRetry: fetchRetry });
 import { secretValues } from '../config/index.js';
 
 const ARTICLE_FONT = '-apple-system,BlinkMacSystemFont,Segoe UI,PingFang SC,Microsoft YaHei,Arial,sans-serif';
@@ -30,14 +35,16 @@ const STYLES = {
 const ALLOWED = new Set('section div p h1 h2 h3 h4 h5 h6 strong b em i s del u a img ul ol li blockquote pre code table thead tbody tr th td hr br sup sub span'.split(' '));
 export function validatePreparedWechatHtml(html) {
   const doc = new JSDOM(html).window.document;
-  const errors = [];
-  if (doc.querySelector('script,iframe,object,embed,form,input,style,link,video,audio')) errors.push('存在危险或不支持的 HTML');
-  for (const el of doc.querySelectorAll('*')) for (const attr of el.attributes) {
-    if (/^on/i.test(attr.name) || /javascript:|file:|vbscript:/i.test(attr.value)) errors.push('存在危险属性');
-  }
-  if (!doc.body.textContent.trim()) errors.push('正文为空');
-  if (/SLMATH\d+XSLMATH/.test(doc.body.textContent)) errors.push('公式占位符未恢复');
-  return { errors, warnings: [] };
+  try {
+    const errors = [];
+    if (doc.querySelector('script,iframe,object,embed,form,input,style,link,video,audio')) errors.push('存在危险或不支持的 HTML');
+    for (const el of doc.querySelectorAll('*')) for (const attr of el.attributes) {
+      if (/^on/i.test(attr.name) || /javascript:|file:|vbscript:/i.test(attr.value)) errors.push('存在危险属性');
+    }
+    if (!doc.body.textContent.trim()) errors.push('正文为空');
+    if (/SLMATH\d+XSLMATH/.test(doc.body.textContent)) errors.push('公式占位符未恢复');
+    return { errors, warnings: [] };
+  } finally { doc.defaultView.close(); }
 }
 export function assertSafeArticle(markdown, config) {
   for (const secret of secretValues(config)) if (secret.length >= 8 && markdown.includes(secret)) throw new Error('成稿含有运行凭据，禁止上传');
@@ -145,6 +152,7 @@ export function applyWechatArticleStyles(body) {
 }
 export async function prepareArticle({ markdown, workDir, config, signal, cover, onTelemetry }) {
   signal?.throwIfAborted();
+  for (const name of ['cover.png', 'article.html', 'preview.html', 'prepared.json', 'math-cache.json']) assertProjectPath(workDir, path.join(workDir, name));
   assertSafeArticle(markdown, config);
   const { title, body } = parseArticle(markdown);
   const protectedMath = protectMathInMarkdown(body);
@@ -156,79 +164,86 @@ export async function prepareArticle({ markdown, workDir, config, signal, cover,
   const mathErrors = validateMathRestored(html, protectedMath);
   if (mathErrors?.errors?.length) throw new Error(mathErrors.errors.join('；'));
   const doc = new JSDOM(`<body>${html}</body>`).window.document;
-  for (const el of [...doc.body.querySelectorAll('*')]) {
-    if (!ALLOWED.has(el.tagName.toLowerCase())) throw new Error(`不支持的 HTML 元素 ${el.tagName}`);
-    for (const attr of [...el.attributes]) {
-      if (/^on/i.test(attr.name)) throw new Error('正文含事件处理属性');
-      const listNumbering = (el.tagName === 'OL' && ['start', 'reversed'].includes(attr.name))
-        || (el.tagName === 'LI' && attr.name === 'value');
-      const mathDimensions = el.tagName === 'IMG' && el.hasAttribute('data-sl-math')
-        && ['width', 'height'].includes(attr.name);
-      if (!['href', 'src', 'alt', 'style', 'colspan', 'rowspan'].includes(attr.name)
-        && !listNumbering && !mathDimensions && !attr.name.startsWith('data-sl-math')) el.removeAttribute(attr.name);
+  try {
+    for (const el of [...doc.body.querySelectorAll('*')]) {
+      if (!ALLOWED.has(el.tagName.toLowerCase())) throw new Error(`不支持的 HTML 元素 ${el.tagName}`);
+      for (const attr of [...el.attributes]) {
+        if (/^on/i.test(attr.name)) throw new Error('正文含事件处理属性');
+        const listNumbering = (el.tagName === 'OL' && ['start', 'reversed'].includes(attr.name))
+          || (el.tagName === 'LI' && attr.name === 'value');
+        const mathDimensions = el.tagName === 'IMG' && el.hasAttribute('data-sl-math')
+          && ['width', 'height'].includes(attr.name);
+        if (!['href', 'src', 'alt', 'style', 'colspan', 'rowspan'].includes(attr.name)
+          && !listNumbering && !mathDimensions && !attr.name.startsWith('data-sl-math')) el.removeAttribute(attr.name);
+      }
     }
-  }
-  applyWechatArticleStyles(doc.body);
-  const assets = [];
-  const localAssets = new Map();
-  const remoteAssets = new Map();
-  const uploadContents = new Set();
-  let assetBytes = 0;
-  for (const img of doc.querySelectorAll('img')) {
+    applyWechatArticleStyles(doc.body);
+    const assets = [];
+    const localAssets = new Map();
+    const remoteAssets = new Map();
+    const uploadContents = new Set();
+    let assetBytes = 0;
+    for (const img of doc.querySelectorAll('img')) {
+      signal?.throwIfAborted();
+      let src = img.getAttribute('src');
+      if (!src) throw new Error('正文图片缺少地址');
+      if (/^https?:\/\//i.test(src)) {
+        const remoteUrl = src;
+        src = remoteAssets.get(remoteUrl);
+        if (!src) {
+          const fetched = await download(remoteUrl, { signal, limits: { maxSourceBytes: 10 * 1024 * 1024, maxRedirects: 5, fetchTimeoutMs: 45000 } });
+          const mime = imageType(fetched.buffer);
+          src = path.join(workDir, `image-${hash(fetched.buffer).slice(0, 16)}.${mime.split('/')[1]}`);
+          assertProjectPath(workDir, src);
+          fs.writeFileSync(src, fetched.buffer, { mode: 0o600 });
+          remoteAssets.set(remoteUrl, src);
+        }
+      }
+      const local = safeLocalAsset(src, workDir);
+      if (!localAssets.has(local)) {
+        const size = fs.statSync(local).size;
+        if (size > 10 * 1024 * 1024) throw new Error('正文单张图片超过 10 MB');
+        const buffer = fs.readFileSync(local);
+        imageType(buffer);
+        const digest = hash(buffer);
+        localAssets.set(local, digest);
+        assets.push(local);
+        // This is a local resource budget, not a WeChat image-count quota.
+        // Papers may legitimately contain hundreds of formula PNGs. Count bytes
+        // once per content hash, matching the uploader's persisted receipt cache,
+        // while retaining every image occurrence and its placement in the HTML.
+        if (!uploadContents.has(digest)) {
+          uploadContents.add(digest);
+          assetBytes += size;
+          if (assetBytes > 40 * 1024 * 1024) throw new Error(`正文不重复图片总量 ${(assetBytes / 1048576).toFixed(1)} MB 超过本地处理预算 40 MB`);
+        }
+      }
+      img.setAttribute('src', path.relative(workDir, local));
+    }
+    if (/\/(?:Users|home|private|var|srv)\/|[A-Z]:\\Users\\/.test(doc.body.textContent)) throw new Error('正文泄漏本机路径，禁止上传');
+    html = `<section style="font-family:${ARTICLE_FONT};font-size:15px;line-height:1.8;color:#222;text-align:left;overflow-wrap:break-word;">${doc.body.innerHTML}</section>`;
+    const check = validatePreparedWechatHtml(html);
+    if (check.errors.length) throw new Error(check.errors.join('；'));
+    const coverPath = path.join(workDir, 'cover.png');
+    if (cover) {
+      let buffer;
+      if (cover.url) buffer = (await download(cover.url, { signal, headers: cover.headers || {}, limits: { maxSourceBytes: 10 * 1024 * 1024, maxRedirects: 5, fetchTimeoutMs: 45000 } })).buffer;
+      else buffer = fs.readFileSync(safeLocalAsset(cover.path, workDir));
+      const mime = imageType(buffer);
+      const dataUrl = `data:${mime};base64,${buffer.toString('base64')}`;
+      await screenshotHtml(`<html><body style="margin:0"><img src="${dataUrl}" style="width:900px;height:383px;object-fit:cover"></body></html>`, coverPath, config, { signal, onTelemetry });
+    } else {
+      await screenshotHtml(`<html lang="zh"><meta charset="utf-8"><body style="margin:0;background:#fff;color:#252525;display:flex;align-items:center;height:383px"><div style="padding:48px 64px;font:600 48px/1.4 -apple-system,sans-serif;word-break:break-word">${escapeHtml(title)}</div></body></html>`, coverPath, config, { signal, onTelemetry });
+    }
     signal?.throwIfAborted();
-    let src = img.getAttribute('src');
-    if (!src) throw new Error('正文图片缺少地址');
-    if (/^https?:\/\//i.test(src)) {
-      const remoteUrl = src;
-      src = remoteAssets.get(remoteUrl);
-      if (!src) {
-        const fetched = await download(remoteUrl, { signal, limits: { maxSourceBytes: 10 * 1024 * 1024, maxRedirects: 5, fetchTimeoutMs: 45000 } });
-        const mime = imageType(fetched.buffer);
-        src = path.join(workDir, `image-${hash(fetched.buffer).slice(0, 16)}.${mime.split('/')[1]}`);
-        fs.writeFileSync(src, fetched.buffer, { mode: 0o600 });
-        remoteAssets.set(remoteUrl, src);
-      }
-    }
-    const local = safeLocalAsset(src, workDir);
-    if (!localAssets.has(local)) {
-      const size = fs.statSync(local).size;
-      if (size > 10 * 1024 * 1024) throw new Error('正文单张图片超过 10 MB');
-      const buffer = fs.readFileSync(local);
-      imageType(buffer);
-      const digest = hash(buffer);
-      localAssets.set(local, digest);
-      assets.push(local);
-      // This is a local resource budget, not a WeChat image-count quota.
-      // Papers may legitimately contain hundreds of formula PNGs. Count bytes
-      // once per content hash, matching the uploader's persisted receipt cache,
-      // while retaining every image occurrence and its placement in the HTML.
-      if (!uploadContents.has(digest)) {
-        uploadContents.add(digest);
-        assetBytes += size;
-        if (assetBytes > 40 * 1024 * 1024) throw new Error(`正文不重复图片总量 ${(assetBytes / 1048576).toFixed(1)} MB 超过本地处理预算 40 MB`);
-      }
-    }
-    img.setAttribute('src', path.relative(workDir, local));
-  }
-  if (/\/(?:Users|home|private|var|srv)\/|[A-Z]:\\Users\\/.test(doc.body.textContent)) throw new Error('正文泄漏本机路径，禁止上传');
-  html = `<section style="font-family:${ARTICLE_FONT};font-size:15px;line-height:1.8;color:#222;text-align:left;overflow-wrap:break-word;">${doc.body.innerHTML}</section>`;
-  const check = validatePreparedWechatHtml(html);
-  if (check.errors.length) throw new Error(check.errors.join('；'));
-  const coverPath = path.join(workDir, 'cover.png');
-  if (cover) {
-    let buffer;
-    if (cover.url) buffer = (await download(cover.url, { signal, headers: cover.headers || {}, limits: { maxSourceBytes: 10 * 1024 * 1024, maxRedirects: 5, fetchTimeoutMs: 45000 } })).buffer;
-    else buffer = fs.readFileSync(safeLocalAsset(cover.path, workDir));
-    const mime = imageType(buffer);
-    const dataUrl = `data:${mime};base64,${buffer.toString('base64')}`;
-    await screenshotHtml(`<html><body style="margin:0"><img src="${dataUrl}" style="width:900px;height:383px;object-fit:cover"></body></html>`, coverPath, config, { signal, onTelemetry });
-  } else {
-    await screenshotHtml(`<html lang="zh"><meta charset="utf-8"><body style="margin:0;background:#fff;color:#252525;display:flex;align-items:center;height:383px"><div style="padding:48px 64px;font:600 48px/1.4 -apple-system,sans-serif;word-break:break-word">${escapeHtml(title)}</div></body></html>`, coverPath, config, { signal, onTelemetry });
-  }
-  signal?.throwIfAborted();
-  writeAtomic(path.join(workDir, 'article.html'), html);
-  writeAtomic(path.join(workDir, 'preview.html'), `<!doctype html><html lang="zh"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)}</title><body style="max-width:680px;margin:36px auto;padding:0 20px;font-family:-apple-system,sans-serif"><h1>${escapeHtml(title)}</h1>${html}</body></html>`);
-  const prepared = { title, html, assets, coverPath };
-  writeAtomic(path.join(workDir, 'prepared.json'), prepared);
-  return prepared;
+    writeAtomic(path.join(workDir, 'article.html'), html);
+    const previewHtml = `<!doctype html><html lang="zh"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)}</title><body style="max-width:680px;margin:36px auto;padding:0 20px;font-family:-apple-system,sans-serif"><h1>${escapeHtml(title)}</h1>${html}</body></html>`;
+    writeAtomic(path.join(workDir, 'preview.html'), previewHtml);
+    const prepared = { title, html, assets, coverPath, outputContents: { 'article.html': html, 'preview.html': previewHtml }, version: RENDER_VERSION,
+      identity: preparedIdentity(markdown, config, cover, workDir),
+      files: [...assets, coverPath, path.join(workDir, 'article.html'), path.join(workDir, 'preview.html')].map(file => fileRecord(file, workDir)) };
+    prepared.manifestHash = preparedManifestHash(prepared);
+    writeAtomic(path.join(workDir, 'prepared.json'), prepared);
+    return prepared;
+  } finally { doc.defaultView.close(); }
 }

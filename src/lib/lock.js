@@ -1,11 +1,14 @@
 import Database from 'better-sqlite3';
 import fs from 'node:fs';
 import path from 'node:path';
+import { assertProjectPath } from './project-path.js';
 
 // The OS releases SQLite's file lock even after SIGKILL. Never unlink the inode:
 // replacing it could let two processes hold locks on different files at this path.
 export async function acquireInstanceLock(root) {
   const directory = path.join(fs.realpathSync(root), '.local');
+  assertProjectPath(root, directory);
+  assertProjectPath(root, path.join(directory, 'instance-lock.sqlite'));
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   const filename = path.join(directory, 'instance-lock.sqlite');
   fs.closeSync(fs.openSync(filename, 'a', 0o600));

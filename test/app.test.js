@@ -10,6 +10,8 @@ import { loadConfig, redact } from '../src/config/index.js';
 import { routeMode, chooseTranslationSource, createEngine } from '../src/core/engine.js';
 import { acquireInstanceLock } from '../src/lib/lock.js';
 import { renderCitations } from '../src/workflows/analysis.js';
+import { approveArtifact } from '../src/lib/artifact-cache.js';
+import { modelIdentity } from '../src/core/model-identity.js';
 import { writeAtomic } from '../src/lib/io.js';
 
 const config = () => loadConfig({ DEEPSEEK_API_KEY: 'test-secret', SLACK_TEAM_ID: 'T1', SLACK_USER_ID: 'U1', SLACK_CHANNEL_ID: 'C1', SLACK_EDIT_DEBOUNCE_MS: '0' });
@@ -79,6 +81,8 @@ test('Slack message edits replace pending revision and offline old top-level mes
     assert.equal(store.list().length, 0);
     await receive({ channel: 'C1', user: 'U1', ts: '1000', text: '<@UBOT> original' }, { team_id: 'T1' });
     await receive({ channel: 'C1', subtype: 'message_changed', message: { user: 'U1', ts: '1000', text: 'edited', edited: { ts: '1001' } } }, { team_id: 'T1' });
+    assert.equal(store.latest('C1:1000').input, 'original');
+    await receive({ channel: 'C1', subtype: 'message_changed', message: { user: 'U1', ts: '1000', text: '<@UBOT> edited', edited: { ts: '1002' } } }, { team_id: 'T1' });
     assert.equal(store.latest('C1:1000').input, 'edited');
   } finally { store.close(); }
 });
@@ -146,7 +150,7 @@ test('dry-run engine never invokes WeChat and retains complete preview result', 
   const store = openStore(':memory:');
   try {
     const run = enqueue(store).run, runDir = path.join(dir, 'runs', run.id);
-    writeAtomic(path.join(runDir, 'artifact.json'), { article: '---\ntitle: 测试\n---\n\n完整正文。', warnings: [] });
+    writeAtomic(path.join(runDir, 'artifact.json'), approveArtifact({ article: '---\ntitle: 测试\n---\n\n完整正文。', warnings: [] }, { input: run.input, mode: 'analysis', modelIdentity: modelIdentity(config().model, { mode: 'analysis' }) }));
     const engine = createEngine({ config: { ...config(), dataDir: dir }, store,
       wechat: { publish: () => { throw new Error('MUST NOT CALL'); } },
       prepare: async () => ({ title: '测试', html: '<p>完整正文</p>' }),

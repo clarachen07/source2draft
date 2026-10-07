@@ -1,3 +1,5 @@
+import { assertProjectPath } from '../lib/project-path.js';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { JSDOM } from 'jsdom';
@@ -214,49 +216,51 @@ export function inspectDatalabResult(result, { expectedPageIds } = {}) {
   if (!Number.isInteger(pageCount) || pageCount < 1) issues.push('page_count 缺失或无效');
   if (quality === undefined || quality < 0 || quality > 5) issues.push('parse_quality_score 缺失或无效');
 
-  let document;
-  try { document = new JSDOM(html).window.document; }
+  let dom, document;
+  try { dom = new JSDOM(html); document = dom.window.document; }
   catch { issues.push('HTML 无法解析'); }
-  const pageNodes = document ? [...document.querySelectorAll('.page[data-page-id]')] : [];
-  const pageIds = pageNodes.map((node) => Number(node.getAttribute('data-page-id')));
-  const expected = Array.isArray(expectedPageIds) && expectedPageIds.length
-    ? expectedPageIds
-    : Number.isInteger(pageCount) && pageCount > 0
-      ? Array.from({ length: pageCount }, (_, index) => index)
-      : [];
-  if (pageNodes.length !== expected.length) {
-    issues.push(`分页容器数量不一致:${pageNodes.length}/${expected.length || '未知'}`);
-  }
-  if (pageIds.some((id) => !Number.isInteger(id)) || new Set(pageIds).size !== pageIds.length) {
-    issues.push('分页 ID 缺失、重复或无效');
-  } else if (expected.length && pageIds.join(',') !== expected.join(',')) {
-    issues.push(`分页 ID 不连续或范围不一致:${pageIds.join(',') || '无'}`);
-  }
-  if (Number.isInteger(pageCount) && expected.length && pageCount !== expected.length) {
-    issues.push(`处理页数不一致:${pageCount}/${expected.length}`);
-  }
+  try {
+    const pageNodes = document ? [...document.querySelectorAll('.page[data-page-id]')] : [];
+    const pageIds = pageNodes.map((node) => Number(node.getAttribute('data-page-id')));
+    const expected = Array.isArray(expectedPageIds) && expectedPageIds.length
+      ? expectedPageIds
+      : Number.isInteger(pageCount) && pageCount > 0
+        ? Array.from({ length: pageCount }, (_, index) => index)
+        : [];
+    if (pageNodes.length !== expected.length) {
+      issues.push(`分页容器数量不一致:${pageNodes.length}/${expected.length || '未知'}`);
+    }
+    if (pageIds.some((id) => !Number.isInteger(id)) || new Set(pageIds).size !== pageIds.length) {
+      issues.push('分页 ID 缺失、重复或无效');
+    } else if (expected.length && pageIds.join(',') !== expected.join(',')) {
+      issues.push(`分页 ID 不连续或范围不一致:${pageIds.join(',') || '无'}`);
+    }
+    if (Number.isInteger(pageCount) && expected.length && pageCount !== expected.length) {
+      issues.push(`处理页数不一致:${pageCount}/${expected.length}`);
+    }
 
-  const htmlImages = document ? [...document.querySelectorAll('img[src]')] : [];
-  const htmlImageKeys = new Set(htmlImages
-    .map((image) => normalizeAssetKey(image.getAttribute('src')))
-    .filter(Boolean));
-  const resultImageKeys = new Set(Object.keys(result?.images || {}).map(normalizeAssetKey).filter(Boolean));
-  const htmlImageAliases = new Set([...htmlImageKeys].flatMap((key) => [key, path.basename(key)]));
-  const resultImageAliases = new Set([...resultImageKeys].flatMap((key) => [key, path.basename(key)]));
-  const missingImages = [...htmlImageKeys].filter((key) => !resultImageAliases.has(key));
-  const unreferencedImages = [...resultImageKeys].filter((key) => !htmlImageAliases.has(key));
-  if (missingImages.length) issues.push(`HTML 图片缺少返回资产:${missingImages.slice(0, 5).join(',')}`);
-  if (unreferencedImages.length) issues.push(`返回图片未被 HTML 引用:${unreferencedImages.slice(0, 5).join(',')}`);
+    const htmlImages = document ? [...document.querySelectorAll('img[src]')] : [];
+    const htmlImageKeys = new Set(htmlImages
+      .map((image) => normalizeAssetKey(image.getAttribute('src')))
+      .filter(Boolean));
+    const resultImageKeys = new Set(Object.keys(result?.images || {}).map(normalizeAssetKey).filter(Boolean));
+    const htmlImageAliases = new Set([...htmlImageKeys].flatMap((key) => [key, path.basename(key)]));
+    const resultImageAliases = new Set([...resultImageKeys].flatMap((key) => [key, path.basename(key)]));
+    const missingImages = [...htmlImageKeys].filter((key) => !resultImageAliases.has(key));
+    const unreferencedImages = [...resultImageKeys].filter((key) => !htmlImageAliases.has(key));
+    if (missingImages.length) issues.push(`HTML 图片缺少返回资产:${missingImages.slice(0, 5).join(',')}`);
+    if (unreferencedImages.length) issues.push(`返回图片未被 HTML 引用:${unreferencedImages.slice(0, 5).join(',')}`);
 
-  return {
-    issues,
-    pageIds,
-    htmlTextCharacters: document
-      ? String(document.body?.textContent || '').replace(/\s+/g, '').length
-      : 0,
-    htmlImageCount: htmlImages.length,
-    resultImageCount: resultImageKeys.size,
-  };
+    return {
+      issues,
+      pageIds,
+      htmlTextCharacters: document
+        ? String(document.body?.textContent || '').replace(/\s+/g, '').length
+        : 0,
+      htmlImageCount: htmlImages.length,
+      resultImageCount: resultImageKeys.size,
+    };
+  } finally { dom?.window.close(); }
 }
 
 function validateCheckUrl(rawUrl, baseUrl, requestId) {
@@ -286,7 +290,8 @@ function validateCheckUrl(rawUrl, baseUrl, requestId) {
 function writeExtractedImages(images, { workDir, maxCount, maxTotalBytes, maxSingleBytes }) {
   const entries = Object.entries(images || {});
   if (entries.length > maxCount) throw new Error(`Datalab 图片数量超过上限:${entries.length}/${maxCount}`);
-  const assetDir = path.join(workDir, 'translation-assets');
+  const assetDir = path.join(workDir, 'translation-assets', 'original');
+  assertProjectPath(workDir, assetDir);
   fs.mkdirSync(assetDir, { recursive: true });
   const mapped = {};
   let total = 0;
@@ -298,8 +303,9 @@ function writeExtractedImages(images, { workDir, maxCount, maxTotalBytes, maxSin
     }
     total += buffer.length;
     if (total > maxTotalBytes) throw new Error(`Datalab 图片总量超过上限:${total}/${maxTotalBytes}`);
-    const filename = `figure-${String(index + 1).padStart(3, '0')}${extension}`;
+    const filename = `${crypto.createHash('sha256').update(buffer).digest('hex')}${extension}`;
     const target = path.join(assetDir, filename);
+    assertProjectPath(workDir, target);
     fs.writeFileSync(target, buffer, { mode: 0o600 });
     mapped[normalizeAssetKey(originalName)] = target;
     mapped[normalizeAssetKey(path.basename(originalName))] = target;

@@ -5,7 +5,7 @@ import { promisify } from 'node:util';
 import { JSDOM } from 'jsdom';
 import { Readability } from '@mozilla/readability';
 import { hash, writeAtomic } from '../lib/io.js';
-import { sourceDownloadUrl } from '../workflows/translation-source-text.js';
+import { sourceDownloadUrl } from '../lib/secure-http.js';
 import { imageType } from '../lib/wechat-render.js';
 import { canonicalUrl, parsedDate, temporalStatus } from './candidates.js';
 import { crossrefMetadata, providerSettings } from './providers.js';

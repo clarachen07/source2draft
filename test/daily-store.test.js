@@ -29,7 +29,7 @@ test('daily migration preserves an existing revision and runs once after reopeni
       VALUES('preserved','C1:1',7,'user content','done',0,1,1,1,'known-draft')`).run();
     db.close();
     store = openStore(fixture.filename);
-    assert.equal(store.db.pragma('user_version', { simple: true }), 2);
+    assert.equal(store.db.pragma('user_version', { simple: true }), 3);
     assert.equal(store.get('preserved').input, 'user content');
     assert.equal(store.get('preserved').media_id, 'known-draft');
     assert.equal(store.get('preserved').context_json, '{}');
@@ -204,7 +204,7 @@ test('version two adds request audit without changing an existing version-one qu
     assert.equal(store.db.prepare("SELECT count(*) AS n FROM sqlite_master WHERE name='provider_reservations'").get().n, 0);
     store.close();
     store = openStore(fixture.filename);
-    assert.equal(store.db.pragma('user_version', { simple: true }), 2);
+    assert.equal(store.db.pragma('user_version', { simple: true }), 3);
     assert.equal(store.providerBudgets()[0].used, 2);
     assert.deepEqual(store.providerReservations(), []);
     assert.equal(store.reserveProviderBudget({ provider: 'tavily', period: '2026-10', units: 1, limit: 3 }).used, 3);

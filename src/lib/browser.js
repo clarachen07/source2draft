@@ -25,8 +25,10 @@ async function screenshotLocked(html, target, config, { width, height, signal, o
   signal?.addEventListener('abort', abortBrowser, { once: true });
   try {
     throwIfTaskCancelled(signal);
-    const page = await browser.newPage({ viewport: { width, height }, deviceScaleFactor: 2 });
-    await page.route('**/*', route => route.abort());
+    const context = await browser.newContext({ viewport: { width, height }, deviceScaleFactor: 2, serviceWorkers: 'block' });
+    await context.route('**/*', route => route.abort());
+    await context.routeWebSocket('**/*', socket => socket.close());
+    const page = await context.newPage();
     await page.setContent(html, { waitUntil: 'load', timeout: 30000 });
     await page.screenshot({ path: target });
     throwIfTaskCancelled(signal);

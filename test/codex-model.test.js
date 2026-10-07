@@ -50,6 +50,32 @@ test('Codex route needs no DeepSeek key, retains legacy default and validates se
   assert.throws(() => loadConfig({ CODEX_CLI_PATH: 'codex' }), /绝对路径/);
   assert.throws(() => loadConfig({ CODEX_MODEL: '--bad argument' }), /模型标识/);
 });
+
+test('Codex passes native business schema and normalizes the native object without a content envelope', async t => {
+  const result = { translations: [{ id: 'b0', text: '译文。' }] };
+  const f = fixture(t, child => {
+    child.stdout.end([{ type: 'turn.started' }, { type: 'item.completed', item: { type: 'agent_message', phase: 'final_answer', text: JSON.stringify(result) } },
+      { type: 'turn.completed' }].map(JSON.stringify).join('\n')); child.emit('close', 0);
+  });
+  const schema = { type: 'object', additionalProperties: false, required: ['translations'], properties: { translations: { type: 'array', items: { type: 'object' } } } };
+  const events = [];
+  const raw = await f.model.complete({ prompt: 'fixture', responseFormat: { type: 'json_schema', json_schema: { name: 'translation_blocks', strict: true, schema } },
+    inferenceContext: { phase: 'repair', repairRound: 2, itemCount: 1, privatePrompt: 'private' }, onTelemetry: event => events.push(event) });
+  assert.deepEqual(JSON.parse(raw), result);
+  assert.deepEqual(readJson(path.join(f.calls[0].options.cwd, 'response-schema.json')), schema);
+  assert.ok(events.some(event => event.phase === 'repair' && event.repairRound === 2));
+  assert.ok(events.every(event => !event.privatePrompt));
+});
+
+test('total Codex deadline includes shared queue wait and cannot dispatch a timed-out queued call', async t => {
+  const f = fixture(t, () => {}), a = new AbortController(), b = new AbortController();
+  const pending = [f.model.complete({ prompt: 'a', signal: a.signal }), f.model.complete({ prompt: 'b', signal: b.signal })];
+  await new Promise(resolve => setTimeout(resolve, 10));
+  await assert.rejects(f.model.complete({ prompt: 'queued', timeoutMs: 15 }), error => error.code === 'CODEX_TIMEOUT');
+  assert.equal(f.calls.length, 2);
+  a.abort(new Error('cancel fixture')); b.abort(new Error('cancel fixture'));
+  await Promise.all(pending.map(item => assert.rejects(item, /cancel fixture/)));
+});
 test('Codex dispatch uses isolated argument arrays, stdin, ChatGPT and a secret-free environment', async t => {
   const f = fixture(t);
   assert.equal(await f.model.complete({ prompt: 'private task `$(do not execute)`', systemPrompt: 'trusted policy' }), '完成');

@@ -17,6 +17,35 @@ import { validatePreparedWechatHtml } from '../src/lib/wechat-render.js';
 
 const FIXTURE = await fs.readFile('test/fixtures/math-sample.md', 'utf-8');
 
+test('formula cache reuses compiled verified PNGs and captures only corrupted formulas', async () => {
+  const dir = await fs.mkdtemp('/tmp/source2draft-math-cache-');
+  try {
+    const equations = () => [{ token: 'SLMATH0001XSLMATH', tex: 'x_t^2', display: false }, { token: 'SLMATH0002XSLMATH', tex: '\\sum_{i=1}^{n} x_i', display: true }];
+    const first = equations(); await renderEquationPngs(first, { outDir: dir });
+    const files = first.map(item => item.image.src), unchanged = await fs.stat(path.join(dir, files[1]));
+    const cached = equations(); await renderEquationPngs(cached, { outDir: dir, capture: () => assert.fail('cache hit must skip the browser') });
+    assert.deepEqual(cached.map(item => item.image), first.map(item => item.image));
+    await fs.writeFile(path.join(dir, files[0]), 'corrupted');
+    await renderEquationPngs(equations(), { outDir: dir });
+    assert.equal((await fs.stat(path.join(dir, files[1]))).mtimeMs, unchanged.mtimeMs);
+    const recolored = equations(); await renderEquationPngs(recolored, { outDir: dir, color: '#123456' });
+    assert.notEqual(recolored[0].image.src, first[0].image.src);
+  } finally { await fs.rm(dir, { recursive: true, force: true }); }
+});
+
+test('a later formula capture failure retains earlier successful formula receipts', async () => {
+  const dir = await fs.mkdtemp('/tmp/source2draft-math-progress-');
+  try {
+    const png = Buffer.from('89504e470d0a1a0a0000000d49484452000000660000001c08060000', 'hex');
+    const equations = [{ token: 'SLMATH0001XSLMATH', tex: 'x_t', display: false }, { token: 'SLMATH0002XSLMATH', tex: 'y_t', display: false }];
+    await assert.rejects(renderEquationPngs(equations, { outDir: dir, capture: async (items, { onCaptured }) => {
+      await fs.writeFile(path.join(dir, 'first.png'), png); onCaptured(items[0], { src: 'first.png', width: 28, height: 5 });
+      throw new Error('later capture failed');
+    } }), /later capture failed/);
+    const saved = JSON.parse(await fs.readFile(path.join(dir, 'math-cache.json'))); assert.equal(Object.keys(saved.records).length, 1);
+  } finally { await fs.rm(dir, { recursive: true, force: true }); }
+});
+
 test('公式保护:提取行内、显示、\\[\\] 与 \\(\\) 公式为占位符', () => {
   const result = protectMathInMarkdown(FIXTURE);
   assert.ok(result.changed);

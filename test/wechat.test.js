@@ -7,6 +7,32 @@ import { contentIdentity, createWechat } from '../src/channels/wechat.js';
 import { openStore } from '../src/core/store.js';
 
 const png = Buffer.from('89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000a49444154789c6360000002000148afa4710000000049454e44ae426082', 'hex');
+
+test('concurrent token callers share one request; unique image uploads use two slots and same content shares a receipt', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wechat-bounded-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const store = openStore(':memory:'); t.after(() => store.close());
+  const run = store.enqueue({ threadKey: 'C1:1', ts: '1', text: 'test', version: 1, dryRun: false }).run;
+  store.update(run.id, { status: 'running' });
+  for (const [name, tag] of [['a', 'a'], ['a-copy', 'a'], ['b', 'b'], ['c', 'c'], ['cover', 'cover']]) fs.writeFileSync(path.join(dir, name + '.png'), Buffer.concat([png, Buffer.from(tag)]));
+  let tokens = 0, uploads = 0, active = 0, peak = 0, creates = 0, article;
+  const client = createWechat({ wechat: { appId: 'fixture-account', secret: 'fixture-secret' } }, { fetchFn: async (url, request) => {
+    if (url.includes('stable_token')) { tokens++; await new Promise(resolve => setTimeout(resolve, 5)); return Response.json({ access_token: 'fixture-token', expires_in: 7200 }); }
+    if (url.includes('media/uploadimg')) {
+      const id = ++uploads; peak = Math.max(peak, ++active); await new Promise(resolve => setTimeout(resolve, 5)); active--;
+      return Response.json({ url: `https://mmbiz.qpic.cn/${id}/0` });
+    }
+    if (url.includes('material/add_material')) return Response.json({ media_id: 'cover-id' });
+    if (url.includes('draft/batchget')) return Response.json({ total_count: 0, item: [] });
+    if (url.includes('draft/add')) { creates++; article = JSON.parse(request.body).articles[0]; return Response.json({ media_id: 'draft-id' }); }
+    if (url.includes('draft/get')) return Response.json({ news_item: [article] });
+    assert.fail('unexpected remote endpoint');
+  } });
+  assert.deepEqual(await Promise.all([client.accessToken(), client.accessToken(), client.accessToken()]), ['fixture-token', 'fixture-token', 'fixture-token']);
+  const args = { run, store, workDir: dir, prepared: { title: '文章', html: '<p>正文。</p>' + ['a', 'a-copy', 'b', 'c'].map(file => `<img src="${file}.png">`).join(''), coverPath: path.join(dir, 'cover.png') } };
+  await client.publish(args); await client.publish(args);
+  assert.equal(tokens, 1); assert.equal(uploads, 3); assert.equal(peak, 2); assert.equal(creates, 1);
+  const receipts = JSON.parse(fs.readFileSync(path.join(dir, 'upload-receipts.json'))); assert.equal(Object.keys(receipts.uploads).length, 4);
+});
 test('公众号 40164 明确说明出口 IP 白名单，诊断不泄漏服务端原始错误内容', async () => {
   for (const address of ['198.51.100.23', '2001:db8::23', 'not-an-ip']) {
     const client = createWechat({ wechat: { appId: 'fixture-account', secret: 'fixture-secret' } }, {

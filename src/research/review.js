@@ -1,21 +1,28 @@
 import { hash } from '../lib/io.js';
 import { DAILY_SYSTEM, DAILY_EXPERIMENT_RULES, DAILY_STYLE_RULES, renderDailyArticle, reviewFingerprint } from './evidence.js';
+import { modelIdentity } from '../core/model-identity.js';
 
-export const DAILY_REVIEW_POLICY = 7;
+export const DAILY_REVIEW_POLICY = 10;
 const auditShape = audit => Array.isArray(audit?.issues) && audit.issues.every(issue => typeof issue?.reason === 'string'
   && ['high', 'medium', 'low'].includes(issue.severity))
   && (!audit.warnings || Array.isArray(audit.warnings) && audit.warnings.every(warning => typeof warning === 'string'));
+
+export function dailyReviewContextIdentity({ run, context, config }) {
+  return hash({ policy: DAILY_REVIEW_POLICY, input: run.input, context, model: modelIdentity(config.model, { mode: 'analysis' }),
+    system: DAILY_SYSTEM, experiment: DAILY_EXPERIMENT_RULES, style: DAILY_STYLE_RULES });
+}
 
 // Each pass has the current full draft identity. Persist every reviewed item
 // before moving on; retries reuse only verified responses for identical input.
 export async function reviewDailyDraft({ draft, cards, run, context, config, checkpoint, persist, model, signal, onTelemetry, progress = () => {} }) {
   const fingerprint = reviewFingerprint({ draft, cards, input: run.input, context, modelConfig: config.model });
   const passNumber = checkpoint.correctionCount || 0;
-  const passIdentity = hash({ policy: DAILY_REVIEW_POLICY, passNumber, fingerprint });
+  const contextIdentity = dailyReviewContextIdentity({ run, context, config });
+  const passIdentity = hash({ policy: DAILY_REVIEW_POLICY, passNumber, fingerprint, contextIdentity });
   checkpoint.reviewPasses ||= {};
   let pass = checkpoint.reviewPasses[passIdentity];
-  if (!pass) { pass = checkpoint.reviewPasses[passIdentity] = { policy: DAILY_REVIEW_POLICY, passNumber, fingerprint, items: {} }; persist(); }
-  if (pass.policy !== DAILY_REVIEW_POLICY || pass.passNumber !== passNumber || pass.fingerprint !== fingerprint || !pass.items || typeof pass.items !== 'object' || Array.isArray(pass.items)) {
+  if (!pass) { pass = checkpoint.reviewPasses[passIdentity] = { policy: DAILY_REVIEW_POLICY, passNumber, fingerprint, contextIdentity, items: {} }; persist(); }
+  if (pass.policy !== DAILY_REVIEW_POLICY || pass.passNumber !== passNumber || pass.fingerprint !== fingerprint || pass.contextIdentity !== contextIdentity || !pass.items || typeof pass.items !== 'object' || Array.isArray(pass.items)) {
     throw new Error('日报逐条审稿断点结构损坏');
   }
   const audits = [];
@@ -27,7 +34,22 @@ export async function reviewDailyDraft({ draft, cards, run, context, config, che
     // title makes an isolated reviewer attribute other events to this source.
     const article = renderDailyArticle({ title: item.heading, intro: '', items: [item] }, relevant, context);
     const identity = hash({ passIdentity, item, cards: relevant, article });
-    const saved = pass.items[item.cardId];
+    let saved = pass.items[item.cardId];
+    if (!saved) {
+      for (const [olderIdentity, older] of Object.entries(checkpoint.reviewPasses).reverse()) {
+        if (olderIdentity === passIdentity || older.policy !== DAILY_REVIEW_POLICY || older.passNumber !== passNumber
+          || older.contextIdentity !== contextIdentity) continue;
+        const candidate = older.items?.[item.cardId];
+        // Compare the exact current item, full relevant sources and rendered
+        // article against the older receipt. A changed global draft alone
+        // cannot invalidate an otherwise identical isolated review request.
+        if (!candidate || candidate.identity !== hash({ passIdentity: olderIdentity, item, cards: relevant, article })) continue;
+        if (candidate.valueHash !== hash(candidate.value) || !auditShape(candidate.value)) throw new Error('日报逐条审稿断点校验失败');
+        saved = pass.items[item.cardId] = { identity, valueHash: candidate.valueHash,
+          value: structuredClone(candidate.value), reusedFrom: olderIdentity };
+        persist(); break;
+      }
+    }
     let audit;
     if (saved) {
       if (saved.identity !== identity || saved.valueHash !== hash(saved.value) || !auditShape(saved.value)) throw new Error('日报逐条审稿断点校验失败');
@@ -50,9 +72,25 @@ locators是完整取得的正文，claims只是精选提要。核对“未披露
     }
     audits.push({ cardId: item.cardId, audit });
   }
+  const headerIdentity = hash({ policy: DAILY_REVIEW_POLICY, contextIdentity,
+    title: draft.title, intro: draft.intro, items: draft.items, cards });
+  checkpoint.headerReviews ||= {};
+  let header = checkpoint.headerReviews[headerIdentity];
+  if (header && (header.valueHash !== hash(header.value) || !auditShape(header.value))) {
+    throw new Error('日报标题导语审稿断点校验失败');
+  }
+  if (!header) {
+    signal?.throwIfAborted();
+    const value = await model.json({ role: 'review', signal, onTelemetry, systemPrompt: DAILY_SYSTEM,
+      prompt: `只审核整篇标题与导语的事实准确性和跨条一致性。不要重新审稿或重写条目正文，不要求文风调整。标题和导语不能把合成/预测/回测结果说成真实交易，不得反转范围、对象、比较或局限；只能概括已核对条目及有证据的内容。事实错误列high并定位标题/导语原句和支持正确表达的条目/原文。返回JSON {"issues":[{"severity":"high或medium或low","reason":"具体证据与问题"}],"warnings":[]}。\n${JSON.stringify({ title: draft.title, intro: draft.intro, items: draft.items, cards, context })}`,
+      validate: auditShape });
+    if (!auditShape(value)) throw new Error('日报标题导语审稿结构无效');
+    header = checkpoint.headerReviews[headerIdentity] = { value, valueHash: hash(value) }; persist();
+  }
   const aggregate = { fingerprint, policy: DAILY_REVIEW_POLICY, passNumber,
-    issues: audits.flatMap(({ cardId, audit }) => audit.issues.filter(issue => issue.severity === 'high').map(issue => ({ cardId, ...issue }))),
-    warnings: [...new Set(audits.flatMap(({ cardId, audit }) => (audit.warnings || []).map(warning => `${cardId}：${warning}`)))] };
+    issues: [...audits.flatMap(({ cardId, audit }) => audit.issues.filter(issue => issue.severity === 'high').map(issue => ({ cardId, ...issue }))),
+      ...header.value.issues.filter(issue => issue.severity === 'high').map(issue => ({ scope: 'header', ...issue }))],
+    warnings: [...new Set([...(header.value.warnings || []), ...audits.flatMap(({ cardId, audit }) => (audit.warnings || []).map(warning => `${cardId}：${warning}`))])] };
   if (!(checkpoint.audits || []).some(audit => audit.fingerprint === fingerprint && audit.policy === DAILY_REVIEW_POLICY && audit.passNumber === passNumber)) {
     (checkpoint.audits ||= []).push(aggregate); persist();
   }

@@ -1,10 +1,12 @@
+import { sourcePolicy } from '../core/source-policy.js';
+export { sourcePolicy } from '../core/source-policy.js';
 import path from 'node:path';
 import { renderArticleMarkdown } from '../lib/article-markdown.js';
 import { JSDOM } from 'jsdom';
 import { fetchRetry, writeAtomic, readJson, hash } from '../lib/io.js';
 import { inputUrls, coverUrls, readSource } from '../core/sources.js';
 import { emitTelemetry } from '../lib/telemetry.js';
-import { safeFetchResource } from './translation-source-text.js';
+import { safeFetchResource } from '../lib/secure-http.js';
 import { modelIdentity } from '../core/model-identity.js';
 
 const BASE = `你是个人作者的研究助手。原始提示词决定主题、观点、结构、长度和语言，不预设金融栏目，不加载文风模板。
@@ -129,20 +131,6 @@ const FOLLOWUP_SEPARATOR = /\n\n补充指令：\n/;
 
 // Treat each followup as a policy update. An unrelated followup never lifts a
 // restriction, and planner-detected restrictions remain valid without a regex hit.
-export function sourcePolicy(input, plannedExclusive) {
-  let exclusive = plannedExclusive;
-  const instructions = input.split(FOLLOWUP_SEPARATOR);
-  for (const [index, instruction] of instructions.entries()) {
-    const only = /(?:仅|只)(?:能|可)?(?:依据|根据|使用|用|参考|基于|分析|阅读|看)[\s\S]{0,45}(?:材料|链接|原文|附件)|(?:禁止|不要|不得|无需|不必|不允许|不可以|不)(?:进行)?(?:额外|扩展|联网|上网|在线)?(?:搜索|检索)|(?:禁止|不得|不要|不允许|不可以|不)(?:再)?(?:联网|上网)|(?:use|using|based on) only|only (?:use|using|rely on)|do not (?:search|browse)|no (?:web|online) (?:search|browsing)/i.test(instruction);
-    const allow = /(?:可以|允许|请|需要)(?:再|进行)?(?:额外|扩展|联网|上网|在线)(?:搜索|检索)|(?:可以|允许)(?:联网|上网)|(?:also|may|can) (?:search|browse)|(?:allow|enable) (?:web|online) (?:search|browsing)/i.test(instruction);
-    if (only) exclusive = true;
-    // An older permission cannot override a restriction the planner detected in
-    // newer wording that this deliberately limited recognizer does not understand.
-    else if (allow && (!plannedExclusive || index === instructions.length - 1)) exclusive = false;
-  }
-  return exclusive;
-}
-
 // Workers stop claiming work after the first failure. Already-running operations
 // still finish and checkpoint before the error reaches the caller.
 async function fillSlots(slots, signal, action, persist) {
@@ -272,7 +260,7 @@ exclusiveSources 仅在用户明确禁止扩展搜索时为 true。按原始要�
     }); persist();
   }
   const reviewFingerprint = () => hash({ version: AUDIT_VERSION, system: BASE, input: run.input, evidence, draft: trace.draft,
-    previousArticle, model: modelIdentity(config.model) });
+    previousArticle, model: modelIdentity(config.model, { mode: 'analysis' }) });
   const cachedReview = trace.approvedReview?.version === AUDIT_VERSION && Array.isArray(trace.approvedReview.warnings)
     && trace.approvedReview.fingerprint === reviewFingerprint();
   const warnings = cachedReview ? [...trace.approvedReview.warnings] : [];
@@ -294,9 +282,9 @@ exclusiveSources 仅在用户明确禁止扩展搜索时为 true。按原始要�
     warnings.push(...audit.issues.filter(i => i.severity !== 'high' || i.confidence !== 'high').map(i => i.reason));
     const serious = audit.issues.filter(i => i.severity === 'high' && i.confidence === 'high');
     if (!serious.length) break;
-    if (pass === 2) throw new Error(`事实核查未通过：${serious.map(i => i.reason).join('；')}`);
+    if (pass === 2) throw Object.assign(new Error(`事实核查未通过：${serious.map(i => i.reason).join('；')}`), { needsReview: true });
     for (const issue of serious) {
-      if (!issue.sentence || !issue.replacement || !trace.draft.body.includes(issue.sentence)) throw new Error(`需要补充证据或修改要求：${issue.reason}`);
+      if (!issue.sentence || !issue.replacement || !trace.draft.body.includes(issue.sentence)) throw Object.assign(new Error(`需要补充证据或修改要求：${issue.reason}`), { needsReview: true });
       trace.draft.body = trace.draft.body.replace(issue.sentence, issue.replacement);
     }
     persist();

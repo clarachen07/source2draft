@@ -28,10 +28,19 @@ const diagnostic = (text, maximum = 220) => JSON.stringify(compact(text)
   .replace(/((?:api[_-]?key|authorization|access[_-]?token|secret|password)\s*[=:]\s*)[^\s&,;]+/gi, '$1[REDACTED]')
   .slice(0, maximum));
 
-// Share the actual publication counter with item validation: letters, numbers
-// and punctuation count; whitespace and common Markdown wrappers do not.
+// Share the actual publication counter with the writer prompt and item validation.
+// Letters, numbers and punctuation count; whitespace and common Markdown wrappers do not.
+// The count is UTF-16 code units. A BMP CJK character is one unit, the same as one 字.
+// This is not grapheme segmentation. Prompts and validators must both use this counter.
 export function dailyPlainLength(text) {
   return String(text || '').replace(/!?\[([^\]]*)\]\([^)]*\)/g, '$1').replace(/\s|[#*_`]/g, '').length;
+}
+
+// Inclusive cap of floor(target × 115%). Integer arithmetic: IEEE-754 makes
+// 400 * 1.15 equal 459.99999999999994, so Math.floor(n * 1.15) rejects a body
+// that is exactly the documented 15% allowance.
+export function dailyItemCharLimit(targetChars) {
+  return Math.floor(targetChars * 115 / 100);
 }
 
 // Recover the literal source substring after a model normalizes PDF line breaks.
@@ -386,7 +395,7 @@ ${excerptIds ? '每条所选excerptId对应的摘录' : '每条refs.quote'}按�
 数值用原文数字和单位，不新增换算。元数据中的v1等版本号、发布日期、更新日期若不出现在locators原文，不得自行写入body；来源列表及真实发表/更新日期由程序添加，不添加补读标签。导语只概括主线，不添加数值。成稿前逐句检查全部body中的数字与claims映射，推断标签不能替代事实定位。
 ${DAILY_STYLE_RULES}
 只写卡片已核实的来源链接。不在body直接写图片；通过figureIds选择已授权原图。公式只可原样使用formula定位块里的明确TeX，不猜测公式。不得写刊物栏目模板、公众号推广或交易建议。
-${assigned ? `只完成本条约${assigned.targetChars}字，上限${Math.floor(assigned.targetChars * 1.15)}字。字数按正文字符计数，中文、英文字母、数字和标点均计入，剔除空白、Markdown标记和链接地址；不要把英文模型名或数字当成一个词。最多24条关键事实claims，允许将长事实句拆成分别映射的短句；claims中的证据摘录不算正文篇幅。${excerptIds ? '只选择支持本句的必要摘录编号' : '每条quote只摘录支持该事实的必要原句'}，不重复整段或整篇原文；所有数字句仍须完整映射。其它条目的介绍、提纲、导语和来源页脚均不写。` : ''}
+${assigned ? `只完成本条约${assigned.targetChars}字，上限${dailyItemCharLimit(assigned.targetChars)}字，长度等于上限可以通过。字数与校验使用同一计数：剔除空白、Markdown标记和链接地址后，中文、英文字母、数字和标点各计1，不要把英文模型名或数字当成一个词。最多24条关键事实claims，允许将长事实句拆成分别映射的短句；claims中的证据摘录不算正文篇幅。${excerptIds ? '只选择支持本句的必要摘录编号' : '每条quote只摘录支持该事实的必要原句'}，不重复整段或整篇原文；所有数字句仍须完整映射。其它条目的介绍、提纲、导语和来源页脚均不写。` : ''}
 ${repair.length ? `这是唯一一次修正机会，请修复这些核验问题并保持其它有效内容：${JSON.stringify(repair)}
 以本条待修正内容为基础，优先局部补充或改正被指出的原句。除非核验明确指出对应事实错误，必须保留原稿已正确交代的市场与样本、评估窗口和划分、基准、成本对象与具体费率、持仓约束以及模型/搜索预算。补充新条件不得将已有数值条件改成含糊概括；例如已给出的滑点、佣金和印花税费率不能缩成“计入交易成本”。篇幅不足时先压缩重复的分析与建议，不删除必要的实验条件；仍不足时收缩结果范围，删除次要指标及其相关结论，完整交代核心结果的评估口径，不保留所有统计数字却省略条件。` : ''}`;
 }

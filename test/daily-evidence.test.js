@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { dailyPlainLength, numericTokens, auditEvidenceClaims, extractEvidenceCard, validateDailyDraft, narrowDailyDraft } from '../src/research/evidence.js';
+import { dailyPlainLength, dailyItemCharLimit, dailyWriterPrompt, numericTokens, auditEvidenceClaims, extractEvidenceCard, validateDailyDraft, narrowDailyDraft } from '../src/research/evidence.js';
+import { dailyItemErrors } from '../src/research/writing.js';
 
 test('numeric evidence distinguishes decimal lists and deterministically recognizes small English counts and dated months', () => {
   assert.deepEqual(numericTokens('Prices [0.10,0.90] and liquidity $5,000.'), ['0.10', '0.90', '5000']);
@@ -69,6 +70,36 @@ test('partial cards retain individually verified facts and precise raw locators 
   assert.equal(card.claims.some(claim => claim.locatorId === 'L4'), false);
   assert.equal(card.summary.includes('99'), false); assert.equal(card.practice, '');
   assert.equal(JSON.stringify(card).includes('立即买入'), false); assert.equal(JSON.stringify(card).includes('未验证的限制'), false);
+});
+
+test('plain length counts UTF-16 code units, and a body equal to the 15% cap is accepted', () => {
+  assert.equal(dailyPlainLength('汉字'), 2);
+  assert.equal(dailyPlainLength('😀'), 2);
+  assert.equal(dailyPlainLength('A\u0301'), 2);
+  assert.equal(dailyItemCharLimit(400), 460);
+  assert.equal(Math.floor(400 * 1.15), 459);
+  for (let target = 300; target <= 1200; target += 1) {
+    const limit = dailyItemCharLimit(target);
+    assert.equal(limit, Math.floor(target * 115 / 100));
+    assert.ok(limit >= Math.floor(target * 1.15));
+  }
+  const assigned = { cardId: 'C5', heading: '模型能力的证据边界', importance: 'medium', targetChars: 400 };
+  const cards = [{ id: 'C5', locators: [{ id: 'L1', text: 'Official benchmark report.' }], figures: [] }];
+  const fit = { ...assigned, body: '测'.repeat(460), claims: [], figureIds: [] };
+  assert.equal(dailyPlainLength(fit.body), 460);
+  assert.deepEqual(dailyItemErrors(fit, assigned, cards), []);
+  const over = dailyItemErrors({ ...fit, body: `${fit.body}测` }, assigned, cards);
+  assert.equal(over.length, 1);
+  assert.match(over[0], /正文实际461字符，超过上限460/);
+  assert.match(over[0], /长度等于460可以通过/);
+  const ungrounded = { ...fit, claims: [{ sentence: '正文没有这句话。', refs: [{ cardId: 'C99', locatorId: 'L1', quote: 'invented quote' }] }] };
+  const grounding = dailyItemErrors(ungrounded, assigned, cards);
+  assert.equal(grounding.some(error => /超过上限/.test(error)), false);
+  assert.ok(grounding.some(error => /sentence|引用/.test(error)));
+  const prompt = dailyWriterPrompt({ run: { input: '写研究分享' }, context: {}, cards, outline: { items: [assigned] }, assigned });
+  assert.match(prompt, /上限460字/);
+  assert.match(prompt, /长度等于上限可以通过/);
+  assert.equal(prompt.includes('上限459'), false);
 });
 
 test('draft and item counters include letters and digits but exclude whitespace and Markdown wrappers', () => {

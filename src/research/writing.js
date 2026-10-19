@@ -1,5 +1,5 @@
 import { hash } from '../lib/io.js';
-import { DAILY_SYSTEM, dailyOutlinePrompt, dailyWriterPrompt, dailyPlainLength, numericTokens, dailyItemEvidenceErrors, dailyStyleErrors } from './evidence.js';
+import { DAILY_SYSTEM, dailyOutlinePrompt, dailyWriterPrompt, dailyPlainLength, dailyItemCharLimit, numericTokens, dailyItemEvidenceErrors, dailyStyleErrors } from './evidence.js';
 import { modelIdentity } from '../core/model-identity.js';
 import { createDailyQuoteCatalog, resolveDailyQuoteReferences } from './quotes.js';
 
@@ -70,9 +70,12 @@ export function dailyItemErrors(item, assigned, cards, options) {
   for (const key of ['cardId', 'heading', 'importance']) {
     if (item[key] !== assigned[key]) errors.push(`${key}必须与分配条目一致：${JSON.stringify(assigned[key])}。`);
   }
-  const max = Math.floor(assigned.targetChars * 1.15);
+  const max = dailyItemCharLimit(assigned.targetChars);
   if (typeof item.body !== 'string' || !item.body.trim()) errors.push('body必须是非空正文字符串。');
-  else if (dailyPlainLength(item.body) > max) errors.push(`body正文实际${dailyPlainLength(item.body)}字符，超过上限${max}；请压缩正文，保留证据映射。`);
+  else {
+    const length = dailyPlainLength(item.body);
+    if (length > max) errors.push(`body正文实际${length}字符，超过上限${max}；长度等于${max}可以通过。请压缩到不超过${max}字符，保留证据映射。`);
+  }
   if (!Array.isArray(item.claims) || item.claims.length > 24) errors.push('claims必须为数组，最多24条。');
   else item.claims.forEach((claim, index) => {
     const prefix = `claims[${index}]`;

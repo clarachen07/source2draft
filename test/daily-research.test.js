@@ -6,7 +6,7 @@ import path from 'node:path';
 import { runDailyResearch as runIncludingHeader, dailyContext } from '../src/workflows/daily-research.js';
 import { normalizeCandidate } from '../src/research/candidates.js';
 import { hash, parseArticle } from '../src/lib/io.js';
-import { dailyPlainLength, extractEvidenceCard, validateDailyDraft, verifyEvidenceClaims } from '../src/research/evidence.js';
+import { dailyPlainLength, dailyItemCharLimit, extractEvidenceCard, validateDailyDraft, verifyEvidenceClaims } from '../src/research/evidence.js';
 import { DAILY_REVIEW_POLICY } from '../src/research/review.js';
 
 // Legacy fixtures focus on per-item repairs. Header repair is exercised separately.
@@ -436,7 +436,7 @@ test('each item enforces its assigned plain-character allowance, including ASCII
   const f = fixture(2), original = f.args.model.json; let checked = false;
   f.args.model.json = async args => {
     if (args.role === 'writer' && assignedItem(args).cardId === 'C2') {
-      const assigned = assignedItem(args), base = draft(2).items[1], limit = Math.floor(assigned.targetChars * 1.15);
+      const assigned = assignedItem(args), base = draft(2).items[1], limit = dailyItemCharLimit(assigned.targetChars);
       assert.equal(limit, 690);
       const fit = { ...base, body: `**${'a'.repeat(limit)}**\n\n`, claims: [] };
       assert.equal(dailyPlainLength(fit.body), limit); assert.equal(args.validate(fit), true);

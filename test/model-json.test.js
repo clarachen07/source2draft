@@ -40,6 +40,22 @@ test('daily item repair receives actual character count and prior response, then
   assert.equal(f.events.filter(event => event.stage === 'model.validation').length, 1);
 });
 
+test('a body at the inclusive character limit is accepted and an overflow repair names both lengths', async t => {
+  const assigned400 = { ...assigned, targetChars: 400 };
+  const fit = { ...assigned400, body: '测'.repeat(460), claims: [], figureIds: [] };
+  const over = { ...fit, body: `${fit.body}测` };
+  assert.deepEqual(dailyItemErrors(fit, assigned400, cards), []);
+  const f = fixture(t, [JSON.stringify(over), JSON.stringify(fit)]);
+  const errors = value => dailyItemErrors(value, assigned400, cards);
+  assert.deepEqual(await f.model.json({ role: 'writer', prompt: '写本条JSON', validate: value => !errors(value).length, validationErrors: errors }), fit);
+  assert.equal(f.requests.length, 2);
+  const feedback = f.requests[1].messages[1].content;
+  assert.match(feedback, /正文实际461字符，超过上限460/);
+  assert.match(feedback, /长度等于460可以通过/);
+  assert.match(feedback, /字符计数为461，上限为460/);
+  assert.match(feedback, /长度等于上限可以通过/);
+});
+
 test('exhausted structured repair retains all failures and reports a specific non-retryable error', async t => {
   const invalid = { ...item, claims: [{ sentence: '正文没有这句话。', refs: [{ cardId: 'C99', locatorId: 'L1', quote: 'invented' }] }] };
   const f = fixture(t, [JSON.stringify(invalid), JSON.stringify(invalid), JSON.stringify(invalid)]);

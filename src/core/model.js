@@ -27,6 +27,8 @@ export function structuredJsonRetryable(errors) {
 
 function repairGuidance(errors) {
   const notes = [];
+  const length = errors.map(error => /正文实际(\d+)字符，超过上限(\d+)/.exec(String(error))).find(Boolean);
+  if (length) notes.push(`正文按与上限相同的字符计数为${length[1]}，上限为${length[2]}，长度等于上限可以通过。请压缩到不超过${length[2]}字符，保留证据映射。`);
   if (errors.some(error => /excerptId|引用编号|refs必须含1–6条引用/.test(error))) notes.push('refs每项只能是目录中存在的excerptId，不要补写quote、cardId或locatorId；超出范围时改用错误里给出的有效编号，超过6条时拆成短句。');
   if (errors.some(error => /数字|numbers|数值句/.test(error))) notes.push('句子里的每个数字必须与所选摘录逐字一致：0.872不能写成0.87或87.2%。候选摘录只说明数字出现位置，市场、指标或行列不符就改写或删除该数字。');
   if (errors.some(error => /逐字复制body|逐字匹配body|最接近正文/.test(error))) notes.push('claims.sentence必须是body的连续子串，标点和空格保持一致。');

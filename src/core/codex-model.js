@@ -7,7 +7,10 @@ import { fileURLToPath } from 'node:url';
 import { emitTelemetry } from '../lib/telemetry.js';
 import { writeAtomic } from '../lib/io.js';
 
-export const CODEX_LIMITS = { stdout: 4 * 1024 * 1024, stderr: 64 * 1024, input: 8 * 1024 * 1024 };
+export const CODEX_LIMITS = { stdout: 4 * 1024 * 1024, stderr: 64 * 1024, input: 8 * 1024 * 1024, inputChars: 1048576 };
+// One structured repair may append the previous reply, which is stored up to 96 KiB
+// and can grow again once JSON escapes it. Leave that room when fitting a prompt.
+export const CODEX_JSON_REPAIR_HEADROOM = 96 * 1024 * 2 + 8192;
 const disabledFeatures = ['shell_tool', 'unified_exec', 'code_mode', 'code_mode_host', 'apps', 'plugins', 'hooks',
   'multi_agent', 'multi_agent_v2', 'browser_use', 'browser_use_external', 'computer_use', 'in_app_browser',
   'image_generation', 'view_image', 'skill_search', 'skill_mcp_dependency_install', 'workspace_dependencies',
@@ -19,6 +22,30 @@ export function codexEnvironment(env = process.env) {
 }
 function failure(code, message, retryable = false) { return Object.assign(new Error(message), { code, retryable }); }
 const NETWORK_TEXT = /(?:\b(?:timeout|timed out|ETIMEDOUT|ECONNRESET|ECONNREFUSED|ENETUNREACH|EAI_AGAIN|EPIPE|ECONNABORTED)\b|socket hang up|fetch failed|reconnecting|reconnect|network error|connection (?:reset|refused|closed|lost|aborted)|stream (?:closed|reset|interrupted|error))/i;
+
+// Codex counts Unicode scalar values. A UTF-16 .length over-counts surrogate pairs.
+export function codexCharacterLength(value) {
+  const text = String(value ?? '');
+  let count = 0;
+  for (let index = 0; index < text.length;) {
+    const code = text.charCodeAt(index);
+    index += code >= 0xD800 && code <= 0xDBFF ? 2 : 1;
+    count += 1;
+  }
+  return count;
+}
+export function codexStdin(prompt, { responseFormat, nativeSchema = false } = {}) {
+  const suffix = nativeSchema
+    ? '输出约定：直接返回符合业务schema的完整JSON对象，不要包装为content字符串。'
+    : `输出约定：将完整${responseFormat ? 'JSON结果序列化为字符串' : '回复文本'}放入最终对象的content字段，不要省略或截断。`;
+  return `${prompt}\n\n${suffix}`;
+}
+export function codexPromptBudget({ responseFormat = { type: 'json_object' }, nativeSchema = false, headroom = 0 } = {}) {
+  return CODEX_LIMITS.inputChars - codexCharacterLength(codexStdin('', { responseFormat, nativeSchema })) - headroom;
+}
+function inputTooLarge(actual) {
+  return failure('CODEX_INPUT_LIMIT', `Codex 输入超过 ${CODEX_LIMITS.inputChars} 字符上限（实际 ${actual} 字符），已停止调用；这不是网络故障，相同输入不会自动重试`);
+}
 function networkFailure({ reason, exitSignal = null, reconnectNotices = 0, finalReceived = false } = {}) {
   return Object.assign(failure('CODEX_NETWORK', 'Codex 网络或流中断，已保存进度；请重试', true), {
     reason, exitSignal, reconnectNotices, finalReceived,
@@ -26,6 +53,11 @@ function networkFailure({ reason, exitSignal = null, reconnectNotices = 0, final
 }
 function classify(text, { signal = null, reconnectNotices = 0, finalReceived = false } = {}) {
   const body = String(text || '');
+  const lengthLimit = /input exceeds maximum length of (\d+) characters(?: \(actual_chars=(\d+)\))?/i.exec(body);
+  if (lengthLimit) {
+    const actual = lengthLimit[2] ? `，实际 ${lengthLimit[2]} 字符` : '';
+    return failure('CODEX_INPUT_LIMIT', `Codex 拒绝超长输入（上限 ${lengthLimit[1]} 字符${actual}），已保存进度；这不是网络故障，不会自动重试`);
+  }
   if (/model metadata.*not found|model_catalog_json/i.test(body)) return failure('CODEX_CONFIG', 'Codex CLI 模型元数据不兼容，已停止任务；请检查项目模型目录');
   if (/loading config|configuration|config\.toml|reserved built-in/i.test(body)) return failure('CODEX_CONFIG', 'Codex CLI 调用配置不兼容，已停止任务；不会修改全局配置');
   if (/usage.?limit|quota|rate.?limit|credits?|too many requests|额度/i.test(body)) return failure('CODEX_QUOTA', 'Codex 订阅额度或速率限制，已保存进度；恢复后请手动重试');
@@ -62,8 +94,10 @@ export async function completeCodex({ config, workDir, prompt, systemPrompt, res
   const schemaPath = path.join(dir, 'response-schema.json');
   const nativeSchema = responseFormat?.type === 'json_schema' && responseFormat.json_schema?.schema;
   writeAtomic(schemaPath, nativeSchema || { type: 'object', properties: { content: { type: 'string' } }, required: ['content'], additionalProperties: false });
-  const input = nativeSchema ? `${prompt}\n\n输出约定：直接返回符合业务schema的完整JSON对象，不要包装为content字符串。` : `${prompt}\n\n输出约定：将完整${responseFormat ? 'JSON结果序列化为字符串' : '回复文本'}放入最终对象的content字段，不要省略或截断。`;
-  if (Buffer.byteLength(input) > CODEX_LIMITS.input) throw failure('CODEX_INPUT_LIMIT', 'Codex 输入超过大小上限，请缩小任务范围');
+  const input = codexStdin(prompt, { responseFormat, nativeSchema: Boolean(nativeSchema) });
+  const inputChars = codexCharacterLength(input);
+  if (inputChars > CODEX_LIMITS.inputChars) throw inputTooLarge(inputChars);
+  if (Buffer.byteLength(input) > CODEX_LIMITS.input) throw failure('CODEX_INPUT_LIMIT', 'Codex 输入超过大小上限，已停止调用；这不是网络故障，相同输入不会自动重试');
   let executable = config.model.cliPath || path.join(os.homedir(), '.local/bin/codex');
   if (!path.isAbsolute(executable)) throw failure('CODEX_CLI_PATH_INVALID', 'CODEX_CLI_PATH 必须为可执行文件的绝对路径');
   try { fs.accessSync(executable, fs.constants.X_OK); } catch { throw failure('CODEX_CLI_UNAVAILABLE', 'Codex CLI 不可用；请检查 CODEX_CLI_PATH'); }

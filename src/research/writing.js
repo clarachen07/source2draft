@@ -2,6 +2,7 @@ import { hash } from '../lib/io.js';
 import { DAILY_SYSTEM, dailyOutlinePrompt, dailyWriterPrompt, dailyPlainLength, dailyItemCharLimit, numericTokens, dailyItemEvidenceErrors, dailyStyleErrors } from './evidence.js';
 import { modelIdentity } from '../core/model-identity.js';
 import { createDailyQuoteCatalog, resolveDailyQuoteReferences } from './quotes.js';
+import { buildWholeArticlePrompt } from './review.js';
 
 const plainHeading = value => typeof value === 'string' && value.trim() && value.length <= 120 && !/[\r\n<>\[\]`]|https?:\/\//.test(value);
 
@@ -127,7 +128,10 @@ export async function writeDailyDraft({ phase = 'writing', run, context, cards, 
     const headerErrors = repair.filter(error => error.startsWith('HEADER：'));
     if (targets && headerErrors.length) {
       const header = await model.json({ role: 'writer', signal, onTelemetry, systemPrompt: DAILY_SYSTEM,
-        prompt: `只修正标题和导语中明确的事实错误，保留正文、选题和顺序。标题不超过64字符，导语不超过400字符，不添加具体数字；遵守现有朴素文风。返回JSON {"title":"标题","intro":"导语"}。\n${JSON.stringify({ errors: headerErrors, title: previousDraft.title, intro: previousDraft.intro, items: previousDraft.items, cards, context })}`,
+        prompt: buildWholeArticlePrompt({
+          instruction: '只修正标题和导语中明确的事实错误，保留正文、选题和顺序。标题不超过64字符，导语不超过400字符，不添加具体数字；遵守现有朴素文风。返回JSON {"title":"标题","intro":"导语"}。',
+          payload: { errors: headerErrors, title: previousDraft.title, intro: previousDraft.intro, items: previousDraft.items, cards, context },
+        }),
         validate: value => outlineShape({ ...outline, title: value?.title, intro: value?.intro }, cards) });
       outline = { ...outline, title: header.title, intro: header.intro };
     }

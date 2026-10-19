@@ -7,7 +7,7 @@ import { EventEmitter } from 'node:events';
 import { PassThrough, Writable } from 'node:stream';
 import { loadConfig, missingConfig } from '../src/config/index.js';
 import { createModel } from '../src/core/model.js';
-import { CODEX_LIMITS, codexEnvironment } from '../src/core/codex-model.js';
+import { CODEX_LIMITS, codexCharacterLength, codexEnvironment, codexStdin } from '../src/core/codex-model.js';
 import { modelIdentity } from '../src/core/model-identity.js';
 import { prepareModelRecovery } from '../src/core/model-recovery.js';
 import { checkCodex } from '../src/core/model-check.js';
@@ -136,6 +136,45 @@ test('disabled code-mode startup notice is accepted only before a turn; actual e
   assert.equal(await f.model.complete({ prompt: 'fixture' }), 'valid');
   const g = fixture(t, child => { child.stdout.end([{ type: 'turn.started' }, notice, ...final('invalid')].map(JSON.stringify).join('\n')); child.emit('close', 0); });
   await assert.rejects(g.model.complete({ prompt: 'fixture' }), e => e.code === 'CODEX_CALL_FAILED');
+});
+test('Codex counts Unicode scalars and rejects stdin over 1048576 characters before spawn', async t => {
+  assert.equal(codexCharacterLength('a😀b'), 3);
+  const responseFormat = { type: 'json_object' };
+  const room = CODEX_LIMITS.inputChars - codexCharacterLength(codexStdin('', { responseFormat }));
+  const accepted = fixture(t, (child, input) => {
+    assert.equal(codexCharacterLength(input), CODEX_LIMITS.inputChars);
+    child.stdout.end(final('完成').map(JSON.stringify).join('\n')); child.emit('close', 0);
+  });
+  assert.equal(await accepted.model.complete({ prompt: 'a'.repeat(room), responseFormat }), '完成');
+  const rejected = fixture(t, () => { throw new Error('must not spawn'); });
+  await assert.rejects(rejected.model.complete({ prompt: 'a'.repeat(room + 1), responseFormat }), error => {
+    assert.equal(error.code, 'CODEX_INPUT_LIMIT');
+    assert.equal(error.retryable, false);
+    assert.match(error.message, /1048576/);
+    assert.match(error.message, /不是网络故障/);
+    assert.match(error.message, /不会自动重试/);
+    return true;
+  });
+  assert.equal(rejected.calls.length, 0);
+});
+test('Codex input-length stderr and turn failures are CODEX_INPUT_LIMIT rather than network or generic call failures', async t => {
+  const stderr = fixture(t, child => {
+    child.stderr.end('private-token Input exceeds maximum length of 1048576 characters (actual_chars=1509088)');
+    child.emit('close', 1);
+  });
+  await assert.rejects(stderr.model.complete({ prompt: 'fixture' }), error => {
+    assert.equal(error.code, 'CODEX_INPUT_LIMIT');
+    assert.equal(error.retryable, false);
+    assert.match(error.message, /上限 1048576 字符，实际 1509088 字符/);
+    assert.match(error.message, /不是网络故障/);
+    assert.equal(error.message.includes('private'), false);
+    return true;
+  });
+  const event = fixture(t, child => {
+    child.stdout.end(JSON.stringify({ type: 'turn.failed', error: { message: 'Input exceeds maximum length of 1048576 characters (actual_chars=1509088) private' } }));
+    child.emit('close', 0);
+  });
+  await assert.rejects(event.model.complete({ prompt: 'fixture' }), error => error.code === 'CODEX_INPUT_LIMIT' && error.retryable === false && !error.message.includes('private'));
 });
 test('oversized output and stderr stop rather than accepting a truncated reply', async t => {
   for (const stream of ['stdout', 'stderr']) {

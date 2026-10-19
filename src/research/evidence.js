@@ -148,17 +148,69 @@ export function isCompleteDailyDraft(draft, cards) {
         && claim.refs.every(ref => known.has(ref?.cardId) && typeof ref.locatorId === 'string' && typeof ref.quote === 'string')));
 }
 
-export function dailyItemEvidenceErrors(item, cards) {
+function sentenceGroundingHint(body, sentence) {
+  if (typeof body !== 'string' || typeof sentence !== 'string' || sentence.trim().length < 4) return '';
+  let best = '', score = -1;
+  for (const part of body.split(/(?<=[。！？!?;；])|\n/)) {
+    const candidate = part.trim();
+    if (!candidate) continue;
+    let index = 0;
+    const limit = Math.min(candidate.length, sentence.length);
+    while (index < limit && candidate[index] === sentence[index]) index++;
+    if (index > score) { score = index; best = candidate; }
+  }
+  if (!best || score < 4) return '';
+  if (score < sentence.length || score < best.length) {
+    return `；最接近正文=${diagnostic(best, 120)}；相同前缀后正文为${diagnostic(best.slice(score, score + 8), 24)}，sentence为${diagnostic(sentence.slice(score, score + 8), 24)}`;
+  }
+  return '';
+}
+
+function groundingCandidates(missing, cards, catalog) {
+  const pool = catalog?.byId ? [...catalog.byId].map(([id, source]) => ({ id, quote: source.quote }))
+    : (cards || []).flatMap(card => (card.locators || []).map(locator => ({ id: `${card.id}/${locator.id}`, quote: locator.text })));
+  const hits = [];
+  for (const entry of pool) {
+    if (typeof entry.quote !== 'string' || !entry.quote.trim()) continue;
+    const tokens = new Set(numericTokens(entry.quote));
+    const covered = missing.filter(number => tokens.has(number));
+    if (covered.length) hits.push({ ...entry, covered });
+  }
+  hits.sort((left, right) => right.covered.length - left.covered.length || left.quote.length - right.quote.length
+    || left.id.localeCompare(right.id));
+  return hits;
+}
+
+// Candidates locate a number; they never authorize swapping it across markets,
+// metrics, or rows, and they never change the equality check below.
+function numericGap(missing, cards, catalog, present) {
+  const all = groundingCandidates(missing, cards, catalog), shown = all.slice(0, 2);
+  const uncovered = missing.filter(number => !all.some(hit => hit.covered.includes(number)));
+  let hint = present ? `，已引用摘录中的numbers=${diagnostic([...present].slice(0, 8).join(',') || '（无）', 80)}` : '';
+  if (shown.length) hint += `，候选摘录=${diagnostic(shown.map(hit => `${hit.id}含${hit.covered.join('+')} ${compact(hit.quote).slice(0, 36)}`).join(' | '), 150)}`;
+  if (uncovered.length) hint += `，提供的证据摘录中不存在这些数字：${diagnostic(uncovered.slice(0, 8).join(','), 60)}，必须从该句删除`;
+  else if (shown.length) hint += '；候选只说明数字位置，语义、市场或行列不符则改写句子，不能改数字去凑摘录';
+  return hint;
+}
+
+export function dailyItemEvidenceErrors(item, cards, options = {}) {
   const errors = [], byId = new Map(cards.map(card => [card.id, card]));
+  const catalog = options.catalog;
   const where = `条目${diagnostic(item.cardId, 30)}`;
   const validSentences = new Set();
   for (const [claimIndex, claim] of item.claims.entries()) {
     if (typeof claim?.sentence !== 'string' || !item.body.includes(claim.sentence) || !Array.isArray(claim.refs) || !claim.refs.length) {
-      errors.push(`${where} claims[${claimIndex}]关键事实缺少原句与证据定位：sentence=${diagnostic(claim?.sentence)}；须逐字匹配body，包括逗号、分号和句号`); continue;
+      errors.push(`${where} claims[${claimIndex}]关键事实缺少原句与证据定位：sentence=${diagnostic(claim?.sentence)}；须逐字匹配body，包括逗号、分号和句号${sentenceGroundingHint(item.body, claim?.sentence)}`); continue;
     }
-    let valid = true;
+    let valid = true, unresolved = false;
     const quotes = [];
     for (const ref of claim.refs) {
+      // An unresolved excerpt id has no quote yet. Asking for a handwritten
+      // quote makes the next repair fail the excerpt-only schema.
+      if (ref && typeof ref === 'object' && Object.hasOwn(ref, 'excerptId') && typeof ref.quote !== 'string') {
+        errors.push(`${where} claims[${claimIndex}]引用编号未能解析，不能当作原文摘录：excerptId=${diagnostic(ref.excerptId, 80)}；只改成目录中存在的excerptId，不要添加quote、cardId或locatorId。`);
+        unresolved = true; valid = false; continue;
+      }
       const source = byId.get(ref?.cardId), locator = source?.locators.find(value => value.id === ref?.locatorId);
       if (locator && typeof ref?.quote === 'string' && compact(ref.quote).length < 8) {
         errors.push(`${where} claims[${claimIndex}]原文摘录过短：ref=${diagnostic(`${ref.cardId}/${ref.locatorId}`, 50)}，quote=${diagnostic(ref.quote)}；须从同一定位块逐字摘录至少8字符的相关原文，不能只引用指标缩写或标签；该定位块原文起始=${diagnostic(locator.text, 160)}`);
@@ -178,7 +230,14 @@ export function dailyItemEvidenceErrors(item, cards) {
     }
     const numbers = new Set(numericTokens(quotes.join(' ')));
     const missing = [...new Set(numericTokens(claim.sentence).filter(number => !numbers.has(number)))];
-    if (missing.length) { errors.push(`${where} claims[${claimIndex}]关键事实数字无法在引用原文中匹配：缺失numbers=${diagnostic(missing.slice(0, 16).join(','), 160)}，sentence=${diagnostic(claim.sentence)}，refs=${diagnostic(claim.refs.map(ref => `${ref?.cardId}/${ref?.locatorId}`).join(','), 100)}`); valid = false; }
+    if (missing.length) {
+      const gap = numericGap(missing, cards, catalog, numbers);
+      const listed = diagnostic(missing.slice(0, 12).join(','), 100);
+      errors.push(!quotes.length && unresolved
+        ? `${where} claims[${claimIndex}]数字尚未核验：缺失numbers=${listed}${gap}`
+        : `${where} claims[${claimIndex}]关键事实数字无法在引用原文中匹配：缺失numbers=${listed}，sentence=${diagnostic(claim.sentence, 140)}，refs=${diagnostic(claim.refs.map(ref => ref?.excerptId || `${ref?.cardId}/${ref?.locatorId}`).join(','), 100)}${gap}`);
+      valid = false;
+    }
     if (valid) validSentences.add(claim.sentence);
   }
   // All numerical prose requires a grounded fact mapping, independently of
@@ -187,7 +246,7 @@ export function dailyItemEvidenceErrors(item, cards) {
     .replace(/!?\[([^\]]*)\]\([^)]*\)/g, '$1');
   for (const sentence of prose.split(/(?<=[。！？!?;；])|\n/).filter(value => numericTokens(value).length)) {
     const clean = sentence.trim();
-    if (clean && ![...validSentences].some(mapped => mapped.includes(clean) || clean.includes(mapped) && numericTokens(clean).every(number => numericTokens(mapped).includes(number)))) errors.push(`${where}正文数值句缺少逐句证据映射：sentence=${diagnostic(clean)}；为完整原句添加claims与全部对应refs`);
+    if (clean && ![...validSentences].some(mapped => mapped.includes(clean) || clean.includes(mapped) && numericTokens(clean).every(number => numericTokens(mapped).includes(number)))) errors.push(`${where}正文数值句缺少逐句证据映射：sentence=${diagnostic(clean, 140)}；为完整原句添加claims与全部对应refs${numericGap(numericTokens(clean), cards, catalog)}`);
   }
   for (const match of item.body.matchAll(/\$\$([\s\S]*?)\$\$|(?<!\$)\$([^$\n]+)\$(?!\$)/g)) {
     const tex = compact(match[1] || match[2]);
@@ -322,7 +381,7 @@ ${assigned ? `写作提纲（选题与篇幅提示，不提供额外事实）：
 每个条目说明事件/研究提出什么、方法与关键结果、对LLM或量化金融为何重要、可落地步骤与限制。强交叉主题优先；通用LLM发布需说明金融研究者的实际用途。区分作者报告和推断。locators保留完整取得的正文，精选claims只是提要，缺少摘录不代表论文未披露。陈述“未披露/未报告/缺少”前必须检查完整locators：只在原文明示限制或完整原文已核查后陈述，限定为所检查的正文，不能推定未核查的附录、代码仓库也缺失；没完成核查就写“本次未核实”。
 所有重要事实尤其数字、日期、模型版本和收益必须在claims中逐句${excerptIds ? '选择支持该句的原文excerptId，程序按编号写入原文quote及locatorId' : '给出原文quote及locatorId'}。body中每一句包含数字的文字都必须映射，包括模型名、版本号以及判断、实践建议和局限段。例如“建议：可用Qwen3.6-35B-A3B做对照”也须对模型名里的数字引用正文原文；没有可定位摘录就改用不含数字的称呼或删除该句。一个数字句同时使用多个定位块的信息时，refs须分别引用各块，不能只引其中一块。
 ${DAILY_EXPERIMENT_RULES}
-claims.sentence必须逐字复制body中的完整原句，包括中文逗号、分号、句号、括号和空格，不能把body的“；”改成“。”。${excerptIds ? 'refs每项只返回excerptId，不复制旧稿的quote或locatorId，不手写摘录，不编造编号。locators.excerpts按原文顺序覆盖完整取得的正文，选取语义匹配的必要摘录，每句最多6条refs。表格比较必须同时选择包含市场/列定义的表头和对应方法的完整数据行，不能拼接成假想连续摘录；指数名里的300、500等数字也须出现在所选表头或相关原文中。不同市场、方法、行列的相同数字不能互换。' : 'quote也逐字取对应locators，不自行改上下标、Unicode符号、缩写或标点。'}货币金额写“0.24美元”等形式，不写美元符号$，避免被误解为数学公式。
+claims.sentence必须逐字复制body中的完整原句，包括中文逗号、分号、句号、括号和空格，不能把body的“；”改成“。”。${excerptIds ? 'refs每项只返回excerptId，不复制旧稿的quote或locatorId，不手写摘录，不编造编号。Q序号必须落在该定位块excerpts的实际条数内。locators.excerpts按原文顺序覆盖完整取得的正文，选取语义匹配的必要摘录，每句最多6条refs；超过6条时把该句拆成多个短句。表格比较必须同时选择包含市场/列定义的表头和对应方法的完整数据行，不能拼接成假想连续摘录；指数名里的300、500等数字也须出现在所选表头或相关原文中。不同市场、方法、行列的相同数字不能互换。0.872不能写成0.87或87.2%。' : 'quote也逐字取对应locators，不自行改上下标、Unicode符号、缩写或标点。'}货币金额写“0.24美元”等形式，不写美元符号$，避免被误解为数学公式。
 ${excerptIds ? '每条所选excerptId对应的摘录' : '每条refs.quote'}按合并空白后的文本计至少8字符，摘录足以支持断言的相关原文；MAE、RMSE、MASE等指标不能只引用缩写或“MAE:”标签，应连同对应定义一起${excerptIds ? '选择原文摘录编号' : '逐字摘录'}。检查所有claims，不因先发现句子不匹配而遗漏其它引用问题。
 数值用原文数字和单位，不新增换算。元数据中的v1等版本号、发布日期、更新日期若不出现在locators原文，不得自行写入body；来源列表及真实发表/更新日期由程序添加，不添加补读标签。导语只概括主线，不添加数值。成稿前逐句检查全部body中的数字与claims映射，推断标签不能替代事实定位。
 ${DAILY_STYLE_RULES}

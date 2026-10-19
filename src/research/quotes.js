@@ -36,6 +36,33 @@ export function createDailyQuoteCatalog(cards) {
   return { cards: sourceCards, byId };
 }
 
+function excerptIdsFor(catalog, prefix) {
+  return [...catalog.byId.keys()].filter(key => key.startsWith(prefix))
+    .sort((left, right) => Number(left.slice(prefix.length)) - Number(right.slice(prefix.length)));
+}
+
+// Tell the model the real Q range. Do not ask it to transcribe a quote: the
+// next response may only contain excerptId, and a handwritten quote is rejected.
+function excerptSelectionError(ref, index, refIndex, catalog) {
+  const where = `claims[${index}].refs[${refIndex}]`;
+  const extra = Object.keys(ref).filter(key => key !== 'excerptId');
+  if (extra.length) return `${where}必须只含excerptId，不能同时带${extra.join('、')}；按目录选择编号，不自行添加cardId、locatorId或quote。`;
+  const id = typeof ref.excerptId === 'string' ? ref.excerptId : '';
+  const match = /^([^/\s]+)\/([^/\s]+)\/Q(\d+)$/.exec(id);
+  if (match) {
+    const [, cardId, locatorId] = match;
+    const ids = excerptIdsFor(catalog, `${cardId}/${locatorId}/Q`);
+    if (ids.length) {
+      const range = ids.length <= 6 ? ids.join('、') : `${ids[0]}–${ids.at(-1)}（共${ids.length}条）`;
+      return `${where} excerptId超出范围：${id}。${cardId}/${locatorId}的有效编号为${range}。改用其中一条，不要添加quote、cardId或locatorId。`;
+    }
+    const locators = [...new Set(excerptIdsFor(catalog, `${cardId}/`).map(key => key.split('/')[1]))];
+    if (locators.length) return `${where} excerptId的定位块不存在：${id}。${cardId}可用定位块=${locators.slice(0, 8).join('、')}。不要编造L或Q编号。`;
+    return `${where} excerptId不在本条原文目录：${id}。只能选择本次提供的摘录编号。`;
+  }
+  return `${where}必须只含本条原文目录中存在的excerptId；收到=${JSON.stringify(id).slice(0, 80)}。按目录选择编号，不自行添加cardId、locatorId或quote。`;
+}
+
 export function resolveDailyQuoteReferences(value, catalog) {
   const item = structuredClone(value), errors = [];
   if (!Array.isArray(item?.claims)) return { item, errors };
@@ -47,7 +74,7 @@ export function resolveDailyQuoteReferences(value, catalog) {
       if (!ref || typeof ref !== 'object' || !Object.hasOwn(ref, 'excerptId')) return ref;
       const source = catalog.byId.get(ref.excerptId);
       if (!source || Object.keys(ref).some(key => key !== 'excerptId')) {
-        errors.push(`claims[${index}].refs[${refIndex}]必须只含本条原文目录中存在的excerptId；按目录选择编号，不自行添加cardId、locatorId或quote。`);
+        errors.push(excerptSelectionError(ref, index, refIndex, catalog));
         return ref;
       }
       return { ...source };

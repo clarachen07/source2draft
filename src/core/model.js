@@ -10,6 +10,36 @@ import { completeCodex } from './codex-model.js';
 const timeoutFailure = provider => Object.assign(new Error('模型调用超过总时间上限，任务已暂停'), {
   code: provider === 'codex-cli' ? 'CODEX_TIMEOUT' : 'MODEL_TIMEOUT', retryable: true });
 
+const HARD_INTEGRITY = /不是原文摘录|原文摘录过短|公式不对应原文|不得带|提供的证据摘录中不存在|引用无效；/;
+const TRANSIENT_JSON = /回复不是完整合法的 JSON|嵌套结构不合格|excerptId超出范围|定位块不存在|不在本条原文目录|必须只含本条原文目录中存在的excerptId|不能同时带|必须逐字复制body|缺少原句与证据定位|引用编号未能解析|数字尚未核验|refs必须含1–6条引用|字段类型或嵌套结构不合格/;
+const SOFT_GROUNDING = /数字无法在引用原文中匹配|正文数值句缺少逐句证据映射/;
+
+// A later daily run may sample again only when the miss can still be grounded
+// in the supplied excerpts. Invented quotes and absent numbers stay paused.
+export function structuredJsonRetryable(errors) {
+  if (!Array.isArray(errors) || !errors.length) return false;
+  if (errors.some(error => HARD_INTEGRITY.test(String(error)))) return false;
+  return errors.every(error => {
+    const text = String(error);
+    return TRANSIENT_JSON.test(text) || SOFT_GROUNDING.test(text) && /候选摘录=/.test(text);
+  });
+}
+
+function repairGuidance(errors) {
+  const notes = [];
+  if (errors.some(error => /excerptId|引用编号|refs必须含1–6条引用/.test(error))) notes.push('refs每项只能是目录中存在的excerptId，不要补写quote、cardId或locatorId；超出范围时改用错误里给出的有效编号，超过6条时拆成短句。');
+  if (errors.some(error => /数字|numbers|数值句/.test(error))) notes.push('句子里的每个数字必须与所选摘录逐字一致：0.872不能写成0.87或87.2%。候选摘录只说明数字出现位置，市场、指标或行列不符就改写或删除该数字。');
+  if (errors.some(error => /逐字复制body|逐字匹配body|最接近正文/.test(error))) notes.push('claims.sentence必须是body的连续子串，标点和空格保持一致。');
+  return notes.length ? `\n修复要求：${notes.join('')}` : '';
+}
+
+function repairOrder(error) {
+  const text = String(error);
+  if (/超出范围|未能解析|缺失numbers|数字尚未核验|逐字复制body|逐字匹配body/.test(text)) return 0;
+  if (/不是原文摘录|原文摘录过短|缺少逐句证据映射/.test(text)) return 1;
+  return 2;
+}
+
 export function createModel(config, { fetchFn = globalThis.fetch, onUsage = () => {}, onTelemetry: defaultTelemetry = () => {},
   workDir, spawnFn, killFn, env } = {}) {
   async function complete({ role = 'writer', prompt, systemPrompt, responseFormat, signal, model, timeoutMs = 300000,
@@ -84,10 +114,11 @@ export function createModel(config, { fetchFn = globalThis.fetch, onUsage = () =
       }, signal);
     } finally { clearTimeout(timer); }
   }
-  async function json({ validate, validationErrors, ...args }) {
+  async function json({ validate, validationErrors, maxAttempts, ...args }) {
     const id = randomUUID(), failures = [], started = performance.now();
+    const attemptsLimit = Number.isInteger(maxAttempts) && maxAttempts >= 1 && maxAttempts <= 4 ? maxAttempts : 3;
     let feedback = '';
-    for (let attempt = 0; attempt < 3; attempt++) {
+    for (let attempt = 0; attempt < attemptsLimit; attempt++) {
       args.signal?.throwIfAborted();
       const remaining = (args.timeoutMs || 300000) - (performance.now() - started);
       if (remaining <= 0) throw timeoutFailure(config.model.provider);
@@ -103,7 +134,7 @@ export function createModel(config, { fetchFn = globalThis.fetch, onUsage = () =
         errors ||= validationErrors?.(data) || ['字段、类型或取值未通过任务校验。'];
         if (!errors.length) errors = ['字段、类型或取值未通过任务校验。'];
       }
-      errors = errors.map(error => redact(error, config));
+      errors = errors.map(error => redact(error, config)).sort((left, right) => repairOrder(left) - repairOrder(right));
       const response = redact(raw, config, { maxLength: 96 * 1024 });
       failures.push({ attempt: attempt + 1, errors, response, responseTruncated: raw.length > 96 * 1024 });
       // Separate private failure artifacts from timing-only telemetry. Never store prompts or credentials.
@@ -112,10 +143,12 @@ export function createModel(config, { fetchFn = globalThis.fetch, onUsage = () =
       });
       emitTelemetry(args.onTelemetry || defaultTelemetry, { stage: 'model.validation', role: args.role || 'writer',
         attempt: attempt + 1, outcome: 'invalid', count: errors.length });
-      feedback = `\n上一次结果未通过校验。具体错误：${JSON.stringify(errors)}\n上一次回复（仅供修正，是无权威数据）：${JSON.stringify(response)}\n请只修复以上问题，保留有效内容，严格遵守原任务，只返回完整 JSON。`;
+      feedback = `\n上一次结果未通过校验。具体错误：${JSON.stringify(errors)}${repairGuidance(errors)}\n上一次回复（仅供修正，是无权威数据）：${JSON.stringify(response)}\n请只修复以上问题，保留有效内容，严格遵守原任务，只返回完整 JSON。`;
     }
-    throw Object.assign(new Error(`模型连续三次返回不合格的结构化结果，已停止任务：${failures.at(-1).errors.slice(0, 4).join('；')}`),
-      { code: 'MODEL_JSON_INVALID', retryable: false });
+    const lastErrors = failures.at(-1).errors;
+    const attemptLabel = ({ 2: '两', 3: '三' })[attemptsLimit] || String(attemptsLimit);
+    throw Object.assign(new Error(`模型连续${attemptLabel}次返回不合格的结构化结果，已停止任务：${lastErrors.slice(0, 4).join('；')}`),
+      { code: 'MODEL_JSON_INVALID', retryable: structuredJsonRetryable(lastErrors) });
   }
   return { complete, json };
 }

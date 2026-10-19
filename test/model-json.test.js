@@ -3,9 +3,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createModel } from '../src/core/model.js';
+import { createModel, structuredJsonRetryable } from '../src/core/model.js';
 import { loadConfig } from '../src/config/index.js';
 import { dailyItemErrors } from '../src/research/writing.js';
+import { createDailyQuoteCatalog, resolveDailyQuoteReferences } from '../src/research/quotes.js';
 
 const assigned = { cardId: 'C5', heading: '模型能力的证据边界', importance: 'medium', targetChars: 450 };
 const cards = [{ id: 'C5', locators: [{ id: 'L1', text: 'Official benchmark report.' }], figures: [] }];
@@ -97,9 +98,10 @@ test('persistent narrator roles still stop after three responses and receive act
   const f = fixture(t, [JSON.stringify(invalid), JSON.stringify(invalid), JSON.stringify(invalid)]);
   const errors = value => dailyItemErrors(value, assigned, cards);
   await assert.rejects(f.model.json({ prompt: '写本条JSON', validate: value => !errors(value).length, validationErrors: errors }),
-    error => error.code === 'MODEL_JSON_INVALID' && /命中表达=.*编辑认为/.test(error.message) && /连续三次/.test(error.message));
+    error => error.code === 'MODEL_JSON_INVALID' && error.retryable === false && /命中表达=.*编辑认为/.test(error.message) && /连续三次/.test(error.message));
   assert.equal(f.requests.length, 3);
   assert.match(f.requests[1].messages[1].content, /保留技术术语和研究事实/);
+  assert.equal(structuredJsonRetryable(['正文不得带“编辑”“笔者”“我们”等表达主体']), false);
 });
 
 test('per-item adapter repair checks exact locator quotes and every numeric sentence before accepting a response', async t => {
@@ -145,4 +147,73 @@ test('the sole item correction receives sentence mismatches and short metric cit
   assert.ok(feedback.includes(source.slice(0, 70)));
   const fabricated = structuredClone(corrected); fabricated.claims[0].refs[0].quote = 'MAE: Evaluates profitable trading strategies.';
   assert.ok(errors(fabricated).some(error => /不是原文摘录/.test(error)));
+});
+
+test('FinQA repair feedback names the valid excerpt and exact AUROC tokens without accepting a rounded number', async t => {
+  const finqa = [{ id: 'C5', figures: [], locators: [
+    { id: 'L2', text: 'The baseline FinQA accuracy is 0.61 on the public split.' },
+    { id: 'L8', text: 'On FinQA the model reaches an AUROC of 0.872 and an F1 of 0.91.' },
+  ] }];
+  const catalog = createDailyQuoteCatalog(finqa);
+  const sentence = '作者报告FinQA的AUROC为0.872，F1为0.91。';
+  const finAssigned = { cardId: 'C5', heading: 'FinQA评测', importance: 'medium', targetChars: 450, evidenceCardIds: ['C5'] };
+  const baseItem = { cardId: 'C5', heading: finAssigned.heading, importance: 'medium', figureIds: [], body: sentence, claims: [] };
+  const wrong = { ...baseItem, claims: [{ sentence, refs: [{ excerptId: 'C5/L8/Q9' }, { excerptId: 'C5/L2/Q1' }] }] };
+  const rightId = [...catalog.byId.keys()].find(id => id.startsWith('C5/L8/Q'));
+  const corrected = { ...baseItem, claims: [{ sentence, refs: [{ excerptId: rightId }] }] };
+  const errors = value => {
+    const resolved = resolveDailyQuoteReferences(value, catalog);
+    return [...resolved.errors, ...dailyItemErrors(resolved.item, finAssigned, finqa, { catalog })];
+  };
+  const first = errors(wrong);
+  assert.ok(first.some(error => /C5\/L8\/Q9/.test(error) && /有效编号为C5\/L8\/Q1/.test(error)));
+  assert.equal(first.some(error => /不是原文摘录|quote必须为字符串/.test(error)), false);
+  assert.ok(first.some(error => /缺失numbers=.*0\.872/.test(error) && /候选摘录=.*C5\/L8\/Q1/.test(error) && /已引用摘录中的numbers=/.test(error)));
+  assert.ok(first.every(error => error.length < 800));
+  const f = fixture(t, [JSON.stringify(wrong), JSON.stringify(corrected)]);
+  assert.deepEqual(await f.model.json({ prompt: '写本条JSON', maxAttempts: 3, validate: value => !errors(value).length, validationErrors: errors }), corrected);
+  assert.equal(f.requests.length, 2);
+  const feedback = f.requests[1].messages[1].content;
+  assert.match(feedback, /excerptId超出范围/);
+  assert.match(feedback, /0\.872不能写成0\.87或87\.2%/);
+  assert.match(feedback, /候选摘录=/);
+  assert.doesNotMatch(feedback, /从该定位块逐字重取/);
+  const rounded = { ...baseItem, body: '作者报告FinQA的AUROC为0.87，F1为0.91。', claims: [{ sentence: '作者报告FinQA的AUROC为0.87，F1为0.91。', refs: [{ excerptId: rightId }] }] };
+  assert.ok(errors(rounded).some(error => /缺失numbers=.*0\.87/.test(error)));
+  assert.ok(errors(rounded).some(error => /提供的证据摘录中不存在这些数字/.test(error)));
+  const punctuation = { ...baseItem, claims: [{ sentence: '作者报告FinQA的AUROC为0.872，F1为0.91；', refs: [{ excerptId: rightId }] }] };
+  const punctuationErrors = errors(punctuation);
+  assert.ok(punctuationErrors.some(error => /最接近正文=/.test(error) && /相同前缀后正文为/.test(error)));
+  assert.equal(structuredJsonRetryable(punctuationErrors), true);
+});
+
+test('exhausted in-catalog citation misses stay retryable, while invented numbers and broken quotes do not', async t => {
+  const finqa = [{ id: 'C5', figures: [], locators: [
+    { id: 'L2', text: 'The baseline FinQA accuracy is 0.61 on the public split.' },
+    { id: 'L8', text: 'On FinQA the model reaches an AUROC of 0.872 and an F1 of 0.91.' },
+  ] }];
+  const catalog = createDailyQuoteCatalog(finqa);
+  const sentence = '作者报告FinQA的AUROC为0.872，F1为0.91。';
+  const finAssigned = { cardId: 'C5', heading: 'FinQA评测', importance: 'medium', targetChars: 450, evidenceCardIds: ['C5'] };
+  const wrong = { cardId: 'C5', heading: finAssigned.heading, importance: 'medium', figureIds: [], body: sentence,
+    claims: [{ sentence, refs: [{ excerptId: 'C5/L2/Q1' }] }] };
+  const errors = value => {
+    const resolved = resolveDailyQuoteReferences(value, catalog);
+    return [...resolved.errors, ...dailyItemErrors(resolved.item, finAssigned, finqa, { catalog })];
+  };
+  assert.equal(structuredJsonRetryable(errors(wrong)), true);
+  const missed = fixture(t, [JSON.stringify(wrong), JSON.stringify(wrong), JSON.stringify(wrong)]);
+  await assert.rejects(missed.model.json({ prompt: '写本条JSON', maxAttempts: 3, validate: value => !errors(value).length, validationErrors: errors }), error => {
+    assert.equal(error.code, 'MODEL_JSON_INVALID'); assert.equal(error.retryable, true);
+    assert.match(error.message, /连续三次/); assert.match(error.message, /0\.872/); return true;
+  });
+  assert.equal(missed.requests.length, 3);
+  const diagnostic = JSON.parse(fs.readFileSync(path.join(missed.dir, 'model-json-failures', fs.readdirSync(path.join(missed.dir, 'model-json-failures'))[0])));
+  assert.equal(diagnostic.failures.length, 3);
+  const invented = { ...wrong, body: '作者报告FinQA的AUROC为0.999。', claims: [{ sentence: '作者报告FinQA的AUROC为0.999。', refs: [{ excerptId: 'C5/L8/Q1' }] }] };
+  assert.equal(structuredJsonRetryable(errors(invented)), false);
+  assert.ok(errors(invented).some(error => /不存在这些数字：.*0\.999/.test(error)));
+  const syntax = fixture(t, ['{', '{', '{']);
+  await assert.rejects(syntax.model.json({ prompt: 'JSON', validate: value => value.ok === true }), error => error.code === 'MODEL_JSON_INVALID' && error.retryable === true);
+  assert.equal(structuredJsonRetryable(['字段、类型或取值未通过任务校验。']), false);
 });

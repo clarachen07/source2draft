@@ -64,6 +64,7 @@ test('writer resolves IDs before validation and caching, and receives only its o
       assert.equal(request.role, 'writer');
       assert.match(request.prompt, /C2：补明市场基准/); assert.doesNotMatch(request.prompt, /C4：补明预测验证集/);
       assert.match(request.prompt, /refs每项只返回excerptId/);
+      assert.equal(request.maxAttempts, 3);
       const response = { ...base, body: sentence, claims: [{ sentence, refs: [{ excerptId: 'C2/L13/Q1' }] }] };
       assert.equal(request.validate(response), true); assert.deepEqual(request.validationErrors(response), []);
       return response;
@@ -84,5 +85,22 @@ test('the existing two-response adapter corrects a wrong ID without transcribing
   const errors = value => { const resolved = resolveDailyQuoteReferences(value, catalog); return [...resolved.errors, ...dailyItemErrors(resolved.item, assigned, cards)]; };
   const result = await model.json({ prompt: '按原文目录选择引用编号。', validate: value => !errors(value).length, validationErrors: errors });
   assert.equal(result.claims[0].refs[0].excerptId, 'C2/L13/Q1'); assert.equal(requests.length, 2);
-  assert.match(requests[1].messages[1].content, /excerptId/);
+  assert.match(requests[1].messages[1].content, /excerptId超出范围/);
+  assert.match(requests[1].messages[1].content, /C2\/L13\/Q1/);
+  assert.doesNotMatch(requests[1].messages[1].content, /从该定位块逐字重取/);
+});
+
+test('an out-of-range excerpt id reports the real range and leaves quote grounding unchanged', () => {
+  const catalog = createDailyQuoteCatalog(cards), sentence = '该方法按日历年评估策略。';
+  const response = { ...base, body: sentence, claims: [{ sentence, refs: [{ excerptId: 'C2/L13/Q9' }] }] };
+  const resolved = resolveDailyQuoteReferences(response, catalog);
+  assert.match(resolved.errors[0], /excerptId超出范围：C2\/L13\/Q9/);
+  assert.match(resolved.errors[0], /有效编号为C2\/L13\/Q1、C2\/L13\/Q2/);
+  const errors = [...resolved.errors, ...dailyItemErrors(resolved.item, assigned, cards, { catalog })];
+  assert.equal(errors.some(error => /不是原文摘录|quote必须为字符串/.test(error)), false);
+  assert.ok(errors.some(error => /引用编号未能解析/.test(error)));
+  const grounded = { ...base, body: sentence, claims: [{ sentence, refs: [{ cardId: 'C2', locatorId: 'L13', quote: 'TradeGrad evaluates strategies across multiple calendar-year windows. ' }] }] };
+  assert.deepEqual(dailyItemErrors(grounded, assigned, cards, { catalog }), []);
+  grounded.claims[0].refs[0].quote = 'TradeGrad evaluates invented calendar-year windows.';
+  assert.ok(dailyItemErrors(grounded, assigned, cards, { catalog }).some(error => /不是原文摘录/.test(error)));
 });

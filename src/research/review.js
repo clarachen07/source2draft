@@ -1,11 +1,122 @@
 import { hash } from '../lib/io.js';
+import { CODEX_JSON_REPAIR_HEADROOM, CODEX_LIMITS, codexCharacterLength, codexPromptBudget } from '../core/codex-model.js';
 import { DAILY_SYSTEM, DAILY_EXPERIMENT_RULES, DAILY_STYLE_RULES, renderDailyArticle, reviewFingerprint } from './evidence.js';
 import { modelIdentity } from '../core/model-identity.js';
 
 export const DAILY_REVIEW_POLICY = 10;
+const OMITTED_LOCATOR_NOTE = '完整原文定位块已在逐条审稿中核对。本请求不重复附上定位全文，只保留定位编号与字符数；条目正文和claims摘录保持完整。不要因未见定位全文把已核对条目判为缺证据。';
+const CLIPPED_QUOTE_NOTE = '过长的证据摘录已按定位编号截断，并标注原字符数。判断标题和导语时以条目正文和保留的摘录为准。';
+const BULK_CARD_KEYS = ['receipt', 'claimValidation', 'figures', 'contentHash', 'extraction', 'fetchedAt', 'firstSeenAt', 'licenseUrl'];
 const auditShape = audit => Array.isArray(audit?.issues) && audit.issues.every(issue => typeof issue?.reason === 'string'
   && ['high', 'medium', 'low'].includes(issue.severity))
   && (!audit.warnings || Array.isArray(audit.warnings) && audit.warnings.every(warning => typeof warning === 'string'));
+
+function clipText(text, maxChars) {
+  if (maxChars <= 0) return '';
+  let count = 0, index = 0;
+  while (index < text.length && count < maxChars) {
+    const code = text.charCodeAt(index);
+    index += code >= 0xD800 && code <= 0xDBFF ? 2 : 1;
+    count += 1;
+  }
+  return text.slice(0, index);
+}
+function locatorPointer(locator) {
+  const pointer = { id: locator?.id, chars: codexCharacterLength(locator?.text || ''), textOmitted: true };
+  if (locator?.type) pointer.type = locator.type;
+  if (locator?.heading) pointer.heading = locator.heading;
+  if (locator?.page != null) pointer.page = locator.page;
+  return pointer;
+}
+function cardsWithoutLocatorText(cards) {
+  return (cards || []).map(card => ({ ...card, locators: (card.locators || []).map(locatorPointer) }));
+}
+function cardsWithoutBulk(cards) {
+  return (cards || []).map(card => {
+    const copy = { ...card };
+    for (const key of BULK_CARD_KEYS) delete copy[key];
+    return copy;
+  });
+}
+function clipQuote(quote, max) {
+  if (typeof quote !== 'string' || codexCharacterLength(quote) <= max) return quote;
+  const marker = `…[摘录截断，原${codexCharacterLength(quote)}字符]`;
+  const room = max - codexCharacterLength(marker);
+  return room >= 8 ? `${clipText(quote, room)}${marker}` : marker;
+}
+function clipEvidenceQuotes(payload, max) {
+  const copy = structuredClone(payload);
+  for (const card of copy.cards || []) {
+    for (const claim of card.claims || []) if (typeof claim?.quote === 'string') claim.quote = clipQuote(claim.quote, max);
+  }
+  for (const item of copy.items || []) {
+    for (const claim of item.claims || []) {
+      for (const ref of claim.refs || []) if (typeof ref?.quote === 'string') ref.quote = clipQuote(ref.quote, max);
+    }
+  }
+  return copy;
+}
+function longestQuote(payload) {
+  let longest = 0;
+  for (const card of payload.cards || []) {
+    for (const claim of card.claims || []) if (typeof claim?.quote === 'string') longest = Math.max(longest, codexCharacterLength(claim.quote));
+  }
+  for (const item of payload.items || []) {
+    for (const claim of item.claims || []) {
+      for (const ref of claim.refs || []) if (typeof ref?.quote === 'string') longest = Math.max(longest, codexCharacterLength(ref.quote));
+    }
+  }
+  return longest;
+}
+function renderWholeArticle(instruction, payload, notes) {
+  const extra = notes.filter(Boolean);
+  return `${instruction}${extra.length ? `\n${extra.join('\n')}` : ''}\n${JSON.stringify(payload)}`;
+}
+function promptWithin(instruction, payload, notes, limit) {
+  const prompt = renderWholeArticle(instruction, payload, notes);
+  return codexCharacterLength(prompt) <= limit ? prompt : null;
+}
+function bestClippedPrompt(instruction, payload, notes, limit) {
+  const longest = longestQuote(payload);
+  if (longest <= 80) return promptWithin(instruction, payload, notes, limit);
+  let low = 80, high = longest, best = null;
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const prompt = promptWithin(instruction, clipEvidenceQuotes(payload, mid), [...notes, CLIPPED_QUOTE_NOTE], limit);
+    if (prompt) { best = prompt; low = mid + 1; } else high = mid - 1;
+  }
+  return best;
+}
+function inputLimitError(actual, hard) {
+  return Object.assign(new Error(`整篇审稿输入在去掉重复原文后仍有${actual}字符，超过 Codex 可接受的 ${hard} 字符输入预算（上限 ${CODEX_LIMITS.inputChars}），已停止调用；这不是网络故障，相同输入不会自动重试`), {
+    code: 'CODEX_INPUT_LIMIT', retryable: false,
+  });
+}
+
+// Item reviews already checked each body against its full locators. This pass
+// only checks the title, intro and cross-item consistency, so repeated raw
+// documents are the first thing removed when Codex's character limit is close.
+export function buildWholeArticlePrompt({ instruction, payload, budget, hardBudget } = {}) {
+  const hard = hardBudget ?? budget ?? codexPromptBudget();
+  const preferred = Math.min(hard, budget ?? codexPromptBudget({ headroom: CODEX_JSON_REPAIR_HEADROOM }));
+  const full = promptWithin(instruction, payload, [], preferred);
+  if (full) return full;
+  const omittedPayload = { ...payload, cards: cardsWithoutLocatorText(payload.cards) };
+  const strippedPayload = { ...omittedPayload, cards: cardsWithoutBulk(omittedPayload.cards) };
+  const omitted = promptWithin(instruction, omittedPayload, [OMITTED_LOCATOR_NOTE], preferred)
+    || promptWithin(instruction, strippedPayload, [OMITTED_LOCATOR_NOTE], preferred)
+    || bestClippedPrompt(instruction, strippedPayload, [OMITTED_LOCATOR_NOTE], preferred);
+  if (omitted) return omitted;
+  if (preferred < hard) {
+    const relaxed = promptWithin(instruction, payload, [], hard)
+      || promptWithin(instruction, omittedPayload, [OMITTED_LOCATOR_NOTE], hard)
+      || promptWithin(instruction, strippedPayload, [OMITTED_LOCATOR_NOTE], hard)
+      || bestClippedPrompt(instruction, strippedPayload, [OMITTED_LOCATOR_NOTE], hard);
+    if (relaxed) return relaxed;
+  }
+  const smallest = renderWholeArticle(instruction, clipEvidenceQuotes(strippedPayload, 80), [OMITTED_LOCATOR_NOTE, CLIPPED_QUOTE_NOTE]);
+  throw inputLimitError(codexCharacterLength(smallest), hard);
+}
 
 export function dailyReviewContextIdentity({ run, context, config }) {
   return hash({ policy: DAILY_REVIEW_POLICY, input: run.input, context, model: modelIdentity(config.model, { mode: 'analysis' }),
@@ -82,7 +193,10 @@ locators是完整取得的正文，claims只是精选提要。核对“未披露
   if (!header) {
     signal?.throwIfAborted();
     const value = await model.json({ role: 'review', signal, onTelemetry, systemPrompt: DAILY_SYSTEM,
-      prompt: `只审核整篇标题与导语的事实准确性和跨条一致性。不要重新审稿或重写条目正文，不要求文风调整。标题和导语不能把合成/预测/回测结果说成真实交易，不得反转范围、对象、比较或局限；只能概括已核对条目及有证据的内容。事实错误列high并定位标题/导语原句和支持正确表达的条目/原文。返回JSON {"issues":[{"severity":"high或medium或low","reason":"具体证据与问题"}],"warnings":[]}。\n${JSON.stringify({ title: draft.title, intro: draft.intro, items: draft.items, cards, context })}`,
+      prompt: buildWholeArticlePrompt({
+        instruction: '只审核整篇标题与导语的事实准确性和跨条一致性。不要重新审稿或重写条目正文，不要求文风调整。标题和导语不能把合成/预测/回测结果说成真实交易，不得反转范围、对象、比较或局限；只能概括已核对条目及有证据的内容。事实错误列high并定位标题/导语原句和支持正确表达的条目/原文。返回JSON {"issues":[{"severity":"high或medium或low","reason":"具体证据与问题"}],"warnings":[]}。',
+        payload: { title: draft.title, intro: draft.intro, items: draft.items, cards, context },
+      }),
       validate: auditShape });
     if (!auditShape(value)) throw new Error('日报标题导语审稿结构无效');
     header = checkpoint.headerReviews[headerIdentity] = { value, valueHash: hash(value) }; persist();

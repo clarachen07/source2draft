@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { reviewDailyDraft as reviewIncludingHeader } from '../src/research/review.js';
+import { buildWholeArticlePrompt, reviewDailyDraft as reviewIncludingHeader } from '../src/research/review.js';
+import { writeDailyDraft } from '../src/research/writing.js';
+import { CODEX_JSON_REPAIR_HEADROOM, CODEX_LIMITS, codexCharacterLength, codexPromptBudget, codexStdin } from '../src/core/codex-model.js';
 
 // These legacy tests isolate item-review contracts; global headers have dedicated tests below.
 const reviewDailyDraft = args => reviewIncludingHeader({ ...args, model: { json: request =>
@@ -137,4 +139,100 @@ test('global header review catches unsupported titles, caches unchanged receipts
   f.args.draft.title = '研究方法与实验边界';
   assert.deepEqual((await reviewIncludingHeader(f.args)).issues, []);
   assert.equal(headers, 2); assert.deepEqual(f.calls, ['C1', 'C2']);
+});
+
+test('whole-article prompt keeps a short draft verbatim and clips evidence before the draft body', () => {
+  const instruction = '只审核整篇标题';
+  const payload = { title: '标题', intro: '导语', items: [{ cardId: 'C1', body: '条目正文必须保留。', claims: [{ sentence: '条目正文必须保留。', refs: [{ quote: 'Q'.repeat(500), cardId: 'C1', locatorId: 'L1' }] }] }],
+    cards: [{ id: 'C1', locators: [{ id: 'L1', type: 'paragraph', text: 'RAW'.repeat(3000) }], receipt: { raw: 'R'.repeat(3000) }, claims: [{ quote: 'C'.repeat(500), locatorId: 'L1' }] }],
+    context: { issueDate: '2026-10-02' } };
+  assert.equal(buildWholeArticlePrompt({ instruction, payload, budget: 100000 }), `${instruction}\n${JSON.stringify(payload)}`);
+  const tight = buildWholeArticlePrompt({ instruction, payload, budget: 900 });
+  assert.ok(tight.includes('条目正文必须保留。'));
+  assert.equal(tight.includes('RAWRAW'), false);
+  assert.equal(tight.includes('RRRR'), false);
+  assert.ok(tight.includes('"textOmitted":true'));
+  assert.ok(tight.includes('摘录截断'));
+  assert.ok(codexCharacterLength(tight) <= 900);
+  assert.equal(payload.cards[0].locators[0].text.startsWith('RAW'), true);
+  assert.equal(payload.items[0].claims[0].refs[0].quote, 'Q'.repeat(500));
+  assert.throws(() => buildWholeArticlePrompt({ instruction, payload: { ...payload, items: [{ body: '正文'.repeat(500) }] }, budget: 180 }), error => {
+    assert.equal(error.code, 'CODEX_INPUT_LIMIT');
+    assert.equal(error.retryable, false);
+    assert.match(error.message, /不是网络故障/);
+    assert.match(error.message, /不会自动重试/);
+    return true;
+  });
+});
+
+test('whole-article review keeps every item body and omits combined raw sources that exceed Codex', async () => {
+  const f = fixture();
+  const marker = 'UNIQUE_SOURCE_SENTINEL_';
+  f.args.cards[0].locators[0].text = marker + 'x'.repeat(600_000);
+  f.args.cards[1].locators[0].text = `OTHER_SOURCE_SENTINEL_${'y'.repeat(600_000)}`;
+  const original = f.args.model.json;
+  let header = '';
+  f.args.model.json = async request => {
+    if (!request.prompt.startsWith('只审核整篇标题')) return original(request);
+    header = request.prompt;
+    return { issues: [], warnings: [] };
+  };
+  const result = await reviewIncludingHeader(f.args);
+  assert.deepEqual(result.issues, []);
+  for (const item of f.args.draft.items) assert.ok(header.includes(item.body));
+  assert.equal(header.includes(marker), false);
+  assert.equal(header.includes('y'.repeat(200)), false);
+  assert.ok(header.includes('"textOmitted":true'));
+  assert.equal(f.args.cards[0].locators[0].text.startsWith(marker), true);
+  assert.ok(codexCharacterLength(header) <= codexPromptBudget({ headroom: CODEX_JSON_REPAIR_HEADROOM }));
+  assert.ok(codexCharacterLength(codexStdin(header, { responseFormat: { type: 'json_object' } })) <= CODEX_LIMITS.inputChars);
+});
+
+test('whole-article review fails clearly when the draft itself still exceeds Codex', async () => {
+  const f = fixture();
+  f.args.draft.items[0].body = '正文保持'.repeat(300_000);
+  f.args.draft.items[1].body = '另一正文'.repeat(300_000);
+  let headers = 0, items = 0;
+  f.args.model.json = async request => {
+    if (request.prompt.startsWith('只审核整篇标题')) headers += 1;
+    if (request.prompt.startsWith('只审核本条事件')) items += 1;
+    return { issues: [], warnings: [] };
+  };
+  await assert.rejects(reviewIncludingHeader(f.args), error => {
+    assert.equal(error.code, 'CODEX_INPUT_LIMIT');
+    assert.equal(error.retryable, false);
+    assert.match(error.message, /1048576/);
+    assert.match(error.message, /不是网络故障/);
+    assert.match(error.message, /不会自动重试/);
+    return true;
+  });
+  assert.equal(headers, 0);
+  assert.equal(items, 2);
+  assert.deepEqual(Object.keys(Object.values(f.args.checkpoint.reviewPasses)[0].items), ['C1', 'C2']);
+});
+
+test('header repair keeps the draft body and drops raw locator dumps above the Codex budget', async () => {
+  const quote = 'The authors report an improvement of 12.5 percent on the held-out financial forecasting benchmark.';
+  const sentence = '作者报告在留出的金融预测基准上改善12.5 percent。';
+  const sentinel = 'UNIQUE_RAW_LOCATOR_';
+  const body = `${sentence}这项研究讨论方法与限制。`;
+  const cards = [{ id: 'C1', title: 'Study', url: 'https://example.com/study', claims: [],
+    locators: [{ id: 'L1', type: 'paragraph', text: `${quote}${sentinel}${'x'.repeat(1_100_000)}` }] }];
+  const previousDraft = { title: '研究方法与实践边界', intro: '以下研究关注方法与限制。', items: [{
+    cardId: 'C1', heading: '研究方法', importance: 'lead', body, figureIds: [],
+    claims: [{ sentence, refs: [{ cardId: 'C1', locatorId: 'L1', quote }] }],
+  }] };
+  let repairPrompt = '';
+  await writeDailyDraft({
+    run: { input: 'LLM与量化日报' }, context: { issueDate: '2026-10-02' }, cards,
+    config: { model: { writerModel: 'chosen-model' } }, repair: ['HEADER：标题越界'], previousDraft,
+    checkpoint: {}, persist: () => {}, progress: () => {},
+    model: { json: async request => { repairPrompt = request.prompt; return { title: previousDraft.title, intro: previousDraft.intro }; } },
+  });
+  assert.ok(repairPrompt.startsWith('只修正标题和导语'));
+  assert.ok(repairPrompt.includes(body));
+  assert.ok(repairPrompt.includes(quote));
+  assert.equal(repairPrompt.includes(sentinel), false);
+  assert.equal(repairPrompt.includes('x'.repeat(200)), false);
+  assert.ok(codexCharacterLength(codexStdin(repairPrompt, { responseFormat: { type: 'json_object' } })) <= CODEX_LIMITS.inputChars);
 });

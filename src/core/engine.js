@@ -171,7 +171,8 @@ export function createEngine({ config, store, modelFactory = createModel, wechat
           writeAtomic(path.join(workDir, 'research-trace.json'), { prompt: run.input, manifest: artifact.manifest, completeness: artifact.completeness, warnings: artifact.warnings });
         } else if (run.profile === 'llm-quant-daily') {
           artifact = await measureStage(onTelemetry, 'daily', () => dailyResearch({ run, config, store, workDir, model, signal,
-            onTelemetry, previousArticle: findPreviousArticle(run, store, workDirFor), progress: text => progress(run, text) }));
+            onTelemetry, previousArticle: findPreviousArticle(run, store, workDirFor), reviewRewrite: run.review_rewrite || 0,
+            progress: text => progress(run, text) }));
           store.recordDailyEvents(run.id, artifact.eventIds || []);
         } else {
           artifact = await measureStage(onTelemetry, 'analysis', () => runAnalysis({ run, config, workDir, model, signal, onTelemetry,

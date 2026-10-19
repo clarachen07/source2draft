@@ -6,8 +6,11 @@ import { buildWholeArticlePrompt } from './review.js';
 
 const plainHeading = value => typeof value === 'string' && value.trim() && value.length <= 120 && !/[\r\n<>\[\]`]|https?:\/\//.test(value);
 
-export function dailyWritingIdentity({ run, context, cards, modelConfig, previousArticle = '', repair = [], previousDraft = null }) {
-  return hash({ version: 7, input: run.input, context, cards, modelConfig: modelIdentity(modelConfig, { mode: 'analysis' }), previousArticle, repair, previousDraft });
+export function dailyWritingIdentity({ run, context, cards, modelConfig, previousArticle = '', repair = [], previousDraft = null, generation = 0 }) {
+  // A user-requested rewrite generation is the only extra identity field.
+  // Omitting generation 0 keeps checkpoints written before that request reusable.
+  return hash({ version: 7, input: run.input, context, cards, modelConfig: modelIdentity(modelConfig, { mode: 'analysis' }), previousArticle, repair, previousDraft,
+    ...(generation > 0 ? { generation } : {}) });
 }
 
 // Unscoped errors (e.g. issue length) require the whole draft. Item-local
@@ -110,8 +113,8 @@ const itemShape = (item, assigned, cards) => dailyItemErrors(item, assigned, car
 // Only completed, matching items are reusable. Each model response is saved
 // before the next item starts; a failed item cannot trigger later requests.
 export async function writeDailyDraft({ phase = 'writing', run, context, cards, config, previousArticle = '', repair = [], previousDraft = null,
-  checkpoint, persist, model, signal, onTelemetry, progress = () => {} }) {
-  const identity = dailyWritingIdentity({ run, context, cards, modelConfig: config.model, previousArticle, repair, previousDraft });
+  generation = 0, checkpoint, persist, model, signal, onTelemetry, progress = () => {} }) {
+  const identity = dailyWritingIdentity({ run, context, cards, modelConfig: config.model, previousArticle, repair, previousDraft, generation });
   if (checkpoint[phase]?.identity !== identity) {
     checkpoint[phase] = { version: 1, identity, items: {} };
     persist();
@@ -129,7 +132,7 @@ export async function writeDailyDraft({ phase = 'writing', run, context, cards, 
     if (targets && headerErrors.length) {
       const header = await model.json({ role: 'writer', signal, onTelemetry, systemPrompt: DAILY_SYSTEM,
         prompt: buildWholeArticlePrompt({
-          instruction: '只修正标题和导语中明确的事实错误，保留正文、选题和顺序。标题不超过64字符，导语不超过400字符，不添加具体数字；遵守现有朴素文风。返回JSON {"title":"标题","intro":"导语"}。',
+          instruction: `${generation > 0 ? `用户要求重试（第${generation}次重写）。请按审稿拒绝原因改正标题或导语，不要原样交回被拒表述。` : ''}只修正标题和导语中明确的事实错误，保留正文、选题和顺序。标题不超过64字符，导语不超过400字符，不添加具体数字；遵守现有朴素文风。返回JSON {"title":"标题","intro":"导语"}。`,
           payload: { errors: headerErrors, title: previousDraft.title, intro: previousDraft.intro, items: previousDraft.items, cards, context },
         }),
         validate: value => outlineShape({ ...outline, title: value?.title, intro: value?.intro }, cards) });
@@ -152,7 +155,7 @@ export async function writeDailyDraft({ phase = 'writing', run, context, cards, 
       writing.items[assigned.cardId] = { identity: itemIdentity, valueHash: hash(item), value: item, preserved: true }; persist();
     } else if (cached?.identity === itemIdentity && cached.valueHash === hash(cached.value) && itemShape(cached.value, assigned, relevant)) item = cached.value;
     else {
-      progress(`正在${repair.length ? '修正' : '撰写'}事件 ${index + 1}/${writing.outline.items.length}`);
+      progress(`正在${generation > 0 ? '按审稿意见重写' : repair.length ? '修正' : '撰写'}事件 ${index + 1}/${writing.outline.items.length}`);
       const catalog = createDailyQuoteCatalog(relevant);
       const responseErrors = value => {
         const resolved = resolveDailyQuoteReferences(value, catalog);
@@ -162,7 +165,7 @@ export async function writeDailyDraft({ phase = 'writing', run, context, cards, 
       // can then ground numbers. Equality checks are unchanged.
       item = await model.json({ role: 'writer', signal, onTelemetry, systemPrompt: DAILY_SYSTEM, maxAttempts: 3,
         prompt: dailyWriterPrompt({ run, context, cards: catalog.cards, previousArticle, repair: itemRepairErrors(repair, assigned.cardId), outline: writing.outline, assigned, excerptIds: true,
-          previousItem: previousDraft?.items.find(value => value.cardId === assigned.cardId) }),
+          generation, previousItem: previousDraft?.items.find(value => value.cardId === assigned.cardId) }),
         validate: value => responseErrors(value).length === 0,
         validationErrors: responseErrors });
       const resolved = resolveDailyQuoteReferences(item, catalog);

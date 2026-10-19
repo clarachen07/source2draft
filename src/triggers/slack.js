@@ -48,7 +48,9 @@ export function createEventHandler({ config, store, engine, botId, now = () => D
       else if (command === 'cancel') {
         if (result.applied) { engine.abort(result.run.id); store.notice(result.run, 'cancelled', '任务已取消，保留已有本地文件。'); }
         else store.notice(result.run, `cancel-info:${message.ts}:${version}`, '该任务已结束；已创建的公众号草稿保留。');
-      } else store.notice(result.run, `retry:${message.ts}:${version}`, '已安排重试；若上传结果待核对，只核对现有草稿，不重复创建。');
+      } else store.notice(result.run, `retry:${message.ts}:${version}`, result.reviewRewrite
+        ? '已安排重试，将按审稿拒绝原因重写未通过核验的正文并重新审稿。'
+        : '已安排重试；若上传结果待核对，只核对现有草稿，不重复创建。');
       return;
     }
     // No history polling or replay on reconnect. Slack's live delivery may retry an event; persisted messages dedupe it.

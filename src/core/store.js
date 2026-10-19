@@ -16,7 +16,7 @@ export function openStore(filename, { maxQueue = 100, readonly = false } = {}) {
 
 function initializeStore(db, { maxQueue, readonly }) {
   const schemaVersion = db.pragma('user_version', { simple: true });
-  if (schemaVersion > 3) throw new Error('任务数据库版本较新，请使用匹配的程序版本');
+  if (schemaVersion > 4) throw new Error('任务数据库版本较新，请使用匹配的程序版本');
   if (!readonly) db.pragma('journal_mode = WAL');
   db.pragma('busy_timeout = 5000'); db.pragma('foreign_keys = ON');
   if (!readonly) db.exec(`
@@ -99,14 +99,20 @@ function initializeStore(db, { maxQueue, readonly }) {
     if (!columns.has('blocked_reason')) db.exec('ALTER TABLE notices ADD COLUMN blocked_reason TEXT');
     db.exec('PRAGMA user_version = 3');
   })();
+  if (!readonly && schemaVersion < 4) db.transaction(() => {
+    const columns = new Set(db.prepare('PRAGMA table_info(runs)').all().map(column => column.name));
+    if (!columns.has('review_rewrite')) db.exec('ALTER TABLE runs ADD COLUMN review_rewrite INTEGER NOT NULL DEFAULT 0');
+    db.exec('PRAGMA user_version = 4');
+  })();
   const outboxReady = !readonly || schemaVersion >= 3;
   const dailySchemaReady = !readonly || schemaVersion >= 1;
   const reservationsSchemaReady = !readonly || schemaVersion >= 2;
   const get = id => db.prepare('SELECT * FROM runs WHERE id=?').get(id);
   const latest = key => db.prepare('SELECT * FROM runs WHERE thread_key=? ORDER BY revision DESC LIMIT 1').get(key);
   const update = (id, fields) => {
-    const allowed = ['status', 'mode', 'title', 'media_id', 'error', 'result', 'ready_at', 'profile', 'context_json', 'error_code', 'retryable'];
+    const allowed = ['status', 'mode', 'title', 'media_id', 'error', 'result', 'ready_at', 'profile', 'context_json', 'error_code', 'retryable', 'review_rewrite'];
     const keys = Object.keys(fields); if (keys.some(k => !allowed.includes(k))) throw new Error('非法任务更新字段');
+    if (fields.review_rewrite !== undefined && (!Number.isInteger(fields.review_rewrite) || fields.review_rewrite < 0)) throw new Error('非法审稿重写次数');
     if (keys.some(key => ['profile', 'context_json'].includes(key))) {
       const current = get(id);
       if (['publishing', 'done'].includes(current?.status) || db.prepare('SELECT 1 FROM operations WHERE run_id=?').get(id)) throw new Error('已上传操作的任务元数据不能修改');
@@ -170,9 +176,15 @@ function initializeStore(db, { maxQueue, readonly }) {
     const op = operation(id);
     if (run.media_id && !op) throw new Error('已有草稿标识但缺少操作记录，禁止重新创建');
     if (op?.state === 'rejected') db.prepare('DELETE FROM operations WHERE run_id=?').run(id);
-    update(id, { status: op && op.state !== 'rejected' ? 'publishing' : 'queued', error: null,
-      error_code: null, retryable: 0, ready_at: Date.now() });
+    const requeue = !(op && op.state !== 'rejected');
+    // Content that already failed review gets one rewrite per user retry.
+    // Publishing reconciliation and automatic failure retries do not.
+    const reviewRewrite = requeue && run.status === 'needs_review' && run.profile === DAILY_PROFILE;
+    update(id, { status: requeue ? 'queued' : 'publishing', error: null,
+      error_code: null, retryable: 0, ready_at: Date.now(),
+      review_rewrite: (run.review_rewrite || 0) + (reviewRewrite ? 1 : 0) });
     db.prepare('DELETE FROM notices WHERE run_id=? AND sent_at IS NULL').run(id);
+    return { reviewRewrite };
   }
   const control = db.transaction(({ threadKey, ts, version, command }) => {
     version = Number(version);
@@ -196,9 +208,14 @@ function initializeStore(db, { maxQueue, readonly }) {
       save('ignored'); return { duplicate: true };
     }
     try {
-      const applied = db.transaction(() => command === 'cancel' ? cancel(run.id) : (retry(run.id), true))();
+      let reviewRewrite = false;
+      const applied = db.transaction(() => {
+        if (command === 'cancel') return cancel(run.id);
+        reviewRewrite = retry(run.id).reviewRewrite;
+        return true;
+      })();
       save(applied ? 'applied' : 'ignored');
-      return { run, applied };
+      return { run, applied, reviewRewrite };
     } catch (error) {
       save('rejected', error.message);
       return { run, applied: false, error: error.message };

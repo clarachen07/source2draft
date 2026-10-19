@@ -62,7 +62,7 @@ function outlineShape(outline, cards) {
   return total >= (outline.items.length < 4 ? 300 * outline.items.length : 3000) && total <= 5000;
 }
 
-export function dailyItemErrors(item, assigned, cards) {
+export function dailyItemErrors(item, assigned, cards, options) {
   const byId = new Map(cards.map(card => [card.id, card]));
   const errors = [];
   if (!item || typeof item !== 'object' || Array.isArray(item)) return ['必须返回分配条目的单个 JSON 对象。'];
@@ -79,8 +79,11 @@ export function dailyItemErrors(item, assigned, cards) {
     if (typeof claim?.sentence !== 'string' || !claim.sentence.trim() || typeof item.body !== 'string' || !item.body.includes(claim.sentence)) {
       errors.push(`${prefix}.sentence必须逐字复制body中的非空原句，不能改动标点或空格。`);
     }
-    if (!Array.isArray(claim?.refs) || !claim.refs.length || claim.refs.length > 6) errors.push(`${prefix}.refs必须含1–6条引用。`);
-    else claim.refs.forEach((ref, refIndex) => {
+    if (!Array.isArray(claim?.refs) || !claim.refs.length || claim.refs.length > 6) {
+      const count = Array.isArray(claim?.refs) ? claim.refs.length : 0;
+      errors.push(`${prefix}.refs必须含1–6条引用${count ? `；当前${count}条` : ''}。超过6条时拆成多个短句claims，每句只保留支撑该句的excerptId。`);
+    } else claim.refs.forEach((ref, refIndex) => {
+      if (ref && typeof ref === 'object' && Object.hasOwn(ref, 'excerptId')) return;
       if (typeof ref?.quote !== 'string' || !byId.get(ref?.cardId)?.locators.some(locator => locator.id === ref?.locatorId)) {
         errors.push(`${prefix}.refs[${refIndex}]引用无效；quote必须为字符串，cardId/locatorId必须存在于本条提供的证据卡。`);
       }
@@ -95,7 +98,7 @@ export function dailyItemErrors(item, assigned, cards) {
   // Collect evidence failures alongside field/sentence failures so the single
   // adapter correction sees all repairable issues at once. Malformed outer
   // fields still stop here; nested claim/ref errors are handled by the auditor.
-  if (typeof item.body === 'string' && Array.isArray(item.claims)) errors.push(...dailyItemEvidenceErrors(item, cards));
+  if (typeof item.body === 'string' && Array.isArray(item.claims)) errors.push(...dailyItemEvidenceErrors(item, cards, options));
   return errors;
 }
 const itemShape = (item, assigned, cards) => dailyItemErrors(item, assigned, cards).length === 0;
@@ -146,9 +149,11 @@ export async function writeDailyDraft({ phase = 'writing', run, context, cards, 
       const catalog = createDailyQuoteCatalog(relevant);
       const responseErrors = value => {
         const resolved = resolveDailyQuoteReferences(value, catalog);
-        return [...resolved.errors, ...dailyItemErrors(resolved.item, assigned, relevant)];
+        return [...resolved.errors, ...dailyItemErrors(resolved.item, assigned, relevant, { catalog })];
       };
-      item = await model.json({ role: 'writer', signal, onTelemetry, systemPrompt: DAILY_SYSTEM,
+      // The first repair often only corrects excerpt ranges. A third response
+      // can then ground numbers. Equality checks are unchanged.
+      item = await model.json({ role: 'writer', signal, onTelemetry, systemPrompt: DAILY_SYSTEM, maxAttempts: 3,
         prompt: dailyWriterPrompt({ run, context, cards: catalog.cards, previousArticle, repair: itemRepairErrors(repair, assigned.cardId), outline: writing.outline, assigned, excerptIds: true,
           previousItem: previousDraft?.items.find(value => value.cardId === assigned.cardId) }),
         validate: value => responseErrors(value).length === 0,

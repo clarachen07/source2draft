@@ -123,6 +123,21 @@ test('daily factual review failure never reaches rendering or draft creation', a
   } finally { await f.close(); }
 });
 
+test('a transient structured writer failure keeps its code and daily retry flag', async () => {
+  const f = fixture({ dailyResearch: async () => {
+    const error = new Error('模型连续3次返回不合格的结构化结果：excerptId超出范围');
+    error.code = 'MODEL_JSON_INVALID'; error.retryable = true; throw error;
+  } });
+  try {
+    const run = f.daily(); await f.engine.execute(run);
+    const saved = f.store.get(run.id);
+    assert.equal(saved.status, 'failed');
+    assert.equal(saved.retryable, 1);
+    assert.equal(saved.error_code, 'MODEL_JSON_INVALID');
+    assert.equal(f.store.operation(run.id), undefined);
+  } finally { await f.close(); }
+});
+
 test('transient daily errors preserve a retryable code without permitting ambiguous writes', async () => {
   const f = fixture({ dailyResearch: async () => {
     const error = new Error('临时模型不可用'); error.code = 'MODEL_TRANSIENT'; error.retryable = true; throw error;

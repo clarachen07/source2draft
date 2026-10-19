@@ -108,6 +108,34 @@ test('cancelling daily discovery does not cancel the manual lane', { timeout: 30
   } finally { release.resolve(); await f.close(); }
 });
 
+test('CLI retry of a needs_review daily passes the rewrite generation and recovery does not', async () => {
+  const seen = [];
+  const f = fixture({ dailyResearch: async ({ reviewRewrite }) => {
+    seen.push(reviewRewrite || 0);
+    if (seen.length === 1) { const error = new Error('日报事实或结构核验未通过'); error.needsReview = true; throw error; }
+    return { article: '# 日报\n\n按审稿意见改正后的正文。', eventIds: [] };
+  } });
+  try {
+    const run = f.daily();
+    await f.engine.execute(run);
+    assert.equal(f.store.get(run.id).status, 'needs_review');
+    assert.equal(f.store.get(run.id).review_rewrite, 0);
+    f.store.update(run.id, { status: 'running' });
+    f.store.recover();
+    assert.equal(f.store.get(run.id).status, 'queued');
+    assert.equal(f.store.get(run.id).review_rewrite, 0);
+    f.store.update(run.id, { status: 'failed', retryable: 1 });
+    assert.equal(f.store.retry(run.id).reviewRewrite, false);
+    assert.equal(f.store.get(run.id).review_rewrite, 0);
+    f.store.update(run.id, { status: 'needs_review' });
+    assert.equal(f.store.retry(run.id).reviewRewrite, true);
+    await f.engine.execute(f.store.get(run.id));
+    assert.deepEqual(seen, [0, 1]);
+    assert.equal(f.store.get(run.id).status, 'done');
+    assert.equal(f.store.get(run.id).review_rewrite, 1);
+  } finally { await f.close(); }
+});
+
 test('daily factual review failure never reaches rendering or draft creation', async () => {
   const f = fixture({
     dailyResearch: async () => { const error = new Error('关键结果缺少原文支持'); error.needsReview = true; throw error; },

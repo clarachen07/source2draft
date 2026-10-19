@@ -106,7 +106,7 @@ function suppliedCandidates(run, context, config) {
 const withoutHeaders = candidate => { const { requestHeaders, ...rest } = candidate; return rest; };
 
 export async function runDailyResearch({ run, config, store, workDir, model, signal, onTelemetry, progress = () => {},
-  fetchFn = globalThis.fetch, previousArticle = '', collect = collectCandidates, read = readResearchDocument,
+  fetchFn = globalThis.fetch, previousArticle = '', reviewRewrite = 0, collect = collectCandidates, read = readResearchDocument,
   extract = extractEvidenceCard, clientFactory = createResearchClient }) {
   signal?.throwIfAborted();
   const context = dailyContext(run), exclusive = sourcePolicy(run.input, false);
@@ -226,11 +226,12 @@ export async function runDailyResearch({ run, config, store, workDir, model, sig
   checkpoint.cards = cards;
   const writingArgs = { run, context, cards, config, previousArticle, checkpoint, persist, model, signal, onTelemetry, progress };
   const completeWriting = async (phase, request = {}) => {
+    const generation = request.generation || 0;
     const expected = dailyWritingIdentity({ run, context, cards, modelConfig: config.model, previousArticle,
-      repair: request.errors || [], previousDraft: request.baseDraft || null });
+      repair: request.errors || [], previousDraft: request.baseDraft || null, generation });
     if (!checkpoint.draft || checkpoint.draftWritingIdentity !== expected) {
       delete checkpoint.approval; persist();
-      const result = await writeDailyDraft({ ...writingArgs, phase, repair: request.errors || [], previousDraft: request.baseDraft || null });
+      const result = await writeDailyDraft({ ...writingArgs, phase, repair: request.errors || [], previousDraft: request.baseDraft || null, generation });
       checkpoint.draft = result.draft; checkpoint.draftWritingIdentity = result.identity;
       if (phase === 'repairWriting') checkpoint.repairRequest.complete = true;
       persist();
@@ -257,6 +258,26 @@ export async function runDailyResearch({ run, config, store, workDir, model, sig
   narrow();
   const fingerprint = () => reviewFingerprint({ draft: checkpoint.draft, cards, input: run.input, context, modelConfig: config.model });
   if (checkpoint.approval?.fingerprint !== fingerprint() || checkpoint.approval?.policy !== DAILY_REVIEW_POLICY) delete checkpoint.approval;
+  // The same rejected draft stays blocked on crash recovery. A Slack or CLI
+  // retry records a higher generation and spends it once, before the model call.
+  const requestedRewrite = Number.isInteger(reviewRewrite) && reviewRewrite > 0 ? reviewRewrite : 0;
+  const spentRewrite = Number.isInteger(checkpoint.reviewRewriteSpent) && checkpoint.reviewRewriteSpent > 0 ? checkpoint.reviewRewriteSpent : 0;
+  if (requestedRewrite > spentRewrite) {
+    const failure = checkpoint.reviewFailure;
+    const eligible = failure?.fingerprint === fingerprint() && failure.policy === DAILY_REVIEW_POLICY
+      && checkpoint.correctionCount === 1 && Array.isArray(checkpoint.draft?.items)
+      && Array.isArray(failure.errors) && failure.errors.length > 0 && failure.errors.every(error => typeof error === 'string');
+    checkpoint.reviewRewriteSpent = requestedRewrite;
+    if (eligible) {
+      if (checkpoint.repairRequest) checkpoint.repairHistory = [...(checkpoint.repairHistory || []), checkpoint.repairRequest];
+      checkpoint.repairRequest = { errors: [...failure.errors], baseDraft: structuredClone(checkpoint.draft), complete: false, generation: requestedRewrite };
+      delete checkpoint.reviewFailure;
+      delete checkpoint.approval;
+      persist();
+      progress('正在按审稿拒绝原因重写未通过的正文');
+      await completeWriting('repairWriting', checkpoint.repairRequest);
+    } else persist();
+  }
   if (checkpoint.reviewFailure?.fingerprint === fingerprint() && checkpoint.reviewFailure.policy === DAILY_REVIEW_POLICY) {
     throw blocked(`日报事实或结构核验未通过：${checkpoint.reviewFailure.errors.slice(0, 4).join('；')}`);
   }

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { openStore } from '../src/core/store.js';
+import { openStore, DAILY_PROFILE } from '../src/core/store.js';
 import { createEventHandler } from '../src/triggers/slack.js';
 import { loadConfig } from '../src/config/index.js';
 
@@ -53,6 +53,26 @@ test('stop is deduped across delivery types and remains bound to its first revis
     assert.equal(store.db.prepare('SELECT run_id FROM control_messages').get().run_id, original.id);
     assert.deepEqual(aborted, [original.id]);
   } finally { store.close(); fs.rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('Slack retry of a needs_review daily asks for one review rewrite', async () => {
+  const store = openStore(':memory:');
+  try {
+    const receive = handler(store); await start(receive);
+    const run = store.latest('C1:100');
+    store.update(run.id, { status: 'needs_review', profile: DAILY_PROFILE });
+    await receive(message(101, '重试'));
+    assert.equal(store.get(run.id).status, 'queued');
+    assert.equal(store.get(run.id).review_rewrite, 1);
+    assert.match(store.db.prepare('SELECT text FROM notices WHERE run_id=? ORDER BY id DESC').get(run.id).text, /按审稿拒绝原因重写/);
+    store.update(run.id, { status: 'failed' });
+    await receive(message(102, '重试'));
+    assert.equal(store.get(run.id).review_rewrite, 1);
+    assert.match(store.db.prepare('SELECT text FROM notices WHERE run_id=? ORDER BY id DESC').get(run.id).text, /只核对现有草稿/);
+    store.update(run.id, { status: 'needs_review' });
+    await receive(message(103, '重试'));
+    assert.equal(store.get(run.id).review_rewrite, 2);
+  } finally { store.close(); }
 });
 
 test('retry replay cannot retry a second failure or retry a newer revision', async () => {

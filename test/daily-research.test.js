@@ -272,6 +272,123 @@ test('fact audit grants only one rewrite, then blocks a still unsupported articl
   } finally { f.close(); }
 });
 
+test('a user retry rewrites a rejected draft from the audit reasons, then the same generation short-circuits', async () => {
+  const f = fixture();
+  const reason = '年化收益未交代样本区间，强基线未点名';
+  const addition = '该方法仍限于作者报告的预测评估。';
+  f.args.model.json = async args => {
+    if (args.role === 'planner') { f.stats.outline++; return outline(1); }
+    if (args.role === 'writer') {
+      f.stats.writer++;
+      const item = draft(1).items[0];
+      if (!args.prompt.includes('用户要求重试')) return item;
+      assert.match(args.prompt, new RegExp(reason));
+      assert.match(args.prompt, /第1次重写/);
+      assert.doesNotMatch(args.prompt, /这是唯一一次修正机会/);
+      return { ...item, body: `${item.body}\n\n${addition}` };
+    }
+    f.stats.review++;
+    return args.prompt.includes(addition) ? { issues: [], warnings: [] } : { issues: [{ severity: 'high', reason }], warnings: [] };
+  };
+  const traceFile = () => JSON.parse(fs.readFileSync(path.join(f.args.workDir, 'research-trace.json')));
+  try {
+    await assert.rejects(runDailyResearch(f.args), error => error.needsReview && !error.retryable);
+    assert.equal(f.stats.writer, 2); assert.equal(f.stats.review, 2);
+    const blocked = { ...f.stats };
+    await assert.rejects(runDailyResearch(f.args), new RegExp(reason));
+    assert.deepEqual(f.stats, blocked, 'the same fingerprint does not rewrite or rereview');
+    assert.equal(traceFile().reviewRewriteSpent, undefined);
+    const rewritten = await runDailyResearch({ ...f.args, reviewRewrite: 1 });
+    assert.match(rewritten.article, new RegExp(addition));
+    assert.equal(f.stats.writer, 3); assert.equal(f.stats.review, 3);
+    const trace = traceFile();
+    assert.equal(trace.reviewRewriteSpent, 1);
+    assert.equal(trace.correctionCount, 1);
+    assert.equal(trace.repairRequest.generation, 1);
+    assert.equal(trace.repairRequest.complete, true);
+    assert.ok(trace.repairRequest.errors.some(error => error.includes(reason)));
+    assert.equal(trace.repairHistory.length, 1);
+    assert.equal(trace.reviewFailure, undefined);
+    assert.equal(trace.approval.policy, DAILY_REVIEW_POLICY);
+    const approved = { ...f.stats };
+    await runDailyResearch({ ...f.args, reviewRewrite: 1 });
+    assert.deepEqual(f.stats, approved, 'the spent generation does not rewrite again');
+  } finally { f.close(); }
+});
+
+test('a rejected rewrite stays blocked until a newer user retry, and an interrupted rewrite resumes once', async () => {
+  const f = fixture();
+  const reason = '事件研究窗口与意外指数没有写在结果旁边';
+  let crash = true, forced = 0;
+  f.args.model.json = async args => {
+    if (args.role === 'planner') { f.stats.outline++; return outline(1); }
+    if (args.role === 'writer') {
+      f.stats.writer++;
+      if (args.prompt.includes('用户要求重试')) {
+        forced++;
+        assert.match(args.prompt, new RegExp(reason));
+        if (crash) { crash = false; const error = new Error('temporary'); error.code = 'MODEL_TRANSIENT'; error.retryable = true; throw error; }
+      }
+      return draft(1).items[0];
+    }
+    f.stats.review++;
+    return { issues: [{ severity: 'high', reason }], warnings: [] };
+  };
+  const traceFile = () => JSON.parse(fs.readFileSync(path.join(f.args.workDir, 'research-trace.json')));
+  try {
+    await assert.rejects(runDailyResearch(f.args), /未通过/);
+    await assert.rejects(runDailyResearch({ ...f.args, reviewRewrite: 1 }), error => error.code === 'MODEL_TRANSIENT' && error.retryable === true);
+    const saved = traceFile();
+    assert.equal(saved.reviewRewriteSpent, 1);
+    assert.equal(saved.reviewFailure, undefined);
+    assert.equal(saved.repairRequest.complete, false);
+    assert.equal(saved.repairRequest.generation, 1);
+    assert.ok(saved.repairRequest.errors.some(error => error.includes(reason)));
+    assert.equal(saved.correctionCount, 1);
+    const resumedWriters = f.stats.writer;
+    await assert.rejects(runDailyResearch({ ...f.args, reviewRewrite: 1 }), new RegExp(reason));
+    assert.equal(f.stats.writer, resumedWriters + 1);
+    assert.equal(forced, 2);
+    const failed = traceFile();
+    assert.equal(failed.repairRequest.complete, true);
+    assert.equal(failed.reviewRewriteSpent, 1);
+    assert.equal(failed.approval, undefined);
+    assert.ok(failed.reviewFailure.errors.some(error => error.includes(reason)));
+    const stalled = { ...f.stats };
+    await assert.rejects(runDailyResearch({ ...f.args, reviewRewrite: 1 }), new RegExp(reason));
+    assert.deepEqual(f.stats, stalled, 'the same generation short-circuits after the rewrite is reviewed');
+    await assert.rejects(runDailyResearch({ ...f.args, reviewRewrite: 2 }), new RegExp(reason));
+    assert.equal(f.stats.writer, stalled.writer + 1);
+    assert.equal(traceFile().reviewRewriteSpent, 2);
+    assert.equal(traceFile().repairRequest.generation, 2);
+  } finally { f.close(); }
+});
+
+test('a user retry that is not a current-policy content rejection does not unlock a later identical failure', async () => {
+  const f = fixture();
+  f.args.model.json = async args => {
+    if (args.role === 'planner') { f.stats.outline++; return outline(1); }
+    if (args.role === 'writer') { f.stats.writer++; return draft(1).items[0]; }
+    f.stats.review++; return { issues: [{ severity: 'high', reason: '关键结论与原文不符' }] };
+  };
+  const filename = () => path.join(f.args.workDir, 'research-trace.json');
+  try {
+    await assert.rejects(runDailyResearch(f.args), error => error.needsReview);
+    const trace = JSON.parse(fs.readFileSync(filename()));
+    trace.reviewFailure.policy = DAILY_REVIEW_POLICY - 1;
+    fs.writeFileSync(filename(), JSON.stringify(trace));
+    const writers = f.stats.writer;
+    await assert.rejects(runDailyResearch({ ...f.args, reviewRewrite: 1 }), /关键结论/);
+    assert.equal(f.stats.writer, writers);
+    const spent = JSON.parse(fs.readFileSync(filename()));
+    assert.equal(spent.reviewRewriteSpent, 1);
+    assert.equal(spent.reviewFailure.policy, DAILY_REVIEW_POLICY);
+    const stalled = { ...f.stats };
+    await assert.rejects(runDailyResearch({ ...f.args, reviewRewrite: 1 }), /关键结论/);
+    assert.deepEqual(f.stats, stalled);
+  } finally { f.close(); }
+});
+
 test('a legacy repaired draft can narrow an unsupported statement without granting another rewrite after interruption', async () => {
   const f = fixture(), unsupported = '作者另报告收益99%。'; let pause = true;
   f.args.model.json = async args => {

@@ -29,7 +29,7 @@ test('daily migration preserves an existing revision and runs once after reopeni
       VALUES('preserved','C1:1',7,'user content','done',0,1,1,1,'known-draft')`).run();
     db.close();
     store = openStore(fixture.filename);
-    assert.equal(store.db.pragma('user_version', { simple: true }), 3);
+    assert.equal(store.db.pragma('user_version', { simple: true }), 4);
     assert.equal(store.get('preserved').input, 'user content');
     assert.equal(store.get('preserved').media_id, 'known-draft');
     assert.equal(store.get('preserved').context_json, '{}');
@@ -204,7 +204,7 @@ test('version two adds request audit without changing an existing version-one qu
     assert.equal(store.db.prepare("SELECT count(*) AS n FROM sqlite_master WHERE name='provider_reservations'").get().n, 0);
     store.close();
     store = openStore(fixture.filename);
-    assert.equal(store.db.pragma('user_version', { simple: true }), 3);
+    assert.equal(store.db.pragma('user_version', { simple: true }), 4);
     assert.equal(store.providerBudgets()[0].used, 2);
     assert.deepEqual(store.providerReservations(), []);
     assert.equal(store.reserveProviderBudget({ provider: 'tavily', period: '2026-10', units: 1, limit: 3 }).used, 3);
@@ -240,6 +240,48 @@ test('registered daily aliases preserve revisions and root ambiguity cannot redi
     assert.deepEqual(store.noticeRoute('C1:10.001'), { channel: 'C1', thread_ts: '10.001' });
     assert.equal(store.noticeRoute('local:preview'), null);
   } finally { store.close(); fixture.close(); }
+});
+
+test('user retry of a needs_review daily records one rewrite generation and other retries do not', () => {
+  const fixture = tempStore();
+  let legacy = new Database(fixture.filename), store;
+  try {
+    legacy.exec(`CREATE TABLE runs (
+      id TEXT PRIMARY KEY,thread_key TEXT NOT NULL,revision INTEGER NOT NULL,input TEXT NOT NULL,
+      attachments TEXT NOT NULL DEFAULT '[]',status TEXT NOT NULL,mode TEXT,dry_run INTEGER NOT NULL,
+      created_at INTEGER NOT NULL,ready_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,
+      title TEXT,media_id TEXT,error TEXT,result TEXT,parent_id TEXT,UNIQUE(thread_key,revision)
+    )`);
+    legacy.close(); legacy = undefined;
+    store = openStore(fixture.filename);
+    store.db.exec('ALTER TABLE runs DROP COLUMN review_rewrite; PRAGMA user_version = 3');
+    store.close();
+    store = openStore(fixture.filename);
+    assert.equal(store.db.pragma('user_version', { simple: true }), 4);
+    const run = issue(store);
+    assert.equal(store.get(run.id).review_rewrite, 0);
+    store.update(run.id, { status: 'failed', error_code: 'MODEL_TRANSIENT', retryable: 1 });
+    assert.equal(store.retry(run.id).reviewRewrite, false);
+    assert.equal(store.get(run.id).review_rewrite, 0);
+    store.update(run.id, { status: 'needs_review' });
+    assert.equal(store.retry(run.id).reviewRewrite, true);
+    assert.equal(store.get(run.id).status, 'queued');
+    assert.equal(store.get(run.id).review_rewrite, 1);
+    store.update(run.id, { status: 'running' }); store.beginPublish(run, { title: 'daily' }, []);
+    store.update(run.id, { status: 'needs_review' });
+    assert.equal(store.retry(run.id).reviewRewrite, false);
+    assert.equal(store.get(run.id).status, 'publishing');
+    assert.equal(store.get(run.id).review_rewrite, 1);
+    store.rejectPublish(run.id);
+    store.update(run.id, { status: 'needs_review' });
+    assert.equal(store.retry(run.id).reviewRewrite, true);
+    assert.equal(store.get(run.id).status, 'queued');
+    assert.equal(store.get(run.id).review_rewrite, 2);
+    assert.equal(store.operation(run.id), undefined);
+    store.recover();
+    assert.equal(store.get(run.id).review_rewrite, 2);
+    assert.throws(() => store.update(run.id, { review_rewrite: -1 }), /非法审稿重写次数/);
+  } finally { if (legacy?.open) legacy.close(); store?.close(); fixture.close(); }
 });
 
 test('daily retry is bounded, delays one and five minutes, and never redispatches an operation', () => {

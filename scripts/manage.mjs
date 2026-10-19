@@ -78,7 +78,10 @@ try {
     if (command === 'status') console.log(JSON.stringify(store.list(), null, 2));
     else if (command === 'retry') {
       if (!args[0]) throw new Error('用法：npm run retry -- <任务 ID>（先停止服务）');
-      store.retry(args[0]); console.log('已重新入队；请启动服务，结果不明的上传只进行核对。');
+      const result = store.retry(args[0]);
+      console.log(result.reviewRewrite
+        ? '已重新入队，将按审稿拒绝原因重写未通过核验的正文并重新审稿。'
+        : '已重新入队；请启动服务，结果不明的上传只进行核对。');
     } else if (command === 'preview') {
       if (!args[0]) throw new Error('用法：npm run preview -- <本地 Markdown 文件>');
       const dir = path.join(config.dataDir, 'previews', crypto.randomUUID()); assertProjectPath(config.root, dir); fs.mkdirSync(dir, { recursive: true });

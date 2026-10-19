@@ -24,17 +24,38 @@ export function dailyContext(run) {
     windowStart: context.windowStart, supplementStart: context.supplementStart, isCatchup: Boolean(context.isCatchup) };
 }
 
-function blocked(message, { sources = false, needsInput = false } = {}) {
-  const error = new Error(message);
+function blocked(message, { sources = false, needsInput = false, cause } = {}) {
+  const error = new Error(message, cause ? { cause } : undefined);
   error.code = sources ? 'DAILY_SOURCES_UNAVAILABLE' : 'DAILY_FACTS_UNVERIFIED';
   error.retryable = sources;
   if (needsInput) error.needsInput = true; else if (!sources) error.needsReview = true;
   return error;
 }
 
+const TRANSIENT_MODEL_CODES = ['MODEL_TRANSIENT', 'MODEL_TIMEOUT', 'CODEX_TIMEOUT', 'CODEX_NETWORK', 'CODEX_INCOMPLETE', 'CODEX_EMPTY',
+  'ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'EAI_AGAIN', 'ENETUNREACH', 'EPIPE', 'ECONNABORTED'];
+const AUTH_MODEL_CODES = ['CODEX_AUTH', 'CODEX_QUOTA', 'CODEX_CONFIG', 'CODEX_MODEL_UNAVAILABLE'];
+const FACT_GATE = /证据卡引用无法|证据卡数值|证据卡有效定位事实不足|结构化结果|定位核验/;
+
+function publicErrorCode(error) {
+  const code = String(error?.code || 'UNKNOWN').replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 80);
+  return code || 'UNKNOWN';
+}
+
+function modelAuthOrQuota(error) {
+  return AUTH_MODEL_CODES.includes(error?.code);
+}
+
+// Network, timeout, and interrupted Codex streams are safe to retry. Auth and quota need a person.
 function modelTransient(error) {
-  return ['MODEL_TRANSIENT', 'ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'EAI_AGAIN'].includes(error.code)
-    || error.name === 'TimeoutError' || /DeepSeek HTTP (?:429|500|502|503|504)|请求超时|下载超时|fetch failed|socket hang up/i.test(error.message || '');
+  if (modelAuthOrQuota(error)) return false;
+  if (TRANSIENT_MODEL_CODES.includes(error?.code)) return true;
+  if (['SIGTERM', 'SIGPIPE', 'SIGHUP'].includes(error?.exitSignal) || error?.reason === 'timeout') return true;
+  return error?.name === 'TimeoutError' || /DeepSeek HTTP (?:429|500|502|503|504)|请求超时|下载超时|fetch failed|socket hang up/i.test(error?.message || '');
+}
+
+function boundedModelDetail(error) {
+  return String(error?.message || '未知错误').replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 180) || '未知错误';
 }
 
 function noUpdatesArticle(context, health) {
@@ -168,8 +189,10 @@ export async function runDailyResearch({ run, config, store, workDir, model, sig
         emit({ stage: 'daily.evidence-card', cacheHit: false, count: 1 });
       } catch (error) {
         signal?.throwIfAborted();
-        if (modelTransient(error)) throw blocked('证据提取模型暂时不可用，已保存原文等待重试', { sources: true });
-        if (!/证据卡引用无法|证据卡数值|证据卡有效定位事实不足|结构化结果|定位核验/.test(error.message || '')) throw blocked('证据提取未完成，已保存原文；需要检查模型连接或响应');
+        const code = publicErrorCode(error);
+        if (modelTransient(error)) throw blocked(`证据提取模型暂时不可用（${code}），已保存原文等待重试`, { sources: true, cause: error });
+        if (modelAuthOrQuota(error)) throw blocked(`证据提取未完成（${code}）：${boundedModelDetail(error)}；已保存原文`, { cause: error });
+        if (!FACT_GATE.test(error.message || '')) throw blocked(`证据提取未完成（${code}）：${boundedModelDetail(error)}；已保存原文；需要检查模型连接或响应`, { cause: error });
         checkpoint.documents[key].factFailure = true;
         // Store only fixed deterministic gate diagnostics, never model JSON or
         // arbitrary network error messages that may contain credentials.

@@ -188,12 +188,74 @@ test('temporary model interruption preserves raw documents and resumes remaining
     return initialExtract(args);
   };
   try {
-    await assert.rejects(runDailyResearch(f.args), error => error.retryable === true);
+    await assert.rejects(runDailyResearch(f.args), error => error.retryable === true && /MODEL_TRANSIENT/.test(error.message));
     const saved = JSON.parse(fs.readFileSync(path.join(f.args.workDir, 'research-trace.json')));
     assert.equal(saved.cards.length, 1); assert.equal(Object.values(saved.documents).some(value => value.factFailure), false);
     const artifact = await runDailyResearch(f.args);
     assert.equal(f.stats.collect, 1); assert.equal(f.stats.read, 2); assert.equal(artifact.evidenceCards.length, 2);
   } finally { f.close(); }
+});
+
+test('CODEX_NETWORK timeout keeps the saved document and is retryable instead of needs_review', async () => {
+  const f = fixture(1), initialExtract = f.args.extract; let attempts = 0;
+  f.args.extract = async args => {
+    attempts += 1;
+    if (attempts === 1) {
+      const error = new Error('Codex 网络或流中断，已保存进度；请重试');
+      error.code = 'CODEX_NETWORK'; error.reason = 'timeout'; error.exitSignal = 'SIGTERM';
+      error.reconnectNotices = 4; error.finalReceived = false;
+      throw error;
+    }
+    return initialExtract(args);
+  };
+  try {
+    await assert.rejects(runDailyResearch(f.args), error => {
+      assert.equal(error.code, 'DAILY_SOURCES_UNAVAILABLE');
+      assert.equal(error.retryable, true);
+      assert.equal(error.needsReview, undefined);
+      assert.match(error.message, /证据提取模型暂时不可用（CODEX_NETWORK）/);
+      assert.equal(error.cause.code, 'CODEX_NETWORK');
+      assert.equal(error.cause.exitSignal, 'SIGTERM');
+      return true;
+    });
+    const saved = JSON.parse(fs.readFileSync(path.join(f.args.workDir, 'research-trace.json')));
+    assert.equal(saved.cards.length, 0);
+    assert.equal(Object.values(saved.documents).length, 1);
+    assert.equal(Object.values(saved.documents).some(value => value.document), true);
+    assert.equal(Object.values(saved.documents).some(value => value.factFailure), false);
+    const reads = f.stats.read;
+    const artifact = await runDailyResearch(f.args);
+    assert.equal(f.stats.read, reads, 'retry reuses the saved document');
+    assert.equal(attempts, 2);
+    assert.equal(f.stats.extract, 1);
+    assert.equal(artifact.evidenceCards.length, 1);
+  } finally { f.close(); }
+});
+
+test('evidence extraction retries stream interruptions and surfaces auth or unknown codes', async () => {
+  for (const [code, message, retryable, needsReview, pattern] of [
+    ['CODEX_TIMEOUT', 'Codex 调用超时，已保存进度；请手动重试', true, false, /证据提取模型暂时不可用（CODEX_TIMEOUT）/],
+    ['CODEX_EMPTY', 'Codex 返回空白或不合格的正文，已停止任务', true, false, /证据提取模型暂时不可用（CODEX_EMPTY）/],
+    ['CODEX_INCOMPLETE', 'Codex 未完整完成回复，已停止任务', true, false, /证据提取模型暂时不可用（CODEX_INCOMPLETE）/],
+    ['CODEX_AUTH', 'Codex ChatGPT 登录不可用；请恢复本机登录后重试', false, true, /证据提取未完成（CODEX_AUTH）：Codex ChatGPT 登录不可用/],
+    ['CODEX_QUOTA', 'Codex 订阅额度或速率限制，已保存进度；恢复后请手动重试', false, true, /证据提取未完成（CODEX_QUOTA）/],
+    ['WEIRD_CODE', 'unexpected socket failure', false, true, /证据提取未完成（WEIRD_CODE）：unexpected socket failure/],
+  ]) {
+    const f = fixture(1);
+    f.args.extract = async () => { const error = new Error(message); error.code = code; throw error; };
+    try {
+      await assert.rejects(runDailyResearch(f.args), error => {
+        assert.match(error.message, pattern);
+        assert.equal(error.retryable, retryable);
+        assert.equal(Boolean(error.needsReview), needsReview);
+        assert.equal(error.code, retryable ? 'DAILY_SOURCES_UNAVAILABLE' : 'DAILY_FACTS_UNVERIFIED');
+        const saved = JSON.parse(fs.readFileSync(path.join(f.args.workDir, 'research-trace.json')));
+        assert.equal(Object.values(saved.documents).some(value => value.document), true);
+        assert.equal(Object.values(saved.documents).some(value => value.factFailure), false);
+        return true;
+      });
+    } finally { f.close(); }
+  }
 });
 
 test('fact audit grants only one rewrite, then blocks a still unsupported article', async () => {

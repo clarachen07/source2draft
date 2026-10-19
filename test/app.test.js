@@ -100,10 +100,10 @@ test('DeepSeek uses official thinking parameters and rejects truncation before p
   assert.equal(calls[0].body.response_format.type, 'json_object');
 });
 
-test('model repairs invalid JSON once, then fails closed', async () => {
+test('model repairs invalid JSON twice, then fails closed', async () => {
   let count = 0;
   const model = createModel(config(), { fetchFn: async () => { count++; return Response.json({ choices: [{ finish_reason: 'stop', message: { content: '{}' } }] }); } });
-  await assert.rejects(model.json({ prompt: 'return JSON', validate: o => !!o.title }), /连续两次/); assert.equal(count, 2);
+  await assert.rejects(model.json({ prompt: 'return JSON', validate: o => !!o.title }), /连续三次/); assert.equal(count, 3);
 });
 
 test('translation is explicit, URLs do not route; ambiguous PDF attachments request clarification', () => {

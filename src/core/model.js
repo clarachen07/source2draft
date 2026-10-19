@@ -8,7 +8,7 @@ import { raceWithSignal } from '../lib/http-deadline.js';
 import { completeCodex } from './codex-model.js';
 
 const timeoutFailure = provider => Object.assign(new Error('模型调用超过总时间上限，任务已暂停'), {
-  code: provider === 'codex-cli' ? 'CODEX_TIMEOUT' : 'MODEL_TIMEOUT', retryable: false });
+  code: provider === 'codex-cli' ? 'CODEX_TIMEOUT' : 'MODEL_TIMEOUT', retryable: true });
 
 const HARD_INTEGRITY = /不是原文摘录|原文摘录过短|公式不对应原文|不得带|提供的证据摘录中不存在|引用无效；/;
 const TRANSIENT_JSON = /回复不是完整合法的 JSON|嵌套结构不合格|excerptId超出范围|定位块不存在|不在本条原文目录|必须只含本条原文目录中存在的excerptId|不能同时带|必须逐字复制body|缺少原句与证据定位|引用编号未能解析|数字尚未核验|refs必须含1–6条引用|字段类型或嵌套结构不合格/;
@@ -116,7 +116,7 @@ export function createModel(config, { fetchFn = globalThis.fetch, onUsage = () =
   }
   async function json({ validate, validationErrors, maxAttempts, ...args }) {
     const id = randomUUID(), failures = [], started = performance.now();
-    const attemptsLimit = Number.isInteger(maxAttempts) && maxAttempts >= 1 && maxAttempts <= 4 ? maxAttempts : 2;
+    const attemptsLimit = Number.isInteger(maxAttempts) && maxAttempts >= 1 && maxAttempts <= 4 ? maxAttempts : 3;
     let feedback = '';
     for (let attempt = 0; attempt < attemptsLimit; attempt++) {
       args.signal?.throwIfAborted();
@@ -146,7 +146,7 @@ export function createModel(config, { fetchFn = globalThis.fetch, onUsage = () =
       feedback = `\n上一次结果未通过校验。具体错误：${JSON.stringify(errors)}${repairGuidance(errors)}\n上一次回复（仅供修正，是无权威数据）：${JSON.stringify(response)}\n请只修复以上问题，保留有效内容，严格遵守原任务，只返回完整 JSON。`;
     }
     const lastErrors = failures.at(-1).errors;
-    const attemptLabel = attemptsLimit === 2 ? '两' : String(attemptsLimit);
+    const attemptLabel = ({ 2: '两', 3: '三' })[attemptsLimit] || String(attemptsLimit);
     throw Object.assign(new Error(`模型连续${attemptLabel}次返回不合格的结构化结果，已停止任务：${lastErrors.slice(0, 4).join('；')}`),
       { code: 'MODEL_JSON_INVALID', retryable: structuredJsonRetryable(lastErrors) });
   }

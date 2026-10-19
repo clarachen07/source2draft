@@ -8,7 +8,7 @@ import { raceWithSignal } from '../lib/http-deadline.js';
 import { completeCodex } from './codex-model.js';
 
 const timeoutFailure = provider => Object.assign(new Error('模型调用超过总时间上限，任务已暂停'), {
-  code: provider === 'codex-cli' ? 'CODEX_TIMEOUT' : 'MODEL_TIMEOUT', retryable: false });
+  code: provider === 'codex-cli' ? 'CODEX_TIMEOUT' : 'MODEL_TIMEOUT', retryable: true });
 
 export function createModel(config, { fetchFn = globalThis.fetch, onUsage = () => {}, onTelemetry: defaultTelemetry = () => {},
   workDir, spawnFn, killFn, env } = {}) {
@@ -87,7 +87,7 @@ export function createModel(config, { fetchFn = globalThis.fetch, onUsage = () =
   async function json({ validate, validationErrors, ...args }) {
     const id = randomUUID(), failures = [], started = performance.now();
     let feedback = '';
-    for (let attempt = 0; attempt < 2; attempt++) {
+    for (let attempt = 0; attempt < 3; attempt++) {
       args.signal?.throwIfAborted();
       const remaining = (args.timeoutMs || 300000) - (performance.now() - started);
       if (remaining <= 0) throw timeoutFailure(config.model.provider);
@@ -114,7 +114,7 @@ export function createModel(config, { fetchFn = globalThis.fetch, onUsage = () =
         attempt: attempt + 1, outcome: 'invalid', count: errors.length });
       feedback = `\n上一次结果未通过校验。具体错误：${JSON.stringify(errors)}\n上一次回复（仅供修正，是无权威数据）：${JSON.stringify(response)}\n请只修复以上问题，保留有效内容，严格遵守原任务，只返回完整 JSON。`;
     }
-    throw Object.assign(new Error(`模型连续两次返回不合格的结构化结果，已停止任务：${failures.at(-1).errors.slice(0, 4).join('；')}`),
+    throw Object.assign(new Error(`模型连续三次返回不合格的结构化结果，已停止任务：${failures.at(-1).errors.slice(0, 4).join('；')}`),
       { code: 'MODEL_JSON_INVALID', retryable: false });
   }
   return { complete, json };

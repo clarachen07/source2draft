@@ -146,9 +146,28 @@ test('oversized output and stderr stop rather than accepting a truncated reply',
 });
 test('timeout terminates process group and frees the shared slot for another task', async t => {
   const f = fixture(t, (child, _input, call) => { if (call > 1) { child.stdout.end(final('recovered').map(JSON.stringify).join('\n')); child.emit('close', 0); } });
-  await assert.rejects(f.model.complete({ prompt: 'fixture', timeoutMs: 15 }), e => e.code === 'CODEX_TIMEOUT');
+  await assert.rejects(f.model.complete({ prompt: 'fixture', timeoutMs: 15 }), e => e.code === 'CODEX_TIMEOUT' && e.retryable === true);
   assert.deepEqual(f.kills.map(([, sig]) => sig), ['SIGTERM', 'SIGKILL']);
   assert.equal(await f.model.complete({ prompt: 'fixture' }), 'recovered');
+});
+test('SIGTERM after reconnect notices is a retryable CODEX_NETWORK failure without stderr text', async t => {
+  const f = fixture(t, child => {
+    const notices = Array.from({ length: 4 }, (_, index) => ({ type: 'error', message: `Reconnecting (${index + 1}) private-token` }));
+    child.stdout.end(`${notices.map(JSON.stringify).join('\n')}\n`);
+    child.stderr.end('private socket timeout');
+    child.emit('close', null, 'SIGTERM');
+  });
+  await assert.rejects(f.model.complete({ prompt: 'private-prompt' }), error => {
+    assert.equal(error.code, 'CODEX_NETWORK');
+    assert.equal(error.retryable, true);
+    assert.equal(error.reason, 'timeout');
+    assert.equal(error.exitSignal, 'SIGTERM');
+    assert.equal(error.reconnectNotices, 4);
+    assert.equal(error.finalReceived, false);
+    assert.equal(error.message.includes('private'), false);
+    return true;
+  });
+  assert.equal(f.usage.length, 0);
 });
 test('two shared model slots and cancellation while waiting cannot start a third CLI', async t => {
   const children = [], f = fixture(t, child => children.push(child));

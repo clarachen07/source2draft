@@ -17,13 +17,24 @@ export function codexEnvironment(env = process.env) {
   return Object.fromEntries(['HOME', 'PATH', 'TMPDIR', 'LANG', 'LC_ALL', 'CODEX_HOME', 'HTTPS_PROXY', 'HTTP_PROXY',
     'ALL_PROXY', 'NO_PROXY'].filter(key => env[key]).map(key => [key, env[key]]));
 }
-function failure(code, message) { return Object.assign(new Error(message), { code, retryable: false }); }
-function classify(text) {
-  if (/model metadata.*not found|model_catalog_json/i.test(text)) return failure('CODEX_CONFIG', 'Codex CLI 模型元数据不兼容，已停止任务；请检查项目模型目录');
-  if (/loading config|configuration|config\.toml|reserved built-in/i.test(text)) return failure('CODEX_CONFIG', 'Codex CLI 调用配置不兼容，已停止任务；不会修改全局配置');
-  if (/usage.?limit|quota|rate.?limit|credits?|too many requests|额度/i.test(text)) return failure('CODEX_QUOTA', 'Codex 订阅额度或速率限制，已保存进度；恢复后请手动重试');
-  if (/unauthorized|not logged|authentication|sign.?in|login|token.*expir|401/i.test(text)) return failure('CODEX_AUTH', 'Codex ChatGPT 登录不可用；请恢复本机登录后重试');
-  if (/model.*(?:not supported|not available|unsupported|unavailable)|unsupported.*model|not.*supported.*model/i.test(text)) return failure('CODEX_MODEL_UNAVAILABLE', 'Codex 服务拒绝所选模型，已保存进度；请确认账号支持该模型');
+function failure(code, message, retryable = false) { return Object.assign(new Error(message), { code, retryable }); }
+const NETWORK_TEXT = /(?:\b(?:timeout|timed out|ETIMEDOUT|ECONNRESET|ECONNREFUSED|ENETUNREACH|EAI_AGAIN|EPIPE|ECONNABORTED)\b|socket hang up|fetch failed|reconnecting|reconnect|network error|connection (?:reset|refused|closed|lost|aborted)|stream (?:closed|reset|interrupted|error))/i;
+function networkFailure({ reason, exitSignal = null, reconnectNotices = 0, finalReceived = false } = {}) {
+  return Object.assign(failure('CODEX_NETWORK', 'Codex 网络或流中断，已保存进度；请重试', true), {
+    reason, exitSignal, reconnectNotices, finalReceived,
+  });
+}
+function classify(text, { signal = null, reconnectNotices = 0, finalReceived = false } = {}) {
+  const body = String(text || '');
+  if (/model metadata.*not found|model_catalog_json/i.test(body)) return failure('CODEX_CONFIG', 'Codex CLI 模型元数据不兼容，已停止任务；请检查项目模型目录');
+  if (/loading config|configuration|config\.toml|reserved built-in/i.test(body)) return failure('CODEX_CONFIG', 'Codex CLI 调用配置不兼容，已停止任务；不会修改全局配置');
+  if (/usage.?limit|quota|rate.?limit|credits?|too many requests|额度/i.test(body)) return failure('CODEX_QUOTA', 'Codex 订阅额度或速率限制，已保存进度；恢复后请手动重试');
+  if (/unauthorized|not logged|authentication|sign.?in|login|token.*expir|401/i.test(body)) return failure('CODEX_AUTH', 'Codex ChatGPT 登录不可用；请恢复本机登录后重试');
+  if (/model.*(?:not supported|not available|unsupported|unavailable)|unsupported.*model|not.*supported.*model/i.test(body)) return failure('CODEX_MODEL_UNAVAILABLE', 'Codex 服务拒绝所选模型，已保存进度；请确认账号支持该模型');
+  if (signal === 'SIGTERM' || signal === 'SIGPIPE' || signal === 'SIGHUP' || NETWORK_TEXT.test(body)) {
+    const reason = signal === 'SIGTERM' || /timeout|timed out|ETIMEDOUT/i.test(body) ? 'timeout' : 'stream-interrupt';
+    return networkFailure({ reason, exitSignal: signal, reconnectNotices, finalReceived });
+  }
   return failure('CODEX_CALL_FAILED', 'Codex CLI 调用失败，已保存进度；不会自动回退其它模型');
 }
 export function codexArguments({ model, effort, dir, schemaPath, timeoutMs, systemPrompt, nativeSchema = false }) {
@@ -61,7 +72,8 @@ export async function completeCodex({ config, workDir, prompt, systemPrompt, res
   const record = stage => emitTelemetry(onTelemetry, { stage, durationMs: performance.now() - startedAt });
   return new Promise((resolve, reject) => {
     let child, timer, killTimer, buffer = '', stdoutBytes = 0, stderrBytes = 0, stderr = '', error,
-      completed = false, started = false, closed = false, finalText, finalUsage;
+      completed = false, started = false, closed = false, finalText, finalUsage, reconnectNotices = 0;
+    const eventText = event => [event?.message, event?.error?.message, event?.item?.message].filter(value => typeof value === 'string').join('\n');
     const stop = problem => {
       if (error) return;
       error = problem;
@@ -79,15 +91,22 @@ export async function completeCodex({ config, workDir, prompt, systemPrompt, res
       if (!event || typeof event !== 'object' || Array.isArray(event) || typeof event.type !== 'string') {
         stop(failure('CODEX_PROTOCOL', 'Codex 返回了无效的事件结构')); return;
       }
+      const text = eventText(event);
+      // Reconnect notices are not a finished turn. Count them and wait for the process exit.
+      if (/reconnect/i.test(text) && !/unauthorized|not logged|authentication|usage.?limit|quota|rate.?limit|credits?|额度/i.test(text)) {
+        reconnectNotices += 1; return;
+      }
       if (event.type === 'turn.started') { started = true; record('codex.turn'); }
-      if (event.type === 'turn.failed' || event.type === 'error') { stop(classify(JSON.stringify(event))); return; }
+      if (event.type === 'turn.failed' || event.type === 'error') {
+        stop(classify(text || JSON.stringify(event), { reconnectNotices, finalReceived: false })); return;
+      }
       if (event.type?.startsWith('item.') && event.item) {
         if (event.item.type === 'error') {
           // CLI 0.148 reports an intentionally disabled code-mode host before
           // turn.started. It is a capability notice, not a failed model turn.
           if (!started && event.item.message?.startsWith('Code Mode is unavailable because code-mode host is disabled.')
             && event.item.message.includes('fail closed')) return;
-          stop(classify(event.item.message || JSON.stringify(event.item.error || {}))); return;
+          stop(classify(event.item.message || JSON.stringify(event.item.error || {}), { reconnectNotices, finalReceived: false })); return;
         }
         if (!['agent_message', 'reasoning'].includes(event.item.type)) { stop(failure('CODEX_TOOL_ATTEMPT', 'Codex 尝试了文本任务以外的操作，已停止')); return; }
         if (event.type === 'item.completed' && event.item.type === 'agent_message'
@@ -105,7 +124,7 @@ export async function completeCodex({ config, workDir, prompt, systemPrompt, res
     record('codex.spawn');
     signal?.addEventListener('abort', abort, { once: true });
     if (signal?.aborted) abort();
-    timer = setTimeout(() => stop(failure('CODEX_TIMEOUT', 'Codex 调用超时，已保存进度；请手动重试')), timeoutMs);
+    timer = setTimeout(() => stop(failure('CODEX_TIMEOUT', 'Codex 调用超时，已保存进度；请手动重试', true)), timeoutMs);
     child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
     child.stdout.on('data', chunk => {
       stdoutBytes += Buffer.byteLength(chunk);
@@ -121,14 +140,22 @@ export async function completeCodex({ config, workDir, prompt, systemPrompt, res
     });
     child.stdin.on('error', () => { /* Exit handler reports transport failure without raw error output. */ });
     child.on('error', () => stop(failure('CODEX_CLI_UNAVAILABLE', '无法启动 Codex CLI；请检查路径和权限')));
-    child.on('close', code => {
+    child.on('close', (code, exitSignal) => {
       closed = true; record('codex.close');
       if (error && child.pid) { try { killFn(child.pid, 'SIGKILL'); } catch { /* Group already exited. */ } }
       clearTimeout(timer); clearTimeout(killTimer); signal?.removeEventListener('abort', abort);
       parseLine(buffer);
       if (error) { reject(error); return; }
-      if (code !== 0) { reject(classify(stderr)); return; }
-      if (!completed || typeof finalText !== 'string') { reject(failure('CODEX_INCOMPLETE', 'Codex 未完整完成回复，已停止任务')); return; }
+      const reportedSignal = typeof exitSignal === 'string' ? exitSignal : null;
+      const notices = Math.min(99, reconnectNotices + (stderr.match(/reconnect/gi) || []).length);
+      const finalReceived = completed && typeof finalText === 'string';
+      if (code !== 0 || reportedSignal) {
+        reject(classify(stderr, { signal: reportedSignal, reconnectNotices: notices, finalReceived })); return;
+      }
+      if (!finalReceived) {
+        reject(notices ? networkFailure({ reason: 'stream-interrupt', reconnectNotices: notices, finalReceived: false })
+          : failure('CODEX_INCOMPLETE', 'Codex 未完整完成回复，已停止任务')); return;
+      }
       let envelope;
       try { envelope = JSON.parse(finalText); } catch { reject(failure('CODEX_PROTOCOL', 'Codex 最终回复不符合输出结构')); return; }
       if (nativeSchema) {

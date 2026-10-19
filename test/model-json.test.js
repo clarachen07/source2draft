@@ -39,17 +39,17 @@ test('daily item repair receives actual character count and prior response, then
   assert.equal(f.events.filter(event => event.stage === 'model.validation').length, 1);
 });
 
-test('exhausted structured repair retains both failures and reports a specific non-retryable error', async t => {
+test('exhausted structured repair retains all failures and reports a specific non-retryable error', async t => {
   const invalid = { ...item, claims: [{ sentence: '正文没有这句话。', refs: [{ cardId: 'C99', locatorId: 'L1', quote: 'invented' }] }] };
-  const f = fixture(t, [JSON.stringify(invalid), JSON.stringify(invalid)]);
+  const f = fixture(t, [JSON.stringify(invalid), JSON.stringify(invalid), JSON.stringify(invalid)]);
   const errors = value => dailyItemErrors(value, assigned, cards);
   await assert.rejects(f.model.json({ prompt: 'JSON', validate: value => !errors(value).length, validationErrors: errors }), error => {
     assert.equal(error.code, 'MODEL_JSON_INVALID'); assert.equal(error.retryable, false);
-    assert.match(error.message, /claims\[0\]\.sentence/); assert.match(error.message, /refs\[0\]/); return true;
+    assert.match(error.message, /连续三次/); assert.match(error.message, /claims\[0\]\.sentence/); assert.match(error.message, /refs\[0\]/); return true;
   });
-  assert.equal(f.requests.length, 2);
+  assert.equal(f.requests.length, 3);
   const diagnostic = JSON.parse(fs.readFileSync(path.join(f.dir, 'model-json-failures', fs.readdirSync(path.join(f.dir, 'model-json-failures'))[0])));
-  assert.equal(diagnostic.failures.length, 2);
+  assert.equal(diagnostic.failures.length, 3);
 });
 
 test('JSON syntax diagnostics and repair context redact credentials without storing the original prompt', async t => {
@@ -92,13 +92,13 @@ test('technical code editing does not waste the single JSON correction needed fo
   assert.equal(corrected.body, sentence);
 });
 
-test('persistent narrator roles still stop after two responses and receive actionable style feedback', async t => {
+test('persistent narrator roles still stop after three responses and receive actionable style feedback', async t => {
   const invalid = { ...item, body: '编辑认为需要验证，代码编辑本身不足以证明收益。' };
-  const f = fixture(t, [JSON.stringify(invalid), JSON.stringify(invalid)]);
+  const f = fixture(t, [JSON.stringify(invalid), JSON.stringify(invalid), JSON.stringify(invalid)]);
   const errors = value => dailyItemErrors(value, assigned, cards);
   await assert.rejects(f.model.json({ prompt: '写本条JSON', validate: value => !errors(value).length, validationErrors: errors }),
-    error => error.code === 'MODEL_JSON_INVALID' && /命中表达=.*编辑认为/.test(error.message));
-  assert.equal(f.requests.length, 2);
+    error => error.code === 'MODEL_JSON_INVALID' && /命中表达=.*编辑认为/.test(error.message) && /连续三次/.test(error.message));
+  assert.equal(f.requests.length, 3);
   assert.match(f.requests[1].messages[1].content, /保留技术术语和研究事实/);
 });
 

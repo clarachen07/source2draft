@@ -123,6 +123,25 @@ test('daily factual review failure never reaches rendering or draft creation', a
   } finally { await f.close(); }
 });
 
+test('evidence CODEX_NETWORK stays retryable and the Slack notice keeps the model code', async () => {
+  const f = fixture({ dailyResearch: async () => {
+    const cause = Object.assign(new Error('Codex 网络或流中断，已保存进度；请重试'), {
+      code: 'CODEX_NETWORK', retryable: true, reason: 'timeout', exitSignal: 'SIGTERM', reconnectNotices: 4, finalReceived: false });
+    throw Object.assign(new Error('证据提取模型暂时不可用（CODEX_NETWORK），已保存原文等待重试', { cause }), {
+      code: 'DAILY_SOURCES_UNAVAILABLE', retryable: true });
+  } });
+  try {
+    const run = f.daily(); await f.engine.execute(run);
+    const saved = f.store.get(run.id);
+    assert.equal(saved.status, 'failed');
+    assert.equal(saved.retryable, 1);
+    assert.equal(saved.error_code, 'DAILY_SOURCES_UNAVAILABLE');
+    const notice = f.store.notices().find(item => item.run_id === run.id);
+    assert.match(notice.text, /^任务失败：证据提取模型暂时不可用（CODEX_NETWORK）/);
+    assert.doesNotMatch(notice.text, /需要核对|证据提取未完成，已保存原文；需要检查模型连接或响应/);
+  } finally { await f.close(); }
+});
+
 test('transient daily errors preserve a retryable code without permitting ambiguous writes', async () => {
   const f = fixture({ dailyResearch: async () => {
     const error = new Error('临时模型不可用'); error.code = 'MODEL_TRANSIENT'; error.retryable = true; throw error;

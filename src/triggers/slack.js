@@ -74,6 +74,7 @@ export async function createSlack({ config, store, engine, now = () => Date.now(
   const clientOptions = { retryConfig: { retries: 0 }, rejectRateLimitedCalls: true, timeout: 20000 };
   let app, auth, receive, connecting, flushing, stopping = false, connected = false, attempts = 0, nextAttemptAt = 0;
   const reconcileAfter = new Map();
+  let recoverBlockedReceipts = false;
   function construct() {
     const options = { token: config.slack.botToken, appToken: config.slack.appToken,
       socketMode: true, deferInitialization: true, clientOptions, logger };
@@ -106,7 +107,7 @@ export async function createSlack({ config, store, engine, now = () => Date.now(
           })]);
         } finally { clearTimeout(timeout); }
         if (stopping) { await app.stop(); return; }
-        connected = true; attempts = 0; nextAttemptAt = 0;
+        connected = true; attempts = 0; nextAttemptAt = 0; recoverBlockedReceipts = true;
       } catch (error) {
         connected = false; auth = undefined;
         try { await app?.stop(); } catch { /* A failed connection must not stop the daily worker. */ }
@@ -119,17 +120,20 @@ export async function createSlack({ config, store, engine, now = () => Date.now(
     try { await connecting; } finally { connecting = undefined; }
   }
   async function reconcileRoot(threadKey, state) {
-    if (now() < (reconcileAfter.get(threadKey) || 0)) return false;
+    if (now() < (reconcileAfter.get(threadKey) || 0)) return 'pending';
     reconcileAfter.set(threadKey, now() + 300000);
     const started = Number(state.started_at ?? state.startedAt);
     // This is an operation receipt lookup, never a source of article context.
-    if (!Number.isFinite(started) || started < now() - 48 * 3600000 || state.channel !== config.slack.channel) return false;
+    if (!Number.isFinite(started) || started < now() - 48 * 3600000 || state.channel !== config.slack.channel) return 'needs_review';
     const matches = new Set();
     let cursor, complete = false;
     for (let page = 0; page < 3; page++) {
       const history = await app.client.conversations.history({ channel: config.slack.channel,
         oldest: String((started - 60000) / 1000), latest: String(Math.min(now() + 60000, started + 600000) / 1000),
         inclusive: true, limit: 100, ...(cursor ? { cursor } : {}) });
+      if (history.ok === false || !Array.isArray(history.messages) || typeof history.has_more !== 'boolean') {
+        throw new Error('Slack 通知回执查询没有返回完整结果');
+      }
       for (const message of history.messages || []) {
         if (message.user === auth.user_id && message.bot_id === auth.bot_id && message.ts
           && (!message.thread_ts || message.thread_ts === message.ts) && String(message.text || '').includes(state.marker)) matches.add(message.ts);
@@ -138,15 +142,18 @@ export async function createSlack({ config, store, engine, now = () => Date.now(
       if (!history.has_more) { complete = true; break; }
       if (!cursor) break;
     }
-    if (!complete || matches.size !== 1) return false;
+    // A just-submitted message may not yet be visible. Recheck only its receipt
+    // inside the original bounded window; never repeat the remote write.
+    if (complete && matches.size === 0 && now() < started + 600000) return 'pending';
+    if (!complete || matches.size !== 1) return 'needs_review';
     store.completeNoticeRoot(threadKey, config.slack.channel, [...matches][0]);
-    return true;
+    return 'sent';
   }
   async function sendDailyRoot(item, run) {
     const marker = noticeMarker(item, run);
     const existing = store.getNoticeRootState(run.thread_key);
     const operation = store.beginNoticeRoot({ threadKey: run.thread_key, channel: config.slack.channel, marker: existing?.marker || marker });
-    if (operation.state === 'sent') return true;
+    if (operation.state === 'sent') return 'sent';
     if (operation.started) {
       try {
         const response = await app.client.chat.postMessage({ channel: config.slack.channel,
@@ -155,14 +162,15 @@ export async function createSlack({ config, store, engine, now = () => Date.now(
         store.completeNoticeRoot(run.thread_key, config.slack.channel, response.ts);
         const saved = store.getNoticeRootState(run.thread_key);
         if (saved?.state !== 'sent' || saved.ts !== response.ts) throw new Error('Slack 根通知标识未持久保存');
-        return true;
+        return 'sent';
       } catch (error) {
         store.failNoticeRoot(run.thread_key, { uncertain: true, error: redact(error, config) });
         log(`日报通知需要核对；不会重复发送：${redact(error, config)}`);
       }
     }
     try {
-      if (await reconcileRoot(run.thread_key, store.getNoticeRootState(run.thread_key))) {
+      const receipt = await reconcileRoot(run.thread_key, store.getNoticeRootState(run.thread_key));
+      if (receipt === 'sent') {
         if (operation.marker !== marker) {
           // A newer terminal revision can arrive while an older root receipt
           // needs reconciliation. Its result belongs in the recovered thread.
@@ -170,14 +178,37 @@ export async function createSlack({ config, store, engine, now = () => Date.now(
           await app.client.chat.postMessage({ channel: route.channel, thread_ts: route.thread_ts,
             text: item.text, mrkdwn: false, unfurl_links: false, unfurl_media: false });
         }
-        return true;
+        return 'sent';
       }
-    } catch (error) { log(`日报通知核对暂不可用：${redact(error, config)}`); }
+      if (receipt === 'pending') {
+        store.deferNotice(item.id, reconcileAfter.get(run.thread_key));
+        return 'pending';
+      }
+    } catch (error) {
+      // A failed lookup says nothing about whether the original send succeeded.
+      // Preserve uncertainty, but retry this read after backoff instead of
+      // permanently blocking it as though a complete lookup had found ambiguity.
+      store.failNoticeRoot(run.thread_key, { uncertain: true, error: `回执查询暂不可用：${redact(error, config)}` });
+      store.deferNotice(item.id, now() + Math.max(300000, Math.min(86400000, (Number(error.retryAfter) || 0) * 1000)));
+      log(`日报通知核对暂不可用；仅稍后查询回执：${redact(error, config)}`);
+      return 'pending';
+    }
     store.failNoticeRoot(run.thread_key, { uncertain: true, error: '无法唯一核对已发送的日报通知；需要人工检查，禁止盲目重发' });
-    return false;
+    return 'needs_review';
   }
   async function deliverNotices() {
     try {
+      if (recoverBlockedReceipts) {
+        recoverBlockedReceipts = false;
+        // Older services permanently blocked even temporary receipt failures.
+        // One recovery pass per verified connection reopens only receipt reads.
+        for (const item of store.notices()) {
+          if (item.blocked_reason !== 'root_needs_review') continue;
+          const root = store.getNoticeRootState(item.thread_key);
+          if (root?.channel === config.slack.channel && Number.isFinite(root.started_at)
+            && now() - root.started_at <= 48 * 3600000) store.resumeNoticeReceipt(item.id, now());
+        }
+      }
       for (const item of store.notices({ deliverable: true, now: now() })) {
         if (stopping || !connected) break;
         if (item.thread_key.startsWith('local:')) { store.sent(item.id); continue; }
@@ -203,7 +234,11 @@ export async function createSlack({ config, store, engine, now = () => Date.now(
         }
         try {
           if (daily && !route) {
-            if (!await sendDailyRoot(item, run)) { store.blockNotice?.(item.id, 'root_needs_review'); continue; }
+            const receipt = await sendDailyRoot(item, run);
+            if (receipt !== 'sent') {
+              if (receipt === 'needs_review') store.blockNotice?.(item.id, 'root_needs_review');
+              continue;
+            }
           } else {
             await app.client.chat.postMessage({ channel: route.channel, thread_ts: route.thread_ts, text: item.text,
               mrkdwn: false, unfurl_links: false, unfurl_media: false });

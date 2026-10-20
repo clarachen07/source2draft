@@ -197,6 +197,21 @@ test('transient daily errors preserve a retryable code without permitting ambigu
   } finally { await f.close(); }
 });
 
+test('model failures have timestamped redacted local logs even while Slack is unavailable', async () => {
+  const logs = [];
+  const f = fixture({ log: text => logs.push(text), dailyResearch: async () => {
+    throw Object.assign(new Error('Codex transport failed token=fixture-private'), { code: 'CODEX_NETWORK', retryable: false });
+  } });
+  try {
+    const run = f.daily(); await f.engine.execute(run);
+    assert.equal(f.store.get(run.id).status, 'failed'); assert.equal(f.store.get(run.id).retryable, 0);
+    assert.equal(logs.length, 1); assert.match(logs[0], /^\[\d{4}-\d{2}-\d{2}T/);
+    assert.ok(logs[0].includes(run.id)); assert.match(logs[0], /CODEX_NETWORK/);
+    assert.doesNotMatch(logs[0], /fixture-private/);
+    assert.ok(f.store.notices().some(item => item.kind.startsWith('failed:')));
+  } finally { await f.close(); }
+});
+
 test('daily events are marked delivered only after a verified live draft', async () => {
   const f = fixture({ wechat: { publish: async ({ run, store, prepared }) => {
     store.beginPublish(run, prepared, []); store.remoteCreated(run.id, 'fixture-live-daily');

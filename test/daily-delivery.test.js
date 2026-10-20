@@ -130,6 +130,97 @@ test('ambiguous root recovery remains needs_review and preserves an accepted dra
   } finally { await slack.stop(); f.store.close(); }
 });
 
+test('a temporary receipt lookup failure retries only the read after backoff, including across restart', async () => {
+  const f = fixture(), run = f.daily(); let delivered, lookupFails = true;
+  f.app.client.chat.postMessage = async args => { f.writes.push(args); delivered = args; throw new Error('lost response'); };
+  f.app.client.conversations.history = async args => {
+    f.reads.push(args);
+    if (lookupFails) throw new Error('temporary TLS failure');
+    return { has_more: false, messages: [{ ts: '123.4', user: 'UBOT', bot_id: 'B1', text: delivered.text }] };
+  };
+  let slack = await f.create();
+  try {
+    await slack.tick(); await slack.flush();
+    assert.equal(f.store.getNoticeRootState(run.thread_key).state, 'needs_review');
+    const pending = f.store.notices()[0];
+    assert.equal(pending.blocked_reason, null); assert.ok(pending.due_at > Date.now() + 290000);
+    await slack.stop(); slack = await f.create(); lookupFails = false;
+    await slack.tick(); await slack.flush(); assert.equal(f.reads.length, 1);
+    f.advance(300001); await slack.flush();
+    assert.equal(f.writes.length, 1); assert.equal(f.reads.length, 2);
+    assert.equal(f.store.getNoticeRootState(run.thread_key).ts, '123.4'); assert.equal(f.store.notices().length, 0);
+  } finally { await slack.stop(); f.store.close(); }
+});
+
+test('a verified connection can recover a legacy blocked receipt without another message write', async () => {
+  const f = fixture(), run = f.daily(); let delivered;
+  f.app.client.chat.postMessage = async args => { f.writes.push(args); delivered = args; throw new Error('lost response'); };
+  let slack = await f.create();
+  try {
+    await slack.tick(); await slack.flush();
+    const item = f.store.notices().find(item => item.kind === 'done');
+    // Reproduce the old service's permanent block after a failed receipt read.
+    f.store.blockNotice(item.id, 'root_needs_review');
+    await slack.stop(); slack = await f.create();
+    f.app.client.conversations.history = async args => {
+      f.reads.push(args);
+      return { has_more: false, messages: [{ ts: '123.4', user: 'UBOT', bot_id: 'B1', text: delivered.text }] };
+    };
+    await slack.tick(); await slack.flush();
+    assert.equal(f.store.getNoticeRootState(run.thread_key).ts, '123.4');
+    assert.equal(f.writes.length, 1);
+    assert.equal(f.reads.length, 2); assert.equal(f.store.notices().length, 0);
+  } finally { await slack.stop(); f.store.close(); }
+});
+
+test('expired or foreign-workspace blocked receipts cannot be reopened by reconnection', async () => {
+  for (const expired of [true, false]) {
+    const f = fixture(), run = f.daily();
+    const item = f.store.notices().find(item => item.kind === 'done');
+    f.store.beginNoticeRoot({ threadKey: run.thread_key, channel: expired ? 'C1' : 'C2', marker: 'fixture-marker' });
+    f.store.failNoticeRoot(run.thread_key); f.store.blockNotice(item.id, 'root_needs_review');
+    if (expired) f.advance(48 * 3600000 + 60000);
+    const slack = await f.create();
+    try {
+      await slack.tick(); await slack.flush();
+      assert.equal(f.reads.length, 0); assert.equal(f.writes.length, 0);
+      assert.equal(f.store.notices()[0].blocked_reason, 'root_needs_review');
+    } finally { await slack.stop(); f.store.close(); }
+  }
+});
+
+test('a missing just-sent root gets bounded receipt checks before becoming blocked, never a second send', async () => {
+  const f = fixture(), run = f.daily();
+  f.app.client.chat.postMessage = async args => { f.writes.push(args); throw new Error('lost response'); };
+  const slack = await f.create();
+  try {
+    await slack.tick(); await slack.flush();
+    assert.equal(f.store.getNoticeRootState(run.thread_key).state, 'needs_review');
+    assert.equal(f.store.notices()[0].blocked_reason, null);
+    f.advance(300001); await slack.flush();
+    assert.equal(f.reads.length, 2); assert.equal(f.store.notices()[0].blocked_reason, null);
+    f.advance(300001); await slack.flush();
+    assert.equal(f.reads.length, 3); assert.equal(f.store.notices()[0].blocked_reason, 'root_needs_review');
+    f.advance(300001); await slack.flush();
+    assert.equal(f.reads.length, 3); assert.equal(f.writes.length, 1);
+  } finally { await slack.stop(); f.store.close(); }
+});
+
+test('incomplete receipt responses remain pending and cannot acknowledge or repeat the original send', async () => {
+  for (const response of [{ ok: false }, { messages: [] }, { has_more: false }]) {
+    const f = fixture(), run = f.daily();
+    f.app.client.chat.postMessage = async args => { f.writes.push(args); throw new Error('lost response'); };
+    f.app.client.conversations.history = async args => { f.reads.push(args); return response; };
+    const slack = await f.create();
+    try {
+      await slack.tick(); await slack.flush(); await slack.flush();
+      assert.equal(f.store.getNoticeRootState(run.thread_key).state, 'needs_review');
+      assert.equal(f.store.notices()[0].blocked_reason, null);
+      assert.equal(f.writes.length, 1); assert.equal(f.reads.length, 1);
+    } finally { await slack.stop(); f.store.close(); }
+  }
+});
+
 test('root receipt survives an outbox acknowledgement failure without repeating a root or thread message', async () => {
   const f = fixture(), run = f.daily(), sent = f.store.sent;
   let failAck = true;

@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { JSDOM } from 'jsdom';
 import { Readability } from '@mozilla/readability';
-import { acquireSourceDocument } from '../workflows/source-document.js';
+import { acquireSourceDocument, assertPdfResponse, hasPdfSignature } from '../workflows/source-document.js';
 import { safeFetchResource, sourceDownloadUrl } from '../lib/secure-http.js';
 import { withTaskCancellation } from '../lib/task-cancellation.js';
 import { fetchRetry, writeAtomic } from '../lib/io.js';
@@ -89,15 +89,16 @@ export async function readSource({ url, file, config, workDir, signal, fetchFn =
   fs.mkdirSync(workDir, { recursive: true, mode: 0o700 });
   const sourceUrl = file?.url || url;
   const headers = file ? attachmentHeaders(file, config) : {};
-  if (!file && new URL(sourceUrl).hostname === 'github.com') return githubText(sourceUrl, signal, fetchFn);
+  const pdfHint = /pdf/i.test(file?.mimetype || '') || /\.pdf$/i.test(new URL(sourceUrl).pathname)
+    || /\.pdf$/i.test(file?.name || '');
+  if (!file && !pdfHint && new URL(sourceUrl).hostname === 'github.com') return githubText(sourceUrl, signal, fetchFn);
   const start = performance.now();
   const downloadUrl = sourceDownloadUrl(sourceUrl);
   const fetched = await download(downloadUrl, { signal, headers, fetchFn });
   emitTelemetry(onTelemetry, { stage: 'source_download', count: 1, cacheHit: false, durationMs: Math.round(performance.now() - start) });
-  const isPdf = fetched.buffer.subarray(0, 5).toString() === '%PDF-';
-  const pdfHint = /pdf/i.test(file?.mimetype || '') || /\.pdf(?:[?#]|$)/i.test(file?.name || sourceUrl);
+  const isPdf = hasPdfSignature(fetched.buffer);
   if (isPdf || pdfHint) {
-    if (!isPdf) throw new Error(`PDF 签名不正确：${file?.name || sourceUrl}；请检查 Slack files:read 权限`);
+    assertPdfResponse({ ...fetched, sourceUrl });
     const document = await acquireSourceDocument({ sourceUrl, workDir, requestHeaders: headers,
       config: translationConfig(config), fetchFn: withTaskCancellation(fetchFn, signal), fetchWithRetry: fetchRetry, signal,
       prefetched: { ...fetched, sourceUrl: downloadUrl }, onTelemetry });

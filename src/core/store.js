@@ -416,6 +416,7 @@ function initializeStore(db, { maxQueue, readonly }) {
       ${deliverable && outboxReady ? 'AND blocked_reason IS NULL AND due_at<=?' : ''} ORDER BY id LIMIT 30`)
       .all(...(deliverable && outboxReady ? [now] : [])),
     deferNotice: (id, dueAt) => db.prepare('UPDATE notices SET due_at=? WHERE id=?').run(dueAt, id),
+    resumeNoticeReceipt: (id, dueAt) => db.prepare("UPDATE notices SET blocked_reason=NULL,due_at=? WHERE id=? AND blocked_reason='root_needs_review'").run(dueAt, id),
     blockNotice: (id, reason) => db.prepare('UPDATE notices SET blocked_reason=? WHERE id=?').run(reason, id),
     sent: id => db.prepare('UPDATE notices SET sent_at=? WHERE id=?').run(Date.now(), id),
     close: () => db.close(),

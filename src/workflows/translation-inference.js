@@ -1,4 +1,4 @@
-import { assessTranslationUnit, translationUnits, protectInvariantText, restoreInvariantText } from './translation-validation.js';
+import { assessTranslationUnit, translationUnits, protectInvariantText, restoreInvariantText, descriptiveOrdinalLabels } from './translation-validation.js';
 export { assessTranslationUnit, translationUnits, translatedUnitText } from './translation-validation.js';
 import { mapBounded } from '../lib/bounded-map.js';
 export { mapBounded } from '../lib/bounded-map.js';
@@ -9,6 +9,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { throwIfTaskCancelled } from '../lib/task-cancellation.js';
 import { emitTelemetry } from '../lib/telemetry.js';
+import { exposeTranslationLinkText } from './translation-links.js';
 import { CHECKPOINT_VERSION, TRANSLATION_BATCH_MAX_CHARS, TRANSLATION_BATCH_MAX_ITEMS,
   TRANSLATION_SHORT_UNIT_MAX_ITEMS, TRANSLATION_SHORT_UNIT_AVERAGE_CHARS,
   REPAIR_BATCH_MAX_CHARS, REPAIR_BATCH_MAX_ITEMS } from './translation-config.js';
@@ -19,6 +20,7 @@ export async function translateDocument({ source, workDir, model, writer, fetchF
   resumeFromCheckpoint = false, translationInstructions = '', semanticReview = true, signal,
 }) {
   throwIfTaskCancelled(signal);
+  source = exposeTranslationLinkText(source);
   const originals = translationUnits(source);
   const units = splitLongTranslationUnits(originals);
   if (!units.length) throw new Error('原文没有可翻译的结构化文本');
@@ -39,6 +41,7 @@ export async function translateDocument({ source, workDir, model, writer, fetchF
   const checkpointPath = path.join(workDir, 'translation-checkpoint.json');
   const completed = new Map(), candidates = new Map(), rounds = new Map(), reviews = new Map(), warnings = new Map();
   const identities = new Map();
+  const ordinalRelease = new Set();
   const reviewContext = (unit, text) => ({ ...contexts.get(unit.id),
     sourceHash: source.sha256, instructions: instructionsForUnit(requirements, unit, text, contexts.get(unit.id).neighbors) });
   const isRisk = (unit, text, notes = []) => !(unit.id === 'meta:title' && requirements.title) && translationNeedsReview(unit, text, {
@@ -55,7 +58,15 @@ export async function translateDocument({ source, workDir, model, writer, fetchF
           const assessment = assessTranslationUnit(unit, entry.text, { afterRepair: true });
           if (entry.approved && assessment.hardErrors.length) continue;
           candidates.set(entry.id, entry.text); identities.set(entry.id, entry.identity);
-          rounds.set(entry.id, Math.min(2, Math.max(0, Math.floor(Number(entry.round) || 0))));
+          let round = Math.min(2, Math.max(0, Math.floor(Number(entry.round) || 0)));
+          // A spent round that only restored a frozen ordinal did not repair anything.
+          // Release that one round once; a later identical failure stays paused.
+          if (entry.ordinalRelease === 'spent') ordinalRelease.add(entry.id);
+          else if (!entry.approved && round >= 2 && ordinalDeadlock(unit, entry.text, entry.review?.issues)) {
+            round -= 1;
+            ordinalRelease.add(entry.id);
+          }
+          rounds.set(entry.id, round);
           const reviewValid = Array.isArray(entry.review?.issues) && entry.review.valueHash === hash(entry.review.issues);
           if (reviewValid) reviews.set(entry.id, entry.review);
           if (entry.approved && (!semanticReview || !isRisk(unit, entry.text, assessment.warnings)
@@ -67,7 +78,7 @@ export async function translateDocument({ source, workDir, model, writer, fetchF
         }
         for (const entry of saved.repairRounds || []) {
           const unit = byId.get(entry.id);
-          if (unit && entry.identity === identityFor(unit, candidates.get(unit.id) || '')) {
+          if (unit && !ordinalRelease.has(unit.id) && entry.identity === identityFor(unit, candidates.get(unit.id) || '')) {
             rounds.set(unit.id, Math.max(rounds.get(unit.id) || 0, Math.min(2, Math.max(0, Math.floor(Number(entry.round) || 0)))));
           }
         }
@@ -78,7 +89,8 @@ export async function translateDocument({ source, workDir, model, writer, fetchF
   const persist = () => {
     const started = performance.now();
     const entry = ([id, text]) => ({ id, text, identity: identities.get(id), approved: completed.has(id),
-      round: rounds.get(id) || 0, review: reviews.get(id), warnings: warnings.get(id) || [] });
+      round: rounds.get(id) || 0, review: reviews.get(id), warnings: warnings.get(id) || [],
+      ...(ordinalRelease.has(id) ? { ordinalRelease: 'spent' } : {}) });
     const payload = { version: CHECKPOINT_VERSION, key: checkpointKey,
       translations: [...completed].map(entry), candidates: [...candidates].filter(([id]) => !completed.has(id)).map(entry),
       warnings: [...warnings].map(([id, messages]) => ({ id, messages })), validationExceptions: [],
@@ -214,14 +226,16 @@ export function splitLongTranslationUnits(units, maxChars = TRANSLATION_BATCH_MA
       const boundaries = [...prefix.matchAll(/[.!?。！？;；]\s+|\n|\s+/g)];
       const last = boundaries.filter(match => match.index > maxChars / 2).at(-1);
       let end = last ? last.index + last[0].length : maxChars;
-      const tokenStart = prefix.lastIndexOf('⟦');
-      if (tokenStart > prefix.lastIndexOf('⟧')) end = tokenStart;
+      const crossing = [...remaining.matchAll(/\[[^\[\]\n]+\]\(⟦SL_INLINE_\d{3}⟧\)|⟦SL_INLINE_\d{3}⟧/g)]
+        .find(match => match.index < end && match.index + match[0].length > end);
+      if (crossing) end = crossing.index;
       if (!end) throw qualityFailure('超长单元无法安全拆分，请缩小范围');
       if (/^[\uDC00-\uDFFF]/.test(remaining.slice(end))) end--;
       parts.push(remaining.slice(0, end)); remaining = remaining.slice(end);
     }
     if (remaining) parts.push(remaining);
-    return parts.map((text, index) => ({ ...unit, parentId: unit.id, id: `${unit.id}:part:${index + 1}`, text }));
+    return parts.map((text, index) => ({ ...unit, parentId: unit.id, id: `${unit.id}:part:${index + 1}`, text,
+      ...(unit.fragments ? { fragments: unit.fragments.filter(fragment => text.includes(fragment.token)) } : {}) }));
   });
 }
 
@@ -251,6 +265,9 @@ async function requestTranslationBatch({
       id: unit.id,
       kind: unit.kind,
       text: protectedText.text,
+      sourceText: unit.text,
+      invariants: protectedText.tokens.map((value, index) => ({ token: `⟦SL_KEEP_${index + 1}⟧`, value })),
+      ...(unit.fragments ? { fragments: unit.fragments } : {}),
       currentTranslation: String(unit.currentTranslation || ''),
       issues: Array.isArray(unit.issues) ? unit.issues : [],
       instructions: unit.instructions || '', context: unit.context || {},
@@ -268,13 +285,15 @@ async function requestTranslationBatch({
 - 不添加输入中不存在的图、表、公式、引用、分析或内容概括。
 - 不改变任何数值含义、Ticker、型号、占位符和正文中原有的 URL。数字词可译成等价阿拉伯数字，K/M/B/T、千分位、百分比、万/亿等可使用等价中文写法，但严禁把数值改成不等价值。
 - 金融语境中的 pre-fee 必须译为“费前”或“费用前”，不得译为“税前”；after-fee 或 net of fees 译为“费后”或“扣除费用后”。
-- 所有 ⟦SL_INLINE_NNN⟧ 都是公式、链接或引用占位符，必须原样、原位置、各保留一次。
+- 所有 ⟦SL_INLINE_NNN⟧ 都是公式、链接或引用占位符；fragments 给出其原值。保留原标记、出现次数和语义归属，可随中文语序在同一单元调整位置，不能移到不同实体或命题上。
+- kind 为 link-url 的 fragment 只保护链接地址：[原文文字](占位符) 中的文字必须与句子一起忠实翻译，保留 [译文文字](同一占位符) 的链接结构。相邻链接可按中文语序移动，但不能丢失、留空或交换地址归属。其它公式和引用占位符仍完整保留。
 - 专有名词首次出现可保留英文，普通叙述必须翻译成中文。
 - 段落保持朴素排版；仅在原文强调或用户要求时使用适量加粗，不规定高亮密度。
 - 每处使用 Markdown **加粗**，可包住 2–64 个字符的关键短语或短句，不能把整段全部加粗，也不能改动原意。
-- title、heading、figure_caption、table_caption 禁止添加 **加粗**；除正文高亮外不得添加其它 Markdown 格式。
-${repair ? `- 输入中的 ⟦SL_KEEP_N⟧ 是不可翻译占位符，必须原样、原位置、各保留一次。
+- title、heading、figure_caption、table_caption 禁止添加 **加粗**；除原文链接结构和正文高亮外不得添加其它 Markdown 格式。
+${repair ? `- sourceText 是未遮蔽原文，invariants 给出 ⟦SL_KEEP_N⟧ 的原值。以原文核对数量、范围和实体归属，保留标记的含义、出现次数和归属。
 - 每个单元都包含 currentTranslation 和 issues。只修复 issues 指出的块内问题，不重新发挥、总结或扩写。
+- 普通名词加连字符再加整数是序号，不是型号。issues 若要求与同单元已有译法一致，就改成该中文序数，不要留下英文序号再与中文级别混用。
 - 即使 currentTranslation 为空，也必须根据 text 返回该 ID 的完整译文。` : ''}
 
 文档标题:${source.title}
@@ -457,6 +476,15 @@ function inferenceContextFor({
     ...(parentBatchIndex === undefined ? {} : { parentBatchIndex: parentBatchIndex + 1 }),
     ...(repairRound === undefined ? {} : { repairRound }),
   };
+}
+
+function ordinalDeadlock(unit, text, issues) {
+  const pending = descriptiveOrdinalLabels(unit?.text).filter((token) => String(text || '').includes(token));
+  if (!pending.length || !Array.isArray(issues)) return false;
+  const blob = issues.map((issue) => (typeof issue === 'string'
+    ? issue
+    : `${issue?.reason || ''}\n${issue?.sourceQuote || ''}\n${issue?.translationQuote || ''}`)).join('\n').toLowerCase();
+  return pending.some((token) => blob.includes(token.slice(0, token.indexOf('-')).toLowerCase()));
 }
 
 function batchUnits(units, maxChars, maxItems) {

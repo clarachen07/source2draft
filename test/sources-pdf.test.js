@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import dns from 'node:dns/promises';
 import { spawnSync } from 'node:child_process';
 import { documentText, readSource } from '../src/core/sources.js';
 import { acquireSourceDocument } from '../src/workflows/translation-source-text.js';
@@ -48,6 +49,87 @@ function onePagePdf() {
 }
 
 const hasPoppler = ['pdfinfo', 'pdftotext'].every(name => spawnSync(name, ['-v']).status === 0);
+for (const flow of ['translation', 'analysis']) test(`${flow} GitHub PDF uses secure raw redirects, validates bytes and preserves original attribution`, {
+  skip: hasPoppler ? false : 'PDF integration verification requires Poppler (pdfinfo and pdftotext)',
+}, async t => {
+  const sourceUrl = 'https://github.com/MoonshotAI/Kimi-K3/blob/main/k3_tech_report.pdf?raw=true#page=1';
+  const rawUrl = sourceUrl.replace('/blob/', '/raw/');
+  const finalUrl = 'https://raw.githubusercontent.com/MoonshotAI/Kimi-K3/main/k3_tech_report.pdf';
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'source-github-pdf-'));
+  t.after(() => fs.rmSync(workDir, { recursive: true, force: true }));
+  const hosts = [], requests = [], pdf = onePagePdf();
+  t.mock.method(dns, 'lookup', async host => {
+    hosts.push(host);
+    return [{ address: '93.184.216.34', family: 4 }];
+  });
+  const fetchFn = async (url, options) => {
+    requests.push(url);
+    if (url === rawUrl) {
+      assert.equal(options.redirect, 'manual');
+      if (flow === 'translation') assert.equal(options.headers.Authorization, 'Bearer fixture-token');
+      return new Response(null, { status: 302, headers: { location: finalUrl } });
+    }
+    if (url === finalUrl) {
+      assert.equal(options.redirect, 'manual');
+      assert.equal(options.headers.Authorization, undefined);
+      // Some raw hosts return generic binary MIME. The signature proves PDF.
+      return new Response(pdf, { headers: { 'content-type': 'application/octet-stream' } });
+    }
+    assert.equal(options.headers['X-API-Key'], 'fixture-key');
+    if (url === 'https://www.datalab.to/api/v1/convert') {
+      assert.deepEqual(Buffer.from(await options.body.get('file').arrayBuffer()), pdf);
+      return Response.json({ success: true, request_id: 'github-pdf', request_check_url: 'https://www.datalab.to/api/v1/convert/github-pdf' });
+    }
+    assert.equal(url, 'https://www.datalab.to/api/v1/convert/github-pdf');
+    return Response.json({ status: 'complete', success: true, page_count: 1, parse_quality_score: 4.5, images: {},
+      html: '<div class="page" data-page-id="0"><h1>GitHub PDF fixture</h1><p>A complete source paragraph for PDF acquisition. All source content is present and the original PDF is parsed.</p></div>' });
+  };
+  let document;
+  if (flow === 'analysis') {
+    const source = await readSource({ url: sourceUrl, workDir, fetchFn, config: loadConfig({ DATALAB_API_KEY: 'fixture-key' }) });
+    assert.equal(source.url, sourceUrl);
+    assert.match(source.text, /A complete source paragraph/);
+    document = JSON.parse(fs.readFileSync(path.join(workDir, 'source-document.json'), 'utf8'));
+  } else document = await acquireSourceDocument({ sourceUrl, workDir, fetchFn,
+    requestHeaders: { Authorization: 'Bearer fixture-token' }, config: { datalabApiKey: 'fixture-key', browserEnabled: false } });
+  assert.equal(document.sourceUrl, sourceUrl);
+  assert.equal(document.sourceType, 'pdf');
+  assert.equal(document.pageCount, 1);
+  assert.deepEqual(document.pageCoverage.processedPageIds, [0]);
+  assert.deepEqual(requests, [rawUrl, finalUrl, 'https://www.datalab.to/api/v1/convert', 'https://www.datalab.to/api/v1/convert/github-pdf']);
+  assert.ok(hosts.includes('github.com') && hosts.includes('raw.githubusercontent.com'));
+  assert.ok(document.acquisition.attempts.includes('direct-file-url'));
+  assert.ok(!document.acquisition.attempts.some(attempt => attempt.startsWith('arxiv')));
+});
+
+test('GitHub raw HTML and private redirects fail before PDF parsing in both flows; README still uses text API', async t => {
+  const sourceUrl = 'https://github.com/MoonshotAI/Kimi-K3/blob/main/k3_tech_report.pdf';
+  t.mock.method(dns, 'lookup', async () => [{ address: '93.184.216.34', family: 4 }]);
+  for (const flow of ['translation', 'analysis']) for (const response of ['html', 'private']) {
+    const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'source-github-invalid-'));
+    t.after(() => fs.rmSync(workDir, { recursive: true, force: true }));
+    const requests = [];
+    const fetchFn = async url => {
+      requests.push(url);
+      return response === 'html'
+        ? new Response('<html>File viewer or login</html>', { headers: { 'content-type': 'text/html' } })
+        : new Response(null, { status: 302, headers: { location: 'http://127.0.0.1/report.pdf' } });
+    };
+    const operation = flow === 'analysis' ? readSource({ url: sourceUrl, workDir, fetchFn, config: loadConfig({}) })
+      : acquireSourceDocument({ sourceUrl, workDir, fetchFn, config: { browserEnabled: false } });
+    await assert.rejects(operation, response === 'html' ? /PDF 下载响应不是有效 PDF/ : /私网或保留地址/);
+    assert.deepEqual(requests, [sourceUrl.replace('/blob/', '/raw/')]);
+  }
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'source-github-readme-'));
+  t.after(() => fs.rmSync(workDir, { recursive: true, force: true }));
+  const source = await readSource({ url: 'https://github.com/MoonshotAI/Kimi-K3', workDir, config: loadConfig({}),
+    fetchFn: async url => {
+      assert.equal(url, 'https://api.github.com/repos/MoonshotAI/Kimi-K3/readme');
+      return Response.json({ path: 'README.md', encoding: 'base64', content: Buffer.from('Original README').toString('base64') });
+    } });
+  assert.equal(source.text, 'Original README');
+});
+
 test('analysis PDF reader downloads once through the real acquisition and parser path', {
   skip: hasPoppler ? false : 'PDF integration verification requires Poppler (pdfinfo and pdftotext)',
 }, async () => {

@@ -4,6 +4,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { JSDOM } from 'jsdom';
+import { renderArticleMarkdown } from '../src/lib/article-markdown.js';
+import { applyWechatArticleStyles } from '../src/lib/wechat-render.js';
 import { withTaskCancellation } from '../src/lib/task-cancellation.js';
 import {
   acquireSourceDocument,
@@ -862,6 +864,130 @@ test('Markdown/HTML 直译保留有序列表的原始起始值、显式序号和
       { ordered: true, ordinal: 8, delimiter: '.' },
     ],
   );
+});
+
+test('LaTeXML 列表和图表标记只呈现一次，通用样式保留嵌套、链接、公式与图片', async () => {
+  const source = await sourceDocumentFromHtml({
+    sourceUrl: 'https://example.com/structured-markers',
+    scope: { kind: 'all' },
+    html: `<article class="ltx_document"><h1>Explicit structure markers</h1>
+      <p>${'The article retains its original structure and supplied visual material. '.repeat(4)}</p>
+      <ul><li><span class="ltx_tag ltx_tag_item">•</span>
+        <p>Parent item with <math alttext="x_i"><mi>x</mi></math> and <a href="/detail">a source link</a>.</p>
+        <ul><li><span class="ltx_tag ltx_tag_item">•</span><p>Nested item.</p></li></ul>
+      </li></ul>
+      <ol start="7"><li><span class="ltx_tag ltx_tag_item">7.</span>
+        <p>Seventh item.</p></li></ol>
+      <figure><img src="/chart.png" alt="Source chart"><figcaption>
+        <span class="ltx_tag ltx_tag_figure">Figure 8:</span> Chart result.</figcaption></figure>
+      <table><caption><span class="ltx_tag ltx_tag_table">Table 3:</span> Table result.</caption>
+        <tr><td>Original cell</td></tr></table>
+    </article>`,
+  });
+  const original = structuredClone(source);
+  const translated = structuredClone(source);
+  const items = translated.blocks.filter(block => block.type === 'list_item');
+  assert.deepEqual(items.map(block => [block.ordered, block.ordinal, block.depth]), [
+    [false, undefined, 0], [false, undefined, 1], [true, 7, 0],
+  ]);
+  assert.match(items[0].text, /^•\n/);
+  assert.match(items[1].text, /^•Nested item\./);
+  assert.match(items[2].text, /^7\.\n/);
+  assert.deepEqual(items[0].fragments.map(fragment => fragment.value), [
+    '$x_i$', '[a source link](https://example.com/detail)',
+  ]);
+  items[0].translatedText = '•\n父条目保留 ⟦SL_INLINE_001⟧ 和 ⟦SL_INLINE_002⟧。';
+  items[1].translatedText = '•嵌套条目。';
+  items[2].translatedText = '7.\n第七条。';
+  const figure = translated.blocks.find(block => block.type === 'figure');
+  figure.translatedCaption = '图 8：图中结果。';
+  figure.images[0].localPath = '/tmp/structure-marker-chart.png';
+  const table = translated.blocks.find(block => block.type === 'table');
+  table.translatedCaption = '表 3：表格结果。';
+  table.localPath = '/tmp/structure-marker-table.png';
+  const beforeRendering = structuredClone(translated);
+  const article = renderTranslatedDocument(translated);
+  assert.match(article, /^- 父条目保留 \$x_i\$ 和 \[a source link\]\(https:\/\/example\.com\/detail\)\。$/m);
+  assert.match(article, /^  - 嵌套条目。$/m);
+  assert.match(article, /^7\. 第七条。$/m);
+  assert.doesNotMatch(article, /^\s*- •|^7\. 7\.|图 1：图 8|表 1：表 3/m);
+  const dom = new JSDOM(renderArticleMarkdown(article));
+  try {
+    applyWechatArticleStyles(dom.window.document.body);
+    const paragraphs = [...dom.window.document.querySelectorAll('p')];
+    const parent = paragraphs.find(paragraph => paragraph.textContent.startsWith('• 父条目'));
+    const nested = paragraphs.find(paragraph => paragraph.textContent === '• 嵌套条目。');
+    assert.equal(parent?.textContent, '• 父条目保留 $x_i$ 和 a source link。');
+    assert.equal(nested?.previousElementSibling, parent);
+    assert.match(nested?.getAttribute('style') || '', /padding-left:1\.5em/);
+    assert.equal(parent?.querySelector('a')?.getAttribute('href'), 'https://example.com/detail');
+    assert.equal(paragraphs.filter(paragraph => paragraph.textContent === '7. 第七条。').length, 1);
+    assert.equal(paragraphs.filter(paragraph => paragraph.textContent === '图 8：图中结果。').length, 1);
+    assert.equal(paragraphs.filter(paragraph => paragraph.textContent === '表 3：表格结果。').length, 1);
+    assert.deepEqual([...dom.window.document.querySelectorAll('img')].map(image => image.getAttribute('src')), [
+      '/tmp/structure-marker-chart.png', '/tmp/structure-marker-table.png',
+    ]);
+    assert.equal(dom.window.document.querySelector('ul,ol,li'), null);
+    assert.doesNotMatch(dom.window.document.body.textContent, /•\s*•|7\.\s*7\.|图 1：图 8|表 1：表 3/);
+  } finally { dom.window.close(); }
+  assert.deepEqual(source, original);
+  assert.deepEqual(translated, beforeRendering);
+});
+
+test('直译只去除源文本确认的单个列表标记，保留语义数字和不匹配的序号', () => {
+  const samples = [
+    { text: '•\nSource item.', translatedText: '•\n译文。', expected: '- 译文。' },
+    { text: '•Source item.', translatedText: '•译文。', expected: '- 译文。' },
+    { ordered: true, ordinal: 7, delimiter: '.', text: '7.\nSource item.', translatedText: '7.\n译文。', expected: '7. 译文。' },
+    { ordered: true, ordinal: 7, delimiter: '.', text: '7.Source item.', translatedText: '7.译文。', expected: '7. 译文。' },
+    { ordered: true, ordinal: 3, delimiter: ')', text: '3)\nSource item.', translatedText: '3)\n译文。', expected: '3) 译文。' },
+    { ordered: true, ordinal: 3, delimiter: ')', text: '3)Source item.', translatedText: '3)译文。', expected: '3) 译文。' },
+    { ordered: true, ordinal: 3, delimiter: '.', text: '3.14 is the value.', translatedText: '3.14 是数值。', expected: '3. 3.14 是数值。' },
+    { text: '-1.5 is the value.', translatedText: '-1.5 是数值。', expected: '- -1.5 是数值。' },
+    { ordered: true, ordinal: 3, delimiter: '.', text: '4.Source item.', translatedText: '4.译文。', expected: '3. 4.译文。' },
+    { ordered: true, ordinal: 3, delimiter: '.', text: '3)Source item.', translatedText: '3)译文。', expected: '3. 3)译文。' },
+    { ordered: true, ordinal: 3, delimiter: '.', text: 'Source item without a marker.', translatedText: '3. 表示第三项含义。', expected: '3. 3. 表示第三项含义。' },
+    { ordered: true, ordinal: 3, delimiter: '.', text: '3.Source item.', translatedText: '3.14 是正文数值。', expected: '3. 3.14 是正文数值。' },
+    { ordered: true, ordinal: 7, delimiter: '.', text: '7.Source item.', translatedText: '8.译文。', expected: '7. 8.译文。' },
+    { text: 'Source item without a marker.', translatedText: '• 是这里讨论的符号。', expected: '- • 是这里讨论的符号。' },
+    { text: '•Source item.', translatedText: '译文没有字面标记。', expected: '- 译文没有字面标记。' },
+    { text: '•Source item.', translatedText: '• • 是这里讨论的符号。', expected: '- • 是这里讨论的符号。' },
+  ];
+  for (const sample of samples) {
+    const { expected, ...block } = sample;
+    const document = { sourceUrl: 'https://example.com/list', title: 'List markers',
+      blocks: [{ id: 'b000001', type: 'list_item', ordered: false, ...block }] };
+    const before = structuredClone(document);
+    const article = renderTranslatedDocument(document);
+    assert.ok(article.includes(`\n${expected}\n`), JSON.stringify(sample));
+    assert.deepEqual(document, before);
+  }
+});
+
+test('直译图表标题保留已有中英文标签和原编号，无标签时继续自动编号', () => {
+  const samples = [
+    { type: 'figure', caption: '图 8：不连续图号。', expected: '图 8：不连续图号。' },
+    { type: 'figure', caption: 'Figure 8: Original figure label.', expected: 'Figure 8: Original figure label.' },
+    { type: 'figure', caption: 'Fig. 12: Abbreviated figure label.', expected: 'Fig. 12: Abbreviated figure label.' },
+    { type: 'table', caption: '表 3：不连续表号。', expected: '表 3：不连续表号。' },
+    { type: 'table', caption: 'Table 3: Original table label.', expected: 'Table 3: Original table label.' },
+    { type: 'figure', caption: '图中结果与表 3 对比。', expected: '图 1：图中结果与表 3 对比。' },
+    { type: 'table', caption: '没有编号的结果。', expected: '表 1：没有编号的结果。' },
+  ];
+  for (const sample of samples) {
+    const document = { sourceUrl: 'https://example.com/captions', title: 'Caption markers',
+      blocks: [{ id: 'b000001', type: sample.type, caption: 'Original source caption.',
+        translatedCaption: sample.caption, images: [], captionFragments: [] }] };
+    const before = structuredClone(document);
+    const dom = new JSDOM(renderArticleMarkdown(renderTranslatedDocument(document)));
+    try {
+      const captions = [...dom.window.document.querySelectorAll('p')]
+        .filter(paragraph => paragraph.textContent === sample.expected);
+      assert.equal(captions.length, 1, JSON.stringify(sample));
+      assert.equal(captions[0].querySelector('strong') !== null, sample.type === 'table');
+    } finally { dom.window.close(); }
+    assert.deepEqual(document, before);
+  }
 });
 
 test('直译参考文献合并为一个连续的有序列表并去除原始重复序号', () => {

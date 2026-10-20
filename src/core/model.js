@@ -59,7 +59,7 @@ export function createModel(config, { fetchFn = globalThis.fetch, onUsage = () =
     try {
       return await withRuntimeResource('model', async () => {
         const started = performance.now(), waitMs = started - queuedAt;
-        let attempts = 0, outcome = 'error';
+        let attempts = 0, outcome = 'error', errorCode;
         try {
           if (provider === 'codex-cli') {
             attempts = 1;
@@ -109,9 +109,12 @@ export function createModel(config, { fetchFn = globalThis.fetch, onUsage = () =
           if (!choice.message?.content?.trim()) throw new Error('DeepSeek 返回空正文，已停止上传');
           outcome = 'success';
           return choice.message.content;
+        } catch (error) {
+          errorCode = error.code;
+          throw error;
         } finally {
           record({ stage: 'model.complete', provider, role, durationMs: performance.now() - started, waitMs, attempts,
-            outcome: signal?.aborted ? 'cancelled' : outcome });
+            outcome: signal?.aborted ? 'cancelled' : outcome, ...(typeof errorCode === 'string' ? { errorCode } : {}) });
         }
       }, signal);
     } finally { clearTimeout(timer); }

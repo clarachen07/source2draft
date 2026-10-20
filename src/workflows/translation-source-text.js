@@ -7,6 +7,7 @@ import { emitTelemetry } from '../lib/telemetry.js';
 import { parseTranslationScope, scopeLabel } from './translation-scope.js';
 import { qualityFailure } from './translation-review.js';
 import { translateDocument } from './translation-inference.js';
+import { exposeTranslationLinkText } from './translation-links.js';
 import { acquireSourceDocument, removeRepeatedSourceMetadata, assertSourceDocumentComplete,
   buildDocumentManifest, renderTranslatedDocument, validateTranslationArtifact } from './source-document.js';
 import { report, writeJsonAtomic } from './translation-utils.js';
@@ -70,6 +71,7 @@ export async function generateStructuredTranslation({
   // Every acquisition path resolves the scope before localizing its assets.
   let source = acquired;
   source = removeRepeatedSourceMetadata(source);
+  source = exposeTranslationLinkText(source);
   assertSourceDocumentComplete(source);
   const manifest = buildDocumentManifest(source);
   await report(onProgress, {

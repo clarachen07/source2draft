@@ -13,10 +13,19 @@ export function assessTranslationUnit(unit, text, { afterRepair = false } = {}) 
     hardErrors.push(exactMismatch);
     repairableIssues.push(exactMismatch);
   }
+  for (const fragment of unit.fragments || []) {
+    if (fragment.kind !== 'link-url') continue;
+    const linked = value => [...String(value).matchAll(/\[([^\[\]\n]+)\]\((⟦SL_INLINE_\d{3}⟧)\)/g)]
+      .filter(match => match[2] === fragment.token && match[1].trim());
+    if (linked(text).length !== linked(unit.text).length || !linked(text).length) {
+      hardErrors.push(`链接文字缺失或链接结构改变：${fragment.token}`);
+      repairableIssues.push(`链接文字缺失或链接结构改变：${fragment.token}`);
+    }
+  }
 
-  const sourceInline = unit.text.match(/⟦SL_INLINE_\d{3}⟧/g) || [];
-  const targetInline = text.match(/⟦SL_INLINE_\d{3}⟧/g) || [];
-  if (JSON.stringify(sourceInline) !== JSON.stringify(targetInline)) hardErrors.push('公式占位符顺序或归属改变');
+  // Exact token multiplicity is checked above. Chinese clauses may put the
+  // comparison before the result, moving their attached citations/formulas.
+  // Attachment is a semantic invariant; global token order cannot prove it.
 
   const numeric = assessNumericEquivalence(unit.text, text);
   hardErrors.push(...numeric.hardErrors);
@@ -35,11 +44,29 @@ export function assessTranslationUnit(unit, text, { afterRepair = false } = {}) 
 }
 
 
+// Sequence nouns such as rung-1 and term-5 are ordinals. Freezing them as model
+// identifiers makes semantic repair restore the English token, so a terminology
+// fix can never land. Product identifiers (GPT-5, Mamba-2, o3-mini) stay frozen.
+const DESCRIPTIVE_ORDINAL = /^(?:rung|term|step|level|stage|phase|round|tier|grade|rank|layer|class|type|group|part|item|case|section|chapter|page|line|row|column|day|week|month|year|hour|minute|generation|floor|band|epoch|cycle|iteration|pass|wave|trial|fold|shot|hop|turn|period|session|season|quarter|frame)-\d+$/i;
+
+function hyphenatedIdentifierPattern() {
+  return /\b(?=[A-Za-z0-9-]*\d)(?=[A-Za-z0-9-]*[A-Za-z])[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)+\b/g;
+}
+
+function isDescriptiveOrdinalLabel(token) {
+  return DESCRIPTIVE_ORDINAL.test(token);
+}
+
+export function descriptiveOrdinalLabels(value) {
+  return [...String(value || '').matchAll(hyphenatedIdentifierPattern())].map((match) => match[0])
+    .filter(isDescriptiveOrdinalLabel);
+}
+
 export function protectInvariantText(value) {
   const tokens = [];
   const text = String(value).replace(
     /⟦SL_INLINE_\d{3}⟧|https?:\/\/[^\s)\]}>"']+|\\[A-Za-z]+|\$[A-Z]{1,6}\b|\b(?:NASDAQ|NYSE|AMEX|OTC)\s*:\s*[A-Z]{1,6}\b|\b(?=[A-Za-z0-9-]*\d)(?=[A-Za-z0-9-]*[A-Za-z])[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)+\b|\b(?=[A-Za-z0-9]*\d)(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z][A-Za-z0-9]{2,}\b|[$€£¥]?[-+]?\d+(?:[,.]\d+)*(?:%|‰|[KMBT](?=\b))?/gi,
-    (token) => `⟦SL_KEEP_${tokens.push(token)}⟧`,
+    (token) => (isDescriptiveOrdinalLabel(token) ? token : `⟦SL_KEEP_${tokens.push(token)}⟧`),
   );
   return { text, tokens };
 }
@@ -56,13 +83,16 @@ export function translationUnits(document) {
   for (const block of document.blocks) {
     if (block.translationPolicy === 'preserve-original') continue;
     if (['heading', 'paragraph', 'quote', 'list_item'].includes(block.type) && block.text?.trim()) {
-      units.push({ id: block.id, text: block.text, kind: block.type });
+      units.push({ id: block.id, text: block.text, kind: block.type,
+        ...(block.fragments?.length ? { fragments: block.fragments } : {}) });
     }
     if (block.type === 'figure' && block.caption?.trim()) {
-      units.push({ id: `${block.id}:caption`, text: block.caption, kind: 'figure_caption' });
+      units.push({ id: `${block.id}:caption`, text: block.caption, kind: 'figure_caption',
+        ...(block.captionFragments?.length ? { fragments: block.captionFragments } : {}) });
     }
     if (block.type === 'table') {
-      if (block.caption?.trim()) units.push({ id: `${block.id}:caption`, text: block.caption, kind: 'table_caption' });
+      if (block.caption?.trim()) units.push({ id: `${block.id}:caption`, text: block.caption, kind: 'table_caption',
+        ...(block.captionFragments?.length ? { fragments: block.captionFragments } : {}) });
     }
   }
   return units;
@@ -86,7 +116,7 @@ function exactInvariantTokens(value) {
     ...exactInvariantUrls(text),
     ...(text.match(/\\[A-Za-z]+/g) || []),
     ...(text.match(/\$[A-Z]{1,6}\b|\b(?:NASDAQ|NYSE|AMEX|OTC)\s*:\s*[A-Z]{1,6}\b/g) || []),
-    ...(text.match(/\b(?=[A-Za-z0-9-]*\d)(?=[A-Za-z0-9-]*[A-Za-z])[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)+\b/g) || []),
+    ...(text.match(hyphenatedIdentifierPattern()) || []).filter((token) => !isDescriptiveOrdinalLabel(token)),
     ...(text.match(/\b(?=[A-Za-z0-9]*\d)(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z][A-Za-z0-9]{2,}\b/g) || []),
   ];
   return tokens.sort();
@@ -228,7 +258,7 @@ function invariantNumericSignature(
     );
   }
   masked = masked.replace(
-    /(?<![A-Za-z0-9])(?:[$€£¥]\s*)?(one\s+and\s+(?:a|one)\s+half|[-+]?\d+(?:[,.]\d+)*)\s*(thousand|million|billion|trillion)\b(?:\s+(?:U\.?S\.?\s+)?dollars?)?/gi,
+    /(?<![A-Za-z0-9])(?:[$€£¥]\s*)?(one\s+and\s+(?:a|one)\s+half|[-+]?\d+(?:[,.]\d+)*)(?:\s*[-‐‑]\s*|\s*)(thousand|million|billion|trillion)\b(?:\s+(?:U\.?S\.?\s+)?dollars?)?/gi,
     (match, amount, unit) => {
       const normalized = normalizeMagnitudeAmount(amount, magnitudeMultipliers[unit.toLowerCase()]);
       if (normalized) magnitudeTokens.push(`NUM:${normalized}`);

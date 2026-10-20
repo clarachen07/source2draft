@@ -97,7 +97,7 @@ export function findPreviousArticle(run, store, workDirFor) {
   return '';
 }
 export function createEngine({ config, store, modelFactory = createModel, wechat = createWechat(config), prepare = prepareArticle,
-  dailyResearch = async args => (await import('../workflows/daily-research.js')).runDailyResearch(args) }) {
+  dailyResearch = async args => (await import('../workflows/daily-research.js')).runDailyResearch(args), log = text => console.error(text) }) {
   const activeRuns = new Map();
   let stopped = false, scheduling = false;
   const laneFor = run => run.profile === 'llm-quant-daily' ? 'daily' : 'manual';
@@ -219,6 +219,10 @@ export function createEngine({ config, store, modelFactory = createModel, wechat
         && (error.retryable === true || timeout.aborted
           || ['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN', 'ENETUNREACH', 'ECONNREFUSED'].includes(errorCode));
       store.update(run.id, { status, error: message, error_code: errorCode, retryable: Number(retryable) });
+      // The durable outbox can be offline or awaiting a receipt. Keep an
+      // independent, timestamped local failure record without raw provider data.
+      try { log(`[${new Date().toISOString()}] 任务 ${run.id} ${status} ${redact(errorCode, config)}：${message}`); }
+      catch { /* Logging cannot suppress the durable failure notification. */ }
       store.notice(run, `${status}:${Date.now()}`, `${status === 'needs_input' ? '需要补充' : status === 'needs_review' ? '需要核对' : '任务失败'}：${message}\n任务 ${run.id}`);
     } finally {
       if (fs.existsSync(workDir)) onTelemetry({ stage: 'task', durationMs: performance.now() - started,

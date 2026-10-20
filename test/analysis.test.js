@@ -13,6 +13,26 @@ test('Hugging Face PDF 预览链接转为原文件下载地址', () => {
   assert.equal(sourceDownloadUrl('https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Pro-RL/blob/main/README.md?download=true'),
     'https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Pro-RL/resolve/main/README.md?download=true');
 });
+
+test('GitHub PDF 预览链接保留精确文件目标并转为 raw 下载，其他链接不改写', () => {
+  for (const suffix of [
+    'main/k3_tech_report.pdf', 'v1.0/docs/report.PDF?raw=true#page=4',
+    'release%2Fv1/docs/report%20final.pdf', 'release/v1/docs/report.pdf',
+    '0123456789abcdef/docs/report.pdf',
+  ]) {
+    const source = `https://github.com/MoonshotAI/Kimi-K3/blob/${suffix}`;
+    assert.equal(sourceDownloadUrl(source), source.replace('/blob/', '/raw/'));
+  }
+  for (const source of [
+    'https://github.com/MoonshotAI/Kimi-K3',
+    'https://github.com/MoonshotAI/Kimi-K3/blob/main/README.md',
+    'https://github.com/MoonshotAI/Kimi-K3/raw/main/report.pdf',
+    'https://raw.githubusercontent.com/MoonshotAI/Kimi-K3/main/report.pdf',
+    'https://example.com/a/blob/main/paper.pdf',
+    'https://github.com.evil.example/owner/repo/blob/main/paper.pdf',
+    'https://github.com/owner/repo/issues/1?file=blob/main/paper.pdf',
+  ]) assert.equal(sourceDownloadUrl(source), source);
+});
 import { marked } from 'marked';
 import { JSDOM } from 'jsdom';
 import { createModel } from '../src/core/model.js';

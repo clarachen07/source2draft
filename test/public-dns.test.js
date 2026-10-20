@@ -4,13 +4,86 @@ import http from 'node:http';
 import { once } from 'node:events';
 import { lookupPublicDns } from '../src/lib/public-dns.js';
 import { pinnedHttpFetch } from '../src/lib/pinned-http.js';
-import { safeFetchResource } from '../src/workflows/translation-source-text.js';
+import { safeFetchResource, assertSafeHttpUrl } from '../src/workflows/translation-source-text.js';
 
 const syntheticDns = async () => [{ address: '198.18.0.206', family: 4 }];
 function dnsResponse(url, address = '140.82.121.6') {
   const type = new URL(url).searchParams.get('type');
   return Response.json({ Status: 0, TC: false, Answer: type === 'A' ? [{ type: 1, data: address }] : [] });
 }
+
+test('本机 DNS 直接失败时以 HTTPS 公共解析恢复，下载固定核验后的地址', async () => {
+  for (const code of ['ENOTFOUND', 'EAI_AGAIN', 'ENODATA', 'ESERVFAIL', 'ECONNREFUSED', 'ETIMEDOUT']) {
+    let lookups = 0, pins;
+    const result = await safeFetchResource({
+      url: 'https://api.github.com/repos/microsoft/qlib',
+      dnsLookup: async () => { throw Object.assign(new Error('local resolver unavailable'), { code }); },
+      publicDnsLookup: async (host, { signal }) => {
+        lookups++;
+        assert.equal(host, 'api.github.com');
+        assert.equal(signal.aborted, false);
+        return [{ address: '140.82.121.6', family: 4 }];
+      },
+      pinnedFetchFactory: addresses => {
+        pins = addresses;
+        return async () => new Response('verified source');
+      },
+    });
+    assert.equal(lookups, 1);
+    assert.deepEqual(pins, [{ address: '140.82.121.6', family: 4 }]);
+    assert.equal(result.buffer.toString(), 'verified source');
+  }
+});
+
+test('卡住的本机 DNS 有独立时限，仍给公共解析留下恢复时间', async () => {
+  let recovered = false;
+  await assert.doesNotReject(() => assertSafeHttpUrl('https://api.github.com/a', {
+    dnsLookup: () => new Promise(() => {}),
+    publicDnsLookup: async () => { recovered = true; return [{ address: '140.82.121.6', family: 4 }]; },
+  }));
+  assert.equal(recovered, true);
+});
+
+test('本机和公共 DNS 均失败时保留固定诊断，私网和混合结果不能借回退放行', async () => {
+  const failedDns = async () => { throw Object.assign(new Error('local unavailable'), { code: 'ENOTFOUND' }); };
+  await assert.rejects(() => assertSafeHttpUrl('https://api.github.com/a', {
+    dnsLookup: failedDns, publicDnsLookup: async () => { throw new Error('public unavailable'); },
+  }), error => error.code === 'SOURCE_DNS_UNAVAILABLE');
+  for (const addresses of [[], [{ address: '10.0.0.1', family: 4 }],
+    [{ address: '140.82.121.6', family: 4 }, { address: 'fd00::1', family: 6 }]]) {
+    await assert.rejects(() => assertSafeHttpUrl('https://api.github.com/a', {
+      dnsLookup: failedDns, publicDnsLookup: async () => addresses,
+    }), error => error.code === 'SOURCE_DNS_UNSAFE');
+  }
+  let fallbacks = 0;
+  for (const addresses of [[{ address: '10.0.0.1', family: 4 }],
+    [{ address: '198.18.0.8', family: 4 }, { address: '10.0.0.1', family: 4 }]]) {
+    await assert.rejects(() => assertSafeHttpUrl('https://api.github.com/a', {
+      dnsLookup: async () => addresses,
+      publicDnsLookup: async () => { fallbacks++; return [{ address: '140.82.121.6', family: 4 }]; },
+    }), error => error.code === 'SOURCE_DNS_UNSAFE');
+  }
+  assert.equal(fallbacks, 0);
+});
+
+test('本机 DNS 失败后的公共解析也遵守整体下载时限与任务取消', async () => {
+  for (const cancelled of [false, true]) {
+    const controller = new AbortController(), reason = new Error('task cancelled');
+    let calls = 0, requestSignal;
+    const pending = safeFetchResource({
+      url: 'https://api.github.com/a', signal: controller.signal, limits: { fetchTimeoutMs: 20 },
+      dnsLookup: async () => { throw Object.assign(new Error('local unavailable'), { code: 'ENOTFOUND' }); },
+      publicDnsLookup: async (_host, { signal }) => {
+        calls++; requestSignal = signal;
+        if (cancelled) queueMicrotask(() => controller.abort(reason));
+        return new Promise(() => {});
+      },
+    });
+    await assert.rejects(pending, error => cancelled ? error === reason : error.code === 'HTTP_TIMEOUT');
+    assert.equal(calls, 1);
+    assert.equal(requestSignal.aborted, true);
+  }
+});
 
 test('DoH 自举固定官方 IP 并保留 HTTPS 主机，不依赖合成 DNS 或携带业务凭据', async () => {
   const calls = [];

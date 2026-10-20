@@ -18,6 +18,14 @@ import { safeError } from './json-output.js';
 
 export function sourceDownloadUrl(sourceUrl) {
   const url = new URL(sourceUrl);
+  // GitHub blob URLs serve the HTML file viewer, including for PDFs. Keep
+  // owner/repository/ref/path intact and let the secure downloader follow the
+  // raw endpoint's redirects (with DNS checks and cross-origin auth stripping).
+  if (url.protocol === 'https:' && url.hostname === 'github.com'
+    && /^\/[^/]+\/[^/]+\/blob\/[^/]+\/.+\.pdf$/i.test(url.pathname)) {
+    url.pathname = url.pathname.replace(/^(\/[^/]+\/[^/]+)\/blob\//, '$1/raw/');
+    return url.toString();
+  }
   if (url.protocol === 'https:' && url.hostname === 'huggingface.co'
     && /^\/[^/]+\/[^/]+\/blob\/[^/]+\/.+/.test(url.pathname)) {
     url.pathname = url.pathname.replace('/blob/', '/resolve/');
@@ -45,32 +53,42 @@ export async function resolveSafeHttpUrl(rawUrl, { dnsLookup = dns.lookup, publi
     return { url, addresses: [{ address: host, family: net.isIPv4(host) ? 4 : 6 }] };
   }
   let records;
-  try { records = await dnsLookup(host, { all: true, verbatim: true }); }
-  catch (error) { throw new Error(`原文域名解析失败:${safeError(error)}`); }
+  let lookupFailed = false;
+  try {
+    records = await withDeadline({ signal, timeoutMs: 6000, message: '本机 DNS 请求超时' },
+      () => dnsLookup(host, { all: true, verbatim: true }));
+  } catch (error) {
+    throwIfTaskCancelled(signal);
+    if (!['ENOTFOUND', 'EAI_AGAIN', 'ENODATA', 'ESERVFAIL', 'ECONNREFUSED', 'ETIMEDOUT', 'HTTP_TIMEOUT'].includes(error.code)) {
+      throw Object.assign(new Error(`原文域名解析失败:${safeError(error)}`), { code: 'SOURCE_DNS_UNAVAILABLE' });
+    }
+    lookupFailed = true;
+  }
   const addresses = (records || []).map((record) => ({
     address: String(record?.address || ''),
     family: Number(record?.family) || net.isIP(record?.address),
   }));
   // Some local network proxies map every public hostname into 198.18.0.0/15.
-  // Resolve the original hostname over authenticated HTTPS and pin the public
-  // result; never connect to the synthetic address or permit other private IPs.
-  if (addresses.length && addresses.every((record) => isSyntheticDnsIp(record.address))) {
+  // A failed/stalled local resolver also needs this recovery path. Resolve the
+  // original hostname over authenticated HTTPS and pin the public result;
+  // never use it to override a private or mixed local DNS answer.
+  if (lookupFailed || (addresses.length && addresses.every((record) => isSyntheticDnsIp(record.address)))) {
     try { records = await publicDnsLookup(host, { signal }); }
     catch (error) {
       throwIfTaskCancelled(signal);
-      throw new Error(`公共 DNS 核验失败:${safeError(error)}`);
+      throw Object.assign(new Error(`公共 DNS 核验失败:${safeError(error)}`), { code: 'SOURCE_DNS_UNAVAILABLE' });
     }
     const publicAddresses = (records || []).map((record) => ({
       address: String(record?.address || ''),
       family: Number(record?.family) || net.isIP(record?.address),
     }));
     if (!publicAddresses.length || publicAddresses.some((record) => !record.family || isPrivateIp(record.address))) {
-      throw new Error('公共 DNS 未返回安全公网地址');
+      throw Object.assign(new Error('公共 DNS 未返回安全公网地址'), { code: 'SOURCE_DNS_UNSAFE' });
     }
     return { url, addresses: publicAddresses };
   }
   if (!addresses.length || addresses.some((record) => !record.family || isPrivateIp(record.address))) {
-    throw new Error('原文域名解析到私网或保留地址');
+    throw Object.assign(new Error('原文域名解析到私网或保留地址'), { code: 'SOURCE_DNS_UNSAFE' });
   }
   return { url, addresses };
 }

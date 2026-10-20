@@ -2345,3 +2345,61 @@ test('真实 DeepSeek 适配器 length 响应触发有界拆批，持续截断�
     }
   }
 });
+
+test('2210.13382 回归：百科、不定冠词“一个”不是新增数字，真实新增数字仍被拒绝', () => {
+  const b5 = {
+    id: 'b000005',
+    kind: 'paragraph',
+    text: 'Networks trained on a simple ‘‘next-word’’ prediction task are apparently capable of many other things. [Footnote 2: See ⟦SL_INLINE_001⟧ for an encyclopedic list of examples.]',
+  };
+  const encyclopedia = assessTranslationUnit(
+    b5,
+    '在简单的“下一个词”预测任务上训练的网络，似乎还能够做许多其他事情。[脚注 2：示例的百科全书式列表见 ⟦SL_INLINE_001⟧。]',
+    { afterRepair: true },
+  );
+  assert.deepEqual(encyclopedia.hardErrors, []);
+  assert.deepEqual(encyclopedia.warnings, []);
+  const hundred = assessTranslationUnit(b5, '在简单的“下一个词”预测任务上训练的网络，似乎还能够做许多其他事情。[脚注 2：一百个示例的列表见 ⟦SL_INLINE_001⟧。]', { afterRepair: true });
+  assert.match(hundred.hardErrors.join(' '), /译文新增不等值数字：NUM:100/);
+
+  const b17 = {
+    id: 'b000017',
+    kind: 'paragraph',
+    text: 'Our approach is to narrow our focus from natural language to a more controlled synthetic setting. We choose the game Othello, which is simpler than chess.',
+  };
+  const article = assessTranslationUnit(
+    b17,
+    '我们的方法是将关注范围从自然语言缩小到一个更受控的合成环境。我们选择奥赛罗，这是一种比国际象棋更简单的游戏。',
+    { afterRepair: true },
+  );
+  assert.deepEqual(article.hardErrors, []);
+  assert.deepEqual(article.warnings, []);
+  for (const added of ['缩小到约一个月内的合成环境', '缩小到第一个合成环境', '缩小到十个合成环境', '缩小到数百个合成环境']) {
+    const changed = assessTranslationUnit(b17, `我们的方法是将关注范围从自然语言${added}。我们选择奥赛罗，这是一种比国际象棋更简单的游戏。`, { afterRepair: true });
+    assert.match(changed.hardErrors.join(' '), /译文新增不等值数字/, added);
+  }
+  const minutes = assessTranslationUnit({ id: 'x', kind: 'paragraph', text: 'The task takes ten minutes and is very important.' }, '任务需要十分钟，而且十分重要。', { afterRepair: true });
+  assert.deepEqual(minutes.hardErrors, []);
+});
+
+test('arXiv LaTeXML 脚注只渲染一次编号，不把 sources33\\n3 粘成标识符', async () => {
+  const note = (n, body) => `<span id="footnote${n}" class="ltx_note ltx_role_footnote"><sup class="ltx_note_mark">${n}</sup><span class="ltx_note_outer"><span class="ltx_note_content"><sup class="ltx_note_mark">${n}</sup>
+    <span class="ltx_tag ltx_tag_note">${n}</span>
+    ${body}</span></span></span>`;
+  const html = `<!doctype html><html><body><article class="ltx_document"><h1 class="ltx_title">Emergent World Representations</h1>
+    <div class="ltx_para"><p class="ltx_p">We collect championship games from two online sources${note(3, '<a href="https://www.liveothello.com/">liveothello</a> and <a href="https://www.ffothello.org/">ffothello</a>.')}, containing many games. ${'Body text. '.repeat(30)}</p></div>
+    <div class="ltx_para"><p class="ltx_p">As a baseline, we include probes on a randomly initialized network${note(6, 'Random probes have a 47% error rate.')} We see only a marginal improvement. ${'More text. '.repeat(30)}</p></div>
+  </article></body></html>`;
+  const document = await sourceDocumentFromHtml({ html, sourceUrl: 'https://arxiv.org/html/2210.13382' });
+  const text = document.blocks.map((block) => block.text || '').join('\n');
+  assert.match(text, /two online sources \[Footnote 3: ⟦SL_INLINE_001⟧ and ⟦SL_INLINE_002⟧\.\], containing/);
+  assert.match(text, /initialized network \[Footnote 6: Random probes have a 47% error rate\.\] We see/);
+  assert.doesNotMatch(text, /sources3|network6|\d\n\d/);
+  const paragraph = document.blocks.find((block) => /network \[Footnote 6/.test(block.text || ''));
+  const kept = assessTranslationUnit(paragraph, paragraph.text.replace(/^[\s\S]*$/, (value) => value
+    .replace('As a baseline, we include probes on a randomly initialized network', '作为基线，我们纳入了随机初始化网络上的探针')
+    .replace('[Footnote 6: Random probes have a 47% error rate.]', '[脚注 6：随机探针的错误率为 47%。]')
+    .replace('We see only a marginal improvement.', '我们只看到微小提升。')
+    .replace(/More text\. /g, '更多文本。')), { afterRepair: true });
+  assert.deepEqual(kept.hardErrors, []);
+});

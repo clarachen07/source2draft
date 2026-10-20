@@ -1458,6 +1458,34 @@ function orderedListItemOrdinal(node) {
   return undefined;
 }
 
+// LaTeXML (arXiv HTML) repeats a footnote's number three times: the in-text
+// mark, the mark inside the note body and the note tag. Plain textContent turns
+// that into "sources33\n3\n…", which reads like an identifier and a stray number.
+// Render each note once as an explicit, translatable "[Footnote N: …]".
+function inlineLatexmlFootnotes(root) {
+  for (const note of [...root.querySelectorAll('.ltx_note')]) {
+    if (!root.contains(note)) continue;
+    const content = note.querySelector('.ltx_note_content');
+    if (!content) continue;
+    const outerMark = [...note.children].find((child) => child.matches('.ltx_note_mark'));
+    const label = cleanText(outerMark?.textContent || content.querySelector('.ltx_tag_note')?.textContent || '');
+    content.querySelectorAll('.ltx_note_mark,.ltx_tag_note').forEach((child) => {
+      if (!child.closest('.ltx_note_content') || child.closest('.ltx_note_content') === content) child.remove();
+    });
+    const doc = root.ownerDocument;
+    content.normalize();
+    const first = content.firstChild;
+    if (first?.nodeType === 3) first.textContent = first.textContent.replace(/^\s+/, '');
+    const last = content.lastChild;
+    if (last?.nodeType === 3) last.textContent = last.textContent.replace(/\s+$/, '');
+    note.replaceWith(
+      doc.createTextNode(label ? ` [Footnote ${label}: ` : ' [Footnote: '),
+      ...[...content.childNodes],
+      doc.createTextNode(']'),
+    );
+  }
+}
+
 function richTextFromNode(node, documentUrl) {
   const clone = node.cloneNode(true);
   clone.querySelectorAll(EXCLUDED_CONTENT_SELECTOR).forEach((child) => child.remove());
@@ -1468,6 +1496,7 @@ function richTextFromNode(node, documentUrl) {
     fragments.push({ token, value, ...(kind ? { kind } : {}) });
     return token;
   };
+  inlineLatexmlFootnotes(clone);
   for (const math of [...clone.querySelectorAll('math,.MathJax,.katex,.ltx_Math')]) {
     const tex = mathTex(math);
     math.replaceWith(clone.ownerDocument.createTextNode(protect(tex ? `$${tex}$` : cleanText(math.textContent))));

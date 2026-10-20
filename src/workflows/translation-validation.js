@@ -391,6 +391,14 @@ function parseEnglishNumberPhrase(value) {
   return `${total + current}`;
 }
 
+const CHINESE_NUMERAL_MORPHEMES = new RegExp([
+  '老百姓', '百科', '百姓', '百货', '百合', '百般', '百出', '千方百计', '千变万化', '千差万别',
+  '千篇一律', '千真万确', '万一', '万物', '万事', '万能', '万象', '十分', '十足', '十字',
+  '一一', '一五一十', '五花八门', '四面八方', '乱七八糟', '七嘴八舌', '三心二意', '九死一生',
+].map((word) => (word === '十分' ? '十分(?!钟)' : word)).join('|')
+  .replace(/^/, '(?<![零〇一二两三四五六七八九十百千万亿兆第])(?:')
+  .replace(/$/, ')(?![零〇一二两三四五六七八九十百千万亿兆])'), 'g');
+
 function chineseWrittenNumbers(value) {
   let text = String(value || '');
   const tokens = [];
@@ -401,6 +409,9 @@ function chineseWrittenNumbers(value) {
   });
   // The Han character in percentage terms is a morpheme, not an independent number 100.
   text = text.replace(/百分(?:比|点|率)/g, (match) => ' '.repeat(match.length));
+  // Lexicalized words whose Han numerals are morphemes, not quantities
+  // (e.g. 百科全书 "encyclopedia", 十分 "very", 万一 "in case").
+  text = text.replace(CHINESE_NUMERAL_MORPHEMES, (match) => ' '.repeat(match.length));
   for (const match of text.matchAll(/[负零〇一二两三四五六七八九十百千万亿兆点]+/g)) {
     const raw = match[0];
     const before = text[match.index - 1] || '';
@@ -411,6 +422,16 @@ function chineseWrittenNumbers(value) {
     const boundaryAfter = !/\p{Script=Han}/u.test(after);
     const counterAfter = /[个项次名位份套种只家台条点倍成年月日时分秒周季届级章页组轮期步方侧端类笔股档架件者人]/.test(after);
     const ordinal = prefix === '第';
+    // 一 + classifier without 第 is the Chinese indefinite article (a/an), which
+    // English sources never mark as a number: 缩小到一个更受控的环境.
+    // Approximators (约/仅/共…) and measure units (月/年/倍…) still keep it a real 1.
+    if (raw === '一' && /[个种项类件位名家只条套份]/.test(after) && !ordinal
+      && !/[约近仅只共达逾超]$/.test(prefixText)) continue;
+    // A lone magnitude character inside a word (百科, 千秋, 万物) is only a
+    // quantity when it carries a classifier/boundary or an approximating prefix.
+    if (raw.length === 1 && /[十百千万亿兆]/.test(raw)
+      && !boundaryAfter && !counterAfter && !/[米元克吨度]/.test(after)
+      && !/[数几上近约逾超达至到为共成好]$/.test(prefixText)) continue;
     const standalone = raw.length === 1
       && (ordinal || (/(?:为|等于|设为|共|约|近|达|至|到)$/.test(prefixText)
         && (boundaryAfter || counterAfter)))

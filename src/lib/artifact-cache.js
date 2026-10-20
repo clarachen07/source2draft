@@ -1,9 +1,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { hash, readJson, parseArticle, writeAtomic } from './io.js';
+import { TRANSLATION_REVIEW_POLICY } from '../workflows/translation-review.js';
 
 export const QUALITY_POLICY = 2;
 export const RENDER_VERSION = 3;
+export const TRANSLATION_PRESENTATION_VERSION = 2;
 export function fileRecord(file, workDir) {
   const root = fs.realpathSync(workDir), resolved = fs.realpathSync(path.resolve(workDir, file));
   if (!resolved.startsWith(root + path.sep) || fs.lstatSync(path.resolve(workDir, file)).isSymbolicLink()) {
@@ -49,7 +51,12 @@ export function readPreparedCache(workDir, { markdown, config, cover, repairOutp
 }
 function approvalIdentity(artifact, context) {
   const { approval: _approval, ...content } = artifact;
-  return hash({ content, ...context });
+  // Rebuild translation prose after presentation fixes without invalidating
+  // source snapshots, translation checkpoints or research-writing approvals.
+  const presentation = context.mode === 'translation'
+    ? { translationPresentationVersion: TRANSLATION_PRESENTATION_VERSION,
+      translationReviewPolicy: TRANSLATION_REVIEW_POLICY } : {};
+  return hash({ content, ...context, ...presentation });
 }
 export function approveArtifact(artifact, { input, mode, modelIdentity }) {
   return { ...artifact, approval: { policy: QUALITY_POLICY,

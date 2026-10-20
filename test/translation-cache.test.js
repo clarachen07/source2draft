@@ -7,7 +7,7 @@ import { inheritTranslationRevision, saveSourceSnapshot, sourceSnapshotKey, read
 import { parseTranslationScope } from '../src/workflows/translation-scope.js';
 import { DOCUMENT_VERSION } from '../src/workflows/translation-config.js';
 import { translationRequirements } from '../src/workflows/translation-requirements.js';
-import { fileRecord, readArtifactCache, approveArtifact, preparedIdentity, preparedManifestHash, readPreparedCache, RENDER_VERSION } from '../src/lib/artifact-cache.js';
+import { fileRecord, readArtifactCache, approveArtifact, preparedIdentity, preparedManifestHash, readPreparedCache, QUALITY_POLICY, RENDER_VERSION } from '../src/lib/artifact-cache.js';
 import { localizeFigureAssets } from '../src/workflows/source-assets.js';
 import { hash, writeAtomic, readJson } from '../src/lib/io.js';
 
@@ -105,6 +105,34 @@ test('artifact approvals bind full source evidence and quality/model policy', t 
   writeAtomic(filename, { ...artifact, manifest: { sha256: 'changed' } }); assert.equal(readArtifactCache(f.workDir, context), null);
   writeAtomic(filename, { ...artifact, approval: { ...artifact.approval, policy: 0 } }); assert.equal(readArtifactCache(f.workDir, context), null);
   writeAtomic(filename, artifact); assert.equal(readArtifactCache(f.workDir, { ...context, modelIdentity: { translation: 'changed' } }), null);
+});
+
+for (const mode of ['translation', 'analysis'])
+  test(`presentation changes ${mode === 'translation' ? 'invalidate old translation' : 'preserve old analysis'} approvals`, t => {
+    const f = fixture(t), context = { input: f.run.input, mode, modelIdentity: { model: 'fixture' } };
+    const content = { article: '# 文章\n\n正文。', manifest: { sha256: 'original' } };
+    const legacy = { ...content, approval: { policy: QUALITY_POLICY, identity: hash({ content, ...context }) } };
+    const filename = path.join(f.workDir, 'artifact.json');
+    writeAtomic(filename, legacy);
+    assert.deepEqual(readArtifactCache(f.workDir, context), mode === 'translation' ? null : legacy);
+    const current = approveArtifact(content, context);
+    writeAtomic(filename, current);
+    assert.deepEqual(readArtifactCache(f.workDir, context), current);
+  });
+
+test('an outdated translation article leaves its reusable source snapshot and checkpoint unchanged', t => {
+  const f = fixture(t), context = { input: f.run.input, mode: 'translation', modelIdentity: { model: 'fixture' } };
+  const content = { article: '# 旧译文\n\n**表 1：表 1：数据集**' };
+  writeAtomic(path.join(f.parentDir, 'artifact.json'), { ...content,
+    approval: { policy: QUALITY_POLICY, identity: hash({ content, ...context }) } });
+  const sourcePath = path.join(f.parentDir, 'translation-source-document.json');
+  const checkpointPath = path.join(f.parentDir, 'translation-checkpoint.json');
+  const sourceBefore = fs.readFileSync(sourcePath), checkpointBefore = fs.readFileSync(checkpointPath);
+  assert.equal(readArtifactCache(f.parentDir, context), null);
+  assert.deepEqual(fs.readFileSync(sourcePath), sourceBefore);
+  assert.deepEqual(fs.readFileSync(checkpointPath), checkpointBefore);
+  assert.deepEqual(readSourceSnapshot(sourcePath, f.key, f.parentDir), f.document);
+  assert.equal(sourceSnapshotKey(f.sourceUrl, parseTranslationScope(f.run.input), f.config), f.key);
 });
 
 test('prepared manifest restores only damaged text outputs; title or image corruption cannot bypass rendering', t => {

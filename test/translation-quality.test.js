@@ -194,11 +194,13 @@ test('long blocks use stable sentence chunks, preserve placeholders, and resume 
   assert.equal((translated.blocks[0].translatedText.match(/⟦SL_INLINE_001⟧/g) || []).length, 1);
 });
 
-test('equivalent numeric formats are accepted, ordered placeholders are gated, omissions trigger review', () => {
+test('equivalent numeric formats and clause reordering pass lexical checks; attribution and omissions require semantic review', () => {
   assert.deepEqual(assessTranslationUnit({ text: '50k tokens; 124M parameters; 8,400 samples; 100 percent.' },
     '5 万个 token、1.24 亿个参数、8400 个样本、100%。').hardErrors, []);
-  assert.ok(assessTranslationUnit({ text: 'A ⟦SL_INLINE_001⟧ then B ⟦SL_INLINE_002⟧.' },
-    'A ⟦SL_INLINE_002⟧，B ⟦SL_INLINE_001⟧。').hardErrors.some(error => /顺序/.test(error)));
+  const unit = { text: 'A ⟦SL_INLINE_001⟧ then B ⟦SL_INLINE_002⟧.' };
+  assert.deepEqual(assessTranslationUnit(unit, 'B ⟦SL_INLINE_002⟧之前是 A ⟦SL_INLINE_001⟧。').hardErrors, []);
+  assert.ok(translationNeedsReview(unit, 'B ⟦SL_INLINE_002⟧之前是 A ⟦SL_INLINE_001⟧。'));
+  assert.ok(assessTranslationUnit(unit, 'A ⟦SL_INLINE_001⟧。').hardErrors.length);
   assert.ok(translationNeedsReview({ text: 'A describes a method. B describes a test. C describes a model. D describes data.' }, '这里介绍方法。'));
   for (const text of ['The method is faster.', "This isn't supported.", 'This suggests a possible improvement.', '这并不是实盘证据。']) {
     assert.ok(translationNeedsReview({ text }, '原文语义需核对。'));

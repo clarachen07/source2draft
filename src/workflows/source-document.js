@@ -4,6 +4,7 @@ import { limitsFor, positive } from './translation-config.js';
 import { DOCUMENT_VERSION, DEFAULT_LIMITS, DOCUMENT_BLOCK_TYPES } from './translation-config.js';
 import { safeFetchResource, assertSafeHttpUrl, resolveSafeHttpUrl, readResponseBufferWithLimit, sourceDownloadUrl } from '../lib/secure-http.js';
 import { translationUnits, translatedUnitText, assessTranslationUnit } from './translation-validation.js';
+import { exposeTranslationLinkText } from './translation-links.js';
 import { report, safeError, writeJsonAtomic } from './translation-utils.js';
 import crypto from 'node:crypto';
 import dns from 'node:dns/promises';
@@ -17,6 +18,7 @@ import { readLimitedResponse, withDeadline } from '../lib/http-deadline.js';
 import { emitTelemetry } from '../lib/telemetry.js';
 import { JSDOM } from 'jsdom';
 import { Readability } from '@mozilla/readability';
+import { marked } from 'marked';
 import {
   cancellationErrorFromSignal,
   fetchUsesGlobalTransport,
@@ -77,7 +79,8 @@ export async function acquireSourceDocument({
   const acquisition = { attempts: [], fallbacks: [] };
   const arxiv = arxivSourceUrls(sourceUrl);
   let acquisitionUrl = arxiv ? (scope.kind === 'pages' ? arxiv.pdf : arxiv.html) : sourceDownloadUrl(sourceUrl);
-  if (acquisitionUrl !== sourceUrl) acquisition.attempts.push(scope.kind === 'pages' ? 'arxiv-pdf' : 'arxiv-html');
+  if (acquisitionUrl !== sourceUrl) acquisition.attempts.push(arxiv
+    ? (scope.kind === 'pages' ? 'arxiv-pdf' : 'arxiv-html') : 'direct-file-url');
   const acquisitionHeaders = requestHeaders;
   const reusableResponse = (url) => {
     if (!prefetched || prefetched.sourceUrl !== url || !Buffer.isBuffer(prefetched.buffer)) return undefined;
@@ -761,7 +764,7 @@ export function renderTranslatedDocument(document) {
     else if (block.type === 'list_item') {
       const ordinal = Number.isInteger(block.ordinal) ? block.ordinal : 1;
       const marker = block.ordered ? `${ordinal}${block.delimiter === ')' ? ')' : '.'}` : '-';
-      lines.push(`${'  '.repeat(block.depth || 0)}${marker} ${text}`, '');
+      lines.push(`${'  '.repeat(block.depth || 0)}${marker} ${withoutSourceListMarker(block, text)}`, '');
     } else if (block.type === 'figure') {
       figureNumber += 1;
       for (const image of block.images || []) {
@@ -769,11 +772,11 @@ export function renderTranslatedDocument(document) {
         lines.push(`![${escapeMarkdownAlt(image.alt || `原文图 ${figureNumber}`)}](${image.localPath})`, '');
       }
       const caption = restoreFragments((preserveOriginal ? block.caption : block.translatedCaption ?? block.caption) ?? '', block.captionFragments, { omitCitations: !preserveOriginal });
-      if (caption) lines.push(captionLine(`图 ${figureNumber}`, caption), '');
+      if (caption) lines.push(captionLine(captionWithLabel('figure', figureNumber, caption)), '');
     } else if (block.type === 'table') {
       tableNumber += 1;
       const caption = restoreFragments((preserveOriginal ? block.caption : block.translatedCaption ?? block.caption) ?? '', block.captionFragments, { omitCitations: !preserveOriginal });
-      if (caption) lines.push(`**表 ${tableNumber}：${caption}**`, '');
+      if (caption) lines.push(`**${captionWithLabel('table', tableNumber, caption)}**`, '');
       if (block.localPath) {
         lines.push(`![原文表 ${tableNumber}](${block.localPath})`, '');
       }
@@ -794,6 +797,7 @@ export function renderTranslatedDocument(document) {
 }
 
 export function validateTranslationArtifact({ source, translated, article }) {
+  source = exposeTranslationLinkText(source);
   const errors = [];
   const warnings = [...new Set(translated.validationWarnings || [])];
   const validationExceptions = Array.isArray(translated.validationExceptions)
@@ -1785,8 +1789,28 @@ function restoreFragments(value, fragments = [], { omitCitations = false } = {})
   return text;
 }
 
-function captionLine(label, caption) {
-  return `<p style="font-size:15px;text-align:left;color:#7b8490;line-height:1.8;margin:.35em 0 1.2em">${escapeHtml(label)}：${escapeHtml(caption)}</p>`;
+function withoutSourceListMarker(block, text) {
+  const source = String(block.text || '');
+  const marker = block.ordered
+    ? `${Number.isInteger(block.ordinal) ? block.ordinal : 1}${block.delimiter === ')' ? ')' : '.'}`
+    : /^\s*([•◦▪‣⁃])/.exec(source)?.[1];
+  if (!marker) return text;
+  const escaped = marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // LaTeXML can join its explicit marker directly to the prose. A decimal
+  // immediately after an ordered dot is content, rather than another marker.
+  const prefix = new RegExp(`^\\s*${escaped}${block.ordered && marker.endsWith('.') ? '(?!\\d)' : ''}\\s*`);
+  return prefix.test(source) ? text.replace(prefix, '') : text;
+}
+
+function captionWithLabel(type, number, caption) {
+  const label = type === 'figure' ? '(?:图|Figure|Fig\\.?)' : '(?:表|Table)';
+  const ordinal = '(?:\\d+(?:\\.\\d+)*[a-z]?|[a-z]\\.?\\d+(?:\\.\\d+)*|[ivxlcdm]+|[零〇一二三四五六七八九十百]+)';
+  const prefix = new RegExp(`^\\s*${label}\\s*${ordinal}(?=[\\s:：.．、(（)）–—-]|$)`, 'i');
+  return prefix.test(caption) ? caption : `${type === 'figure' ? '图' : '表'} ${number}：${caption}`;
+}
+
+function captionLine(caption) {
+  return `<p style="font-size:15px;text-align:left;color:#7b8490;line-height:1.8;margin:.35em 0 1.2em">${marked.parseInline(escapeHtml(caption))}</p>`;
 }
 
 function escapeMarkdownAlt(value) {

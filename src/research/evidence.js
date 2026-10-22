@@ -379,7 +379,7 @@ ${DAILY_STYLE_RULES}
 ${repair.length ? `这是已消耗的唯一一次语义修正，请修复这些问题后分条写作，不得再申请一轮：${JSON.stringify(repair)}` : ''}`;
 }
 
-export function dailyWriterPrompt({ run, context, cards, previousArticle, repair = [], outline, assigned, previousItem, excerptIds = false, generation = 0 }) {
+export function dailyWriterPrompt({ run, context, cards, previousArticle, repair = [], outline, assigned, previousItem, excerptIds = false, generation = 0, followUp = false }) {
   const reference = excerptIds ? '{"excerptId":"从本条locators.excerpts选择的完整编号，如C2/L13/Q1"}'
     : '{"cardId":"允许引用的C编号","locatorId":"L编号","quote":"逐字原文摘录至少8字符"}';
   return `冻结的资料窗口：${JSON.stringify(context)}\n用户要求与本线程修改：${run.input}\n已核实证据卡：${JSON.stringify(cards)}
@@ -396,9 +396,12 @@ ${excerptIds ? '每条所选excerptId对应的摘录' : '每条refs.quote'}按�
 ${DAILY_STYLE_RULES}
 只写卡片已核实的来源链接。不在body直接写图片；通过figureIds选择已授权原图。公式只可原样使用formula定位块里的明确TeX，不猜测公式。不得写刊物栏目模板、公众号推广或交易建议。
 ${assigned ? `只完成本条约${assigned.targetChars}字，上限${dailyItemCharLimit(assigned.targetChars)}字，长度等于上限可以通过。字数与校验使用同一计数：剔除空白、Markdown标记和链接地址后，中文、英文字母、数字和标点各计1，不要把英文模型名或数字当成一个词。最多24条关键事实claims，允许将长事实句拆成分别映射的短句；claims中的证据摘录不算正文篇幅。${excerptIds ? '只选择支持本句的必要摘录编号' : '每条quote只摘录支持该事实的必要原句'}，不重复整段或整篇原文；所有数字句仍须完整映射。其它条目的介绍、提纲、导语和来源页脚均不写。` : ''}
-${repair.length ? `${generation > 0
+${repair.length ? `${followUp
+  ? '终审发现上一次修正后新出现的严重问题，这是最后一次补充修正。只改正这些问题涉及的原句和claims，其余已通过的内容保持不变'
+  : generation > 0
   ? `用户要求重试（第${generation}次重写）。上一版正文未通过审稿，请按这些拒绝原因重写相关条目和claims，不要原样交回被拒内容`
   : '这是唯一一次修正机会，请修复这些核验问题并保持其它有效内容'}：${JSON.stringify(repair)}
+审稿意见中的每个数字只属于意见写明的主语、比较组、样本和定位；意见同时提到多个数字时，回到完整locators逐个核对各自的比较组和样本量，不得把一个比较的数字写到另一个比较下。
 以本条待修正内容为基础，优先局部补充或改正被指出的原句。除非核验明确指出对应事实错误，必须保留原稿已正确交代的市场与样本、评估窗口和划分、基准、成本对象与具体费率、持仓约束以及模型/搜索预算。补充新条件不得将已有数值条件改成含糊概括；例如已给出的滑点、佣金和印花税费率不能缩成“计入交易成本”。篇幅不足时先压缩重复的分析与建议，不删除必要的实验条件；仍不足时收缩结果范围，删除次要指标及其相关结论，完整交代核心结果的评估口径，不保留所有统计数字却省略条件。` : ''}`;
 }
 

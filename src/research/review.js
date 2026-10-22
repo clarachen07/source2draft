@@ -176,6 +176,7 @@ locators是完整取得的正文，claims只是精选提要。核对“未披露
 程序来源页脚已提供来源标题、链接及真实发表/更新日期，不要求补读标签；不因body没重复这些元数据而报缺来源或把元数据强写入正文。${DAILY_STYLE_RULES}
 核对判断与建议是否省略表达主体，仍须保留研究事实的必要归属。不得要求恢复定期汇编措辞、补读标签或结尾固定说明。
 只审核本条，warnings必须有本条原文依据，不能把其它事件的LLM裁判、实验设置或局限混到本条。样式偏好、篇幅偏好和不影响事实的补充背景列low，不要求另一次重写。
+reason会直接交给改稿模型。引用数字时，每个数字须紧跟其所属主语、比较组（谁相对谁）、样本或实例数及原文定位；不同比较的数字分开陈述，不能把多个比较的数字并列归到同一比较下。
 返回 JSON {"issues":[{"severity":"high或medium或low","reason":"具体问题，指出稿件原句、原文定位和正确比较/定义"}],"warnings":["仅本条原文支持的限制"]}。明确事实错误、比较组/语义错误、重要无证据断言、错误实验口径、错称实测/今日发布均为high；非关键细节为medium；样式为low。`,
         validate: auditShape });
       if (!auditShape(audit)) throw new Error('日报逐条审稿结构化结果不合格');
@@ -194,7 +195,7 @@ locators是完整取得的正文，claims只是精选提要。核对“未披露
     signal?.throwIfAborted();
     const value = await model.json({ role: 'review', signal, onTelemetry, systemPrompt: DAILY_SYSTEM,
       prompt: buildWholeArticlePrompt({
-        instruction: '只审核整篇标题与导语的事实准确性和跨条一致性。不要重新审稿或重写条目正文，不要求文风调整。标题和导语不能把合成/预测/回测结果说成真实交易，不得反转范围、对象、比较或局限；只能概括已核对条目及有证据的内容。事实错误列high并定位标题/导语原句和支持正确表达的条目/原文。返回JSON {"issues":[{"severity":"high或medium或low","reason":"具体证据与问题"}],"warnings":[]}。',
+        instruction: '只审核整篇标题与导语的事实准确性和跨条一致性。不要重新审稿或重写条目正文，不要求文风调整。标题和导语不能把合成/预测/回测结果说成真实交易，不得反转范围、对象、比较或局限；只能概括已核对条目及有证据的内容。事实错误列high并定位标题/导语原句和支持正确表达的条目/原文。引用数字时，每个数字须紧跟其所属主语、比较组（谁相对谁）、样本或实例数及原文定位；不同比较的数字分开陈述，不能把多个比较的数字并列归到同一比较下。返回JSON {"issues":[{"severity":"high或medium或low","reason":"具体证据与问题"}],"warnings":[]}。',
         payload: { title: draft.title, intro: draft.intro, items: draft.items, cards, context },
       }),
       validate: auditShape });

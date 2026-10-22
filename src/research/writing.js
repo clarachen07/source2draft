@@ -113,7 +113,7 @@ const itemShape = (item, assigned, cards) => dailyItemErrors(item, assigned, car
 // Only completed, matching items are reusable. Each model response is saved
 // before the next item starts; a failed item cannot trigger later requests.
 export async function writeDailyDraft({ phase = 'writing', run, context, cards, config, previousArticle = '', repair = [], previousDraft = null,
-  generation = 0, checkpoint, persist, model, signal, onTelemetry, progress = () => {} }) {
+  generation = 0, followUp = false, checkpoint, persist, model, signal, onTelemetry, progress = () => {} }) {
   const identity = dailyWritingIdentity({ run, context, cards, modelConfig: config.model, previousArticle, repair, previousDraft, generation });
   if (checkpoint[phase]?.identity !== identity) {
     checkpoint[phase] = { version: 1, identity, items: {} };
@@ -132,7 +132,7 @@ export async function writeDailyDraft({ phase = 'writing', run, context, cards, 
     if (targets && headerErrors.length) {
       const header = await model.json({ role: 'writer', signal, onTelemetry, systemPrompt: DAILY_SYSTEM,
         prompt: buildWholeArticlePrompt({
-          instruction: `${generation > 0 ? `用户要求重试（第${generation}次重写）。请按审稿拒绝原因改正标题或导语，不要原样交回被拒表述。` : ''}只修正标题和导语中明确的事实错误，保留正文、选题和顺序。标题不超过64字符，导语不超过400字符，不添加具体数字；遵守现有朴素文风。返回JSON {"title":"标题","intro":"导语"}。`,
+          instruction: `${followUp ? '终审发现上一次修正后新出现的问题，这是最后一次补充修正。' : generation > 0 ? `用户要求重试（第${generation}次重写）。请按审稿拒绝原因改正标题或导语，不要原样交回被拒表述。` : ''}只修正标题和导语中明确的事实错误，保留正文、选题和顺序。标题不超过64字符，导语不超过400字符，不添加具体数字；遵守现有朴素文风。返回JSON {"title":"标题","intro":"导语"}。`,
           payload: { errors: headerErrors, title: previousDraft.title, intro: previousDraft.intro, items: previousDraft.items, cards, context },
         }),
         validate: value => outlineShape({ ...outline, title: value?.title, intro: value?.intro }, cards) });
@@ -165,7 +165,7 @@ export async function writeDailyDraft({ phase = 'writing', run, context, cards, 
       // can then ground numbers. Equality checks are unchanged.
       item = await model.json({ role: 'writer', signal, onTelemetry, systemPrompt: DAILY_SYSTEM, maxAttempts: 3,
         prompt: dailyWriterPrompt({ run, context, cards: catalog.cards, previousArticle, repair: itemRepairErrors(repair, assigned.cardId), outline: writing.outline, assigned, excerptIds: true,
-          generation, previousItem: previousDraft?.items.find(value => value.cardId === assigned.cardId) }),
+          generation, followUp, previousItem: previousDraft?.items.find(value => value.cardId === assigned.cardId) }),
         validate: value => responseErrors(value).length === 0,
         validationErrors: responseErrors });
       const resolved = resolveDailyQuoteReferences(item, catalog);

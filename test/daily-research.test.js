@@ -699,3 +699,102 @@ test('invalid exact evidence stops an injected writer before saving the item, re
     assert.equal(trace.repairRequest, undefined); assert.equal(trace.approval, undefined);
   } finally { f.close(); }
 });
+
+// Writer call n appends marks[n - 1]; the reviewer answers by the newest mark it sees.
+function followUpFixture(answers) {
+  const f = fixture();
+  const marks = ['', '该结论限于作者报告的预测评估。', '该结论仍需样本外复核。', '该结论尚未覆盖交易执行。'];
+  f.prompts = { writer: [], review: [] };
+  f.args.model.json = async args => {
+    if (args.role === 'planner') { f.stats.outline++; return outline(1); }
+    if (args.role === 'writer') {
+      const item = draft(1).items[0], mark = marks[f.stats.writer++];
+      f.prompts.writer.push(args.prompt);
+      return mark ? { ...item, body: `${item.body}\n\n${mark}` } : item;
+    }
+    f.stats.review++; f.prompts.review.push(args.prompt);
+    const seen = marks.reduce((latest, mark, index) => mark && args.prompt.includes(mark) ? index : latest, 0);
+    const reason = answers[seen];
+    return { issues: reason ? [{ severity: 'high', reason }] : [], warnings: [] };
+  };
+  f.trace = () => JSON.parse(fs.readFileSync(path.join(f.args.workDir, 'research-trace.json')));
+  return f;
+}
+
+test('a high issue first raised by the final review gets one scoped follow-up correction, then approval', async () => {
+  const first = '样本区间未写在结果旁边';
+  const introduced = '修正后把甲比较的数字写到了乙比较下';
+  const f = followUpFixture([first, introduced, null]);
+  try {
+    const result = await runDailyResearch(f.args);
+    assert.match(result.article, /该结论仍需样本外复核/);
+    assert.equal(f.stats.writer, 3); assert.equal(f.stats.review, 3);
+    const trace = f.trace();
+    assert.equal(trace.correctionCount, 1, 'the follow-up does not reopen the main correction budget');
+    assert.deepEqual(trace.followUpCorrection.errors, [`C1：${introduced}`]);
+    assert.equal(trace.repairRequest.followUp, true);
+    assert.equal(trace.repairRequest.complete, true);
+    assert.equal(trace.repairHistory.length, 1);
+    assert.equal(trace.approval.policy, DAILY_REVIEW_POLICY);
+    assert.match(f.prompts.writer[2], /最后一次补充修正/);
+    assert.match(f.prompts.writer[2], new RegExp(introduced));
+    assert.doesNotMatch(f.prompts.writer[2], new RegExp(first));
+    assert.match(f.prompts.writer[1], /不得把一个比较的数字写到另一个比较下/);
+    assert.ok(f.prompts.review.every(prompt => prompt.includes('每个数字须紧跟其所属主语、比较组')));
+  } finally { f.close(); }
+});
+
+test('the follow-up correction is spent once; a further high issue blocks without another rewrite', async () => {
+  const f = followUpFixture(['样本区间未写在结果旁边', '修正后混淆了比较组', '补充修正后又遗漏了重复次数']);
+  try {
+    await assert.rejects(runDailyResearch(f.args), error => error.needsReview && !error.retryable && /遗漏了重复次数/.test(error.message));
+    assert.equal(f.stats.writer, 3); assert.equal(f.stats.review, 3);
+    const trace = f.trace();
+    assert.ok(trace.followUpCorrection);
+    assert.ok(trace.reviewFailure.errors.some(error => error.includes('遗漏了重复次数')));
+    const blocked = { ...f.stats };
+    await assert.rejects(runDailyResearch(f.args), /遗漏了重复次数/);
+    assert.deepEqual(f.stats, blocked, 'crash recovery or an automatic rerun does not grant another follow-up');
+  } finally { f.close(); }
+});
+
+test('an issue already sent to a repair is unresolved and blocks without the follow-up', async () => {
+  const same = '关键结论与原文不符';
+  const f = followUpFixture([same, same, null]);
+  try {
+    await assert.rejects(runDailyResearch(f.args), new RegExp(same));
+    assert.equal(f.stats.writer, 2); assert.equal(f.stats.review, 2);
+    assert.equal(f.trace().followUpCorrection, undefined);
+  } finally { f.close(); }
+});
+
+test('a user retry of a task blocked before follow-ups existed can rewrite, then spend the follow-up on new issues', async () => {
+  const same = '关键结论与原文不符';
+  const introduced = '重写后把甲比较的数字写到了乙比较下';
+  // Writer 1 = draft, 2 = the automatic correction (unchanged output), 3 = user retry, 4 = follow-up.
+  const f = followUpFixture([same, null, introduced, null]);
+  const marks = ['', '', '该结论仍需样本外复核。', '该结论尚未覆盖交易执行。'];
+  const writer = f.args.model.json;
+  f.args.model.json = async args => {
+    if (args.role !== 'writer') return writer(args);
+    const item = draft(1).items[0], mark = marks[f.stats.writer++];
+    f.prompts.writer.push(args.prompt);
+    return mark ? { ...item, body: `${item.body}\n\n${mark}` } : item;
+  };
+  try {
+    await assert.rejects(runDailyResearch(f.args), new RegExp(same));
+    assert.equal(f.stats.writer, 2);
+    assert.equal(f.trace().followUpCorrection, undefined);
+    const result = await runDailyResearch({ ...f.args, reviewRewrite: 1 });
+    assert.match(result.article, /该结论尚未覆盖交易执行/);
+    assert.equal(f.stats.writer, 4);
+    assert.match(f.prompts.writer[2], /第1次重写/);
+    assert.match(f.prompts.writer[3], /最后一次补充修正/);
+    const trace = f.trace();
+    assert.equal(trace.reviewRewriteSpent, 1);
+    assert.equal(trace.repairRequest.generation, 1);
+    assert.equal(trace.repairRequest.followUp, true);
+    assert.equal(trace.repairHistory.length, 2);
+    assert.equal(trace.approval.policy, DAILY_REVIEW_POLICY);
+  } finally { f.close(); }
+});

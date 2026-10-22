@@ -231,7 +231,8 @@ export async function runDailyResearch({ run, config, store, workDir, model, sig
       repair: request.errors || [], previousDraft: request.baseDraft || null, generation });
     if (!checkpoint.draft || checkpoint.draftWritingIdentity !== expected) {
       delete checkpoint.approval; persist();
-      const result = await writeDailyDraft({ ...writingArgs, phase, repair: request.errors || [], previousDraft: request.baseDraft || null, generation });
+      const result = await writeDailyDraft({ ...writingArgs, phase, repair: request.errors || [], previousDraft: request.baseDraft || null, generation,
+        followUp: request.followUp === true });
       checkpoint.draft = result.draft; checkpoint.draftWritingIdentity = result.identity;
       if (phase === 'repairWriting') checkpoint.repairRequest.complete = true;
       persist();
@@ -282,7 +283,8 @@ export async function runDailyResearch({ run, config, store, workDir, model, sig
     throw blocked(`日报事实或结构核验未通过：${checkpoint.reviewFailure.errors.slice(0, 4).join('；')}`);
   }
   let corrections = checkpoint.correctionCount || 0;
-  for (let pass = 0; !checkpoint.approval && pass < 2; pass++) {
+  // At most: first review, the one correction, and one scoped follow-up.
+  for (let pass = 0; !checkpoint.approval && pass < 3; pass++) {
     narrow();
     if (!isCompleteDailyDraft(checkpoint.draft, cards)) throw blocked('日报写作结构未完整，已停止审稿与上传');
     let errors = validateDailyDraft(checkpoint.draft, cards);
@@ -295,6 +297,20 @@ export async function runDailyResearch({ run, config, store, workDir, model, sig
     }
     if (!errors.length) { checkpoint.approval = { version: 1, policy: DAILY_REVIEW_POLICY, fingerprint: fingerprint(), checkedAt: new Date().toISOString() }; persist(); break; }
     if (corrections >= 1) {
+      // A final review can surface high issues the correction itself caused
+      // or a medium issue escalated to high. Those get one scoped follow-up
+      // per task. Any issue already sent to a repair is unresolved and blocks.
+      const requested = new Set([...(checkpoint.repairHistory || []), checkpoint.repairRequest].flatMap(request => request?.errors || []));
+      if (!checkpoint.followUpCorrection && checkpoint.repairRequest?.complete === true && errors.every(error => !requested.has(error))) {
+        checkpoint.followUpCorrection = { version: 1, errors: [...errors], at: new Date().toISOString() };
+        checkpoint.repairHistory = [...(checkpoint.repairHistory || []), checkpoint.repairRequest];
+        checkpoint.repairRequest = { errors, baseDraft: structuredClone(checkpoint.draft), complete: false,
+          generation: checkpoint.repairRequest.generation || 0, followUp: true };
+        delete checkpoint.approval; persist();
+        progress('终审发现修正后新出现的严重问题，正在做唯一一次补充修正');
+        await completeWriting('repairWriting', checkpoint.repairRequest);
+        continue;
+      }
       checkpoint.reviewFailure = { policy: DAILY_REVIEW_POLICY, fingerprint: fingerprint(), errors }; persist();
       throw blocked(`日报事实或结构核验未通过：${errors.slice(0, 4).join('；')}`);
     }

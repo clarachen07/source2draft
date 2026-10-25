@@ -7,10 +7,49 @@ test('numeric evidence distinguishes decimal lists and deterministically recogni
   assert.deepEqual(numericTokens('Prices [0.10,0.90] and liquidity $5,000.'), ['0.10', '0.90', '5000']);
   assert.deepEqual(numericTokens('zero six twenty single August 2026'), ['2026', '0', '6', '20', '1', '8']);
   assert.deepEqual(numericTokens('May increase or march forward; August alone.'), []);
+  assert.deepEqual(numericTokens('May 2 samples'), ['2']);
+  assert.equal(numericTokens('may 2 samples in 2026.').includes('5'), false);
+  assert.equal(numericTokens('May 2 samples. The budget year is 2026.').includes('5'), false);
+  assert.equal(numericTokens('May 2 samples were collected for an unrelated purpose, and the separate budget year is 2026.').includes('5'), false);
+  assert.ok(numericTokens('May 2, 2026.').includes('5'));
+  assert.equal(numericTokens('April 32, 2026 is not a date.').includes('4'), false);
+  assert.ok(numericTokens('Positions opened on 8 April 2026.').includes('4'));
+  const live = numericTokens('Steward traded live from April 8 to September 10, 2026 for 102 trading days on a $100,000 paper account.');
+  for (const number of ['4', '8', '9', '10', '2026', '102', '100000']) assert.ok(live.includes(number), number);
   const audit = auditEvidenceClaims([{ text: '作者覆盖6个领域，采用1轮训练；采用2026年8月价目。', locatorId: 'L1',
     quote: 'The study covers six domains with single epoch training at August 2026 list prices.' }],
   [{ id: 'L1', text: 'The study covers six domains with single epoch training at August 2026 list prices.' }]);
   assert.equal(audit.verified.length, 1); assert.deepEqual(audit.rejected, []);
+});
+
+test('Chinese calendar dates ground on English month-day phrases, and a bold heading boundary still maps the sentence', () => {
+  const quote = 'Steward traded live from April 8 to September 10, 2026 for 102 trading days on a $100,000 paper account.';
+  const cards = [{ id: 'C1', locators: [{ id: 'L40', text: quote }], figures: [] }];
+  const assigned = { cardId: 'C1', heading: '纸面账户运行', importance: 'lead', targetChars: 1000 };
+  const chinese = '系统于2026年4月8日至9月10日在券商纸面账户运行，共102个交易日，账户资金为100,000美元；';
+  const english = '论文记载，Steward在April 8至September 10, 2026于券商纸面账户运行102个交易日，资金为100,000美元；';
+  for (const sentence of [chinese, english]) {
+    const item = { cardId: 'C1', heading: assigned.heading, importance: 'lead', figureIds: [],
+      body: `**作者报告的证据。**${sentence}`,
+      claims: [{ sentence, refs: [{ cardId: 'C1', locatorId: 'L40', quote }] }] };
+    assert.deepEqual(dailyItemErrors(item, assigned, cards), []);
+  }
+  const uncovered = { cardId: 'C1', heading: assigned.heading, importance: 'lead', figureIds: [],
+    body: `**作者报告的证据。**${chinese}`, claims: [] };
+  const uncoveredErrors = dailyItemErrors(uncovered, assigned, cards);
+  assert.ok(uncoveredErrors.some(error => /正文数值句缺少逐句证据映射/.test(error) && error.includes('2026年4月8日') && !error.includes('**')));
+  const invented = { cardId: 'C1', heading: assigned.heading, importance: 'lead', figureIds: [],
+    body: '系统于2026年3月8日运行。',
+    claims: [{ sentence: '系统于2026年3月8日运行。', refs: [{ cardId: 'C1', locatorId: 'L40', quote }] }] };
+  assert.ok(dailyItemErrors(invented, assigned, cards).some(error => /缺失numbers="3"/.test(error)));
+  const leaked = 'L44及方法说明L143所述的相关模拟条件未给出可归入这组比较的交易成本费率。';
+  const leakItem = { cardId: 'C1', heading: assigned.heading, importance: 'lead', figureIds: [], body: leaked,
+    claims: [{ sentence: leaked, refs: [{ cardId: 'C1', locatorId: 'L40', quote }] }] };
+  const leakErrors = dailyItemErrors(leakItem, assigned, cards);
+  assert.ok(leakErrors.some(error => /缺失numbers="44,143"/.test(error)));
+  assert.ok(leakErrors.some(error => /提供的证据摘录中不存在这些数字："44,143"/.test(error)));
+  const prompt = dailyWriterPrompt({ run: { input: '写研究分享' }, context: {}, cards, outline: { items: [assigned] }, assigned, excerptIds: true });
+  assert.match(prompt, /不写内部定位编号（如L40、L143、C1\/L40\/Q1）/);
 });
 
 const source = [

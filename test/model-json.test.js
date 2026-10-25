@@ -40,6 +40,58 @@ test('daily item repair receives actual character count and prior response, then
   assert.equal(f.events.filter(event => event.stage === 'model.validation').length, 1);
 });
 
+test('a pure length overrun on the final attempt gets one compress-only repair', async t => {
+  const narrow = { ...assigned, targetChars: 400 };
+  const fit = { ...narrow, body: '测'.repeat(460), claims: [], figureIds: [] };
+  const over = { ...fit, body: '测'.repeat(478) };
+  const f = fixture(t, [JSON.stringify(over), JSON.stringify(over), JSON.stringify(over), JSON.stringify(fit)]);
+  const errors = value => dailyItemErrors(value, narrow, cards);
+  assert.deepEqual(await f.model.json({ role: 'writer', prompt: '写本条JSON', maxAttempts: 3, validate: value => !errors(value).length, validationErrors: errors }), fit);
+  assert.equal(f.requests.length, 4);
+  const feedback = f.requests[3].messages[1].content;
+  assert.match(feedback, /正文实际478字符，超过上限460/);
+  assert.match(feedback, /本次只压缩正文，不要新增事实、数字或定位编号，已通过的证据映射保持不变/);
+  const diagnostic = JSON.parse(fs.readFileSync(path.join(f.dir, 'model-json-failures', fs.readdirSync(path.join(f.dir, 'model-json-failures'))[0])));
+  assert.equal(diagnostic.failures.length, 3);
+});
+
+test('a second pure length overrun after the compress repair stops', async t => {
+  const narrow = { ...assigned, targetChars: 400 };
+  const over = { ...narrow, body: '测'.repeat(478), claims: [], figureIds: [] };
+  const f = fixture(t, Array.from({ length: 4 }, () => JSON.stringify(over)));
+  const errors = value => dailyItemErrors(value, narrow, cards);
+  await assert.rejects(f.model.json({ role: 'writer', prompt: '写本条JSON', maxAttempts: 3, validate: value => !errors(value).length, validationErrors: errors }), error => {
+    assert.equal(error.code, 'MODEL_JSON_INVALID');
+    assert.equal(error.retryable, false);
+    assert.match(error.message, /连续四次/);
+    assert.match(error.message, /正文实际478字符，超过上限460/);
+    return true;
+  });
+  assert.equal(f.requests.length, 4);
+  assert.match(f.requests[3].messages[1].content, /本次只压缩正文/);
+  const diagnostic = JSON.parse(fs.readFileSync(path.join(f.dir, 'model-json-failures', fs.readdirSync(path.join(f.dir, 'model-json-failures'))[0])));
+  assert.equal(diagnostic.failures.length, 4);
+});
+
+test('a final attempt that is still ungrounded does not gain a compress pass', async t => {
+  const narrow = { ...assigned, targetChars: 400 };
+  const sentence = '作者报告69次评估。';
+  const over = { ...narrow, body: `${'测'.repeat(478)}${sentence}`, claims: [], figureIds: [] };
+  const recovered = { ...narrow, body: '测'.repeat(460), claims: [], figureIds: [] };
+  const f = fixture(t, [JSON.stringify(over), JSON.stringify(over), JSON.stringify(over), JSON.stringify(recovered)]);
+  const errors = value => dailyItemErrors(value, narrow, cards);
+  await assert.rejects(f.model.json({ prompt: 'JSON', maxAttempts: 3, validate: value => !errors(value).length, validationErrors: errors }), error => {
+    assert.match(error.message, /连续三次/);
+    assert.match(error.message, /超过上限/);
+    assert.match(error.message, /69/);
+    return true;
+  });
+  assert.equal(f.requests.length, 3);
+  const feedback = f.requests[2].messages[1].content;
+  assert.equal(feedback.includes('本次只压缩正文'), false);
+  assert.ok(feedback.indexOf('缺少逐句证据映射') < feedback.indexOf('超过上限'));
+});
+
 test('a body at the inclusive character limit is accepted and an overflow repair names both lengths', async t => {
   const assigned400 = { ...assigned, targetChars: 400 };
   const fit = { ...assigned400, body: '测'.repeat(460), claims: [], figureIds: [] };

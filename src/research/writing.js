@@ -162,7 +162,9 @@ export async function writeDailyDraft({ phase = 'writing', run, context, cards, 
         return [...resolved.errors, ...dailyItemErrors(resolved.item, assigned, relevant, { catalog })];
       };
       // The first repair often only corrects excerpt ranges. A third response
-      // can then ground numbers. Equality checks are unchanged.
+      // can then ground numbers. A pure length overrun on that last response
+      // gets one compress-only attempt inside the adapter; this budget stays
+      // three so grounding does not gain another rewrite. Equality checks are unchanged.
       item = await model.json({ role: 'writer', signal, onTelemetry, systemPrompt: DAILY_SYSTEM, maxAttempts: 3,
         prompt: dailyWriterPrompt({ run, context, cards: catalog.cards, previousArticle, repair: itemRepairErrors(repair, assigned.cardId), outline: writing.outline, assigned, excerptIds: true,
           generation, followUp, previousItem: previousDraft?.items.find(value => value.cardId === assigned.cardId) }),

@@ -32,8 +32,12 @@ const diagnostic = (text, maximum = 220) => JSON.stringify(compact(text)
 // Letters, numbers and punctuation count; whitespace and common Markdown wrappers do not.
 // The count is UTF-16 code units. A BMP CJK character is one unit, the same as one 字.
 // This is not grapheme segmentation. Prompts and validators must both use this counter.
+function withoutMarkup(text) {
+  return String(text || '').replace(/!?\[([^\]]*)\]\([^)]*\)/g, '$1').replace(/[#*_`]/g, '');
+}
+
 export function dailyPlainLength(text) {
-  return String(text || '').replace(/!?\[([^\]]*)\]\([^)]*\)/g, '$1').replace(/\s|[#*_`]/g, '').length;
+  return withoutMarkup(text).replace(/\s/g, '').length;
 }
 
 // Inclusive cap of floor(target × 115%). Integer arithmetic: IEEE-754 makes
@@ -60,6 +64,45 @@ export function originalQuote(text, quote) {
   return text.slice(positions[location], positions[location + wanted.length - 1] + 1);
 }
 
+const CALENDAR_MONTHS = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'];
+
+function calendarMonthNumber(name) {
+  const index = CALENDAR_MONTHS.indexOf(String(name || '').toLowerCase());
+  return index < 0 ? null : String(index + 1);
+}
+
+// A month name is a number only inside an explicit date. "August 2026" and
+// "April 8 to September 10, 2026" supply 8, 4 and 9. A bare "May", or
+// "May 2 samples" whose year is in another sentence, does not.
+function calendarMonthNumbers(text) {
+  const source = String(text), numbers = [];
+  const monthName = CALENDAR_MONTHS.join('|');
+  for (const match of source.matchAll(new RegExp(`\\b(${monthName})\\s*,?\\s+(?:19|20)\\d{2}\\b`, 'gi'))) {
+    numbers.push(calendarMonthNumber(match[1]));
+  }
+  const monthWord = CALENDAR_MONTHS.map(name => `${name[0].toUpperCase()}${name.slice(1)}|${name.toUpperCase()}`).join('|');
+  const datedDay = new RegExp(`\\b(?:(${monthWord})\\s+(\\d{1,2})(?:st|nd|rd|th)?|(\\d{1,2})(?:st|nd|rd|th)?\\s+(${monthWord}))\\b`, 'g');
+  const bounds = [0];
+  for (const match of source.matchAll(/\n+|(?<=[.!?])\s+/g)) bounds.push(match.index + match[0].length);
+  bounds.push(source.length);
+  for (const match of source.matchAll(datedDay)) {
+    const name = match[1] || match[4];
+    const day = Number(match[2] || match[3]);
+    if (!name || day < 1 || day > 31) continue;
+    let from = 0, to = source.length;
+    for (const index of bounds) {
+      if (index <= match.index) from = index;
+      else { to = index; break; }
+    }
+    // Keep the year in this sentence and next to the month-day. A later
+    // "2026" must not turn an unrelated "May 2" into evidence for 5月.
+    const around = source.slice(Math.max(from, match.index - 24), Math.min(to, match.index + match[0].length + 48));
+    if (!/(?<!\d)(?:19|20)\d{2}(?!\d)/.test(around)) continue;
+    numbers.push(calendarMonthNumber(name));
+  }
+  return numbers;
+}
+
 export function numericTokens(text) {
   // Normalize only numeric sign spelling; keep quotes and locator bytes intact.
   // A negative value must still fail against a positive value of the same magnitude.
@@ -74,12 +117,7 @@ export function numericTokens(text) {
     const word = match[0].toLowerCase();
     numbers.push(String(word === 'single' ? 1 : words.indexOf(word)));
   }
-  const months = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'];
-  // Month equivalence is limited to an explicit calendar month/year phrase.
-  // A standalone "May" or "March" is not evidence for a calendar number.
-  for (const match of source.matchAll(/\b(January|February|March|April|May|June|July|August|September|October|November|December)\s*,?\s+(?:19|20)\d{2}\b/gi)) {
-    numbers.push(String(months.indexOf(match[1].toLowerCase()) + 1));
-  }
+  numbers.push(...calendarMonthNumbers(source));
   return numbers;
 }
 
@@ -251,11 +289,15 @@ export function dailyItemEvidenceErrors(item, cards, options = {}) {
   }
   // All numerical prose requires a grounded fact mapping, independently of
   // the model review. Equations are checked separately against explicit TeX.
-  const prose = item.body.replace(/\$\$[\s\S]*?\$\$|\$[^$\n]+\$/g, '')
-    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, '$1');
+  // A bold heading boundary leaves the closing ** on the next sentence
+  // (**作者报告的证据。**系统于…). Strip markup before this comparison only.
+  // claims.sentence must still be a literal body substring, and numbers
+  // below are still checked against the cited excerpts.
+  const prose = withoutMarkup(item.body.replace(/\$\$[\s\S]*?\$\$|\$[^$\n]+\$/g, ''));
+  const grounded = [...validSentences].map(sentence => withoutMarkup(sentence));
   for (const sentence of prose.split(/(?<=[。！？!?;；])|\n/).filter(value => numericTokens(value).length)) {
     const clean = sentence.trim();
-    if (clean && ![...validSentences].some(mapped => mapped.includes(clean) || clean.includes(mapped) && numericTokens(clean).every(number => numericTokens(mapped).includes(number)))) errors.push(`${where}正文数值句缺少逐句证据映射：sentence=${diagnostic(clean, 140)}；为完整原句添加claims与全部对应refs${numericGap(numericTokens(clean), cards, catalog)}`);
+    if (clean && !grounded.some(mapped => mapped.includes(clean) || clean.includes(mapped) && mapped.trim() && numericTokens(clean).every(number => numericTokens(mapped).includes(number)))) errors.push(`${where}正文数值句缺少逐句证据映射：sentence=${diagnostic(clean, 140)}；为完整原句添加claims与全部对应refs${numericGap(numericTokens(clean), cards, catalog)}`);
   }
   for (const match of item.body.matchAll(/\$\$([\s\S]*?)\$\$|(?<!\$)\$([^$\n]+)\$(?!\$)/g)) {
     const tex = compact(match[1] || match[2]);
@@ -390,7 +432,7 @@ ${assigned ? `写作提纲（选题与篇幅提示，不提供额外事实）：
 每个条目说明事件/研究提出什么、方法与关键结果、对LLM或量化金融为何重要、可落地步骤与限制。强交叉主题优先；通用LLM发布需说明金融研究者的实际用途。区分作者报告和推断。locators保留完整取得的正文，精选claims只是提要，缺少摘录不代表论文未披露。陈述“未披露/未报告/缺少”前必须检查完整locators：只在原文明示限制或完整原文已核查后陈述，限定为所检查的正文，不能推定未核查的附录、代码仓库也缺失；没完成核查就写“本次未核实”。
 所有重要事实尤其数字、日期、模型版本和收益必须在claims中逐句${excerptIds ? '选择支持该句的原文excerptId，程序按编号写入原文quote及locatorId' : '给出原文quote及locatorId'}。body中每一句包含数字的文字都必须映射，包括模型名、版本号以及判断、实践建议和局限段。例如“建议：可用Qwen3.6-35B-A3B做对照”也须对模型名里的数字引用正文原文；没有可定位摘录就改用不含数字的称呼或删除该句。一个数字句同时使用多个定位块的信息时，refs须分别引用各块，不能只引其中一块。
 ${DAILY_EXPERIMENT_RULES}
-claims.sentence必须逐字复制body中的完整原句，包括中文逗号、分号、句号、括号和空格，不能把body的“；”改成“。”。${excerptIds ? 'refs每项只返回excerptId，不复制旧稿的quote或locatorId，不手写摘录，不编造编号。Q序号必须落在该定位块excerpts的实际条数内。locators.excerpts按原文顺序覆盖完整取得的正文，选取语义匹配的必要摘录，每句最多6条refs；超过6条时把该句拆成多个短句。表格比较必须同时选择包含市场/列定义的表头和对应方法的完整数据行，不能拼接成假想连续摘录；指数名里的300、500等数字也须出现在所选表头或相关原文中。不同市场、方法、行列的相同数字不能互换。0.872不能写成0.87或87.2%。' : 'quote也逐字取对应locators，不自行改上下标、Unicode符号、缩写或标点。'}货币金额写“0.24美元”等形式，不写美元符号$，避免被误解为数学公式。
+claims.sentence必须逐字复制body中的完整原句，包括中文逗号、分号、句号、括号和空格，不能把body的“；”改成“。”。正文和sentence不写内部定位编号（如L40、L143、C1/L40/Q1），编号只放在refs。${excerptIds ? 'refs每项只返回excerptId，不复制旧稿的quote或locatorId，不手写摘录，不编造编号。Q序号必须落在该定位块excerpts的实际条数内。locators.excerpts按原文顺序覆盖完整取得的正文，选取语义匹配的必要摘录，每句最多6条refs；超过6条时把该句拆成多个短句。表格比较必须同时选择包含市场/列定义的表头和对应方法的完整数据行，不能拼接成假想连续摘录；指数名里的300、500等数字也须出现在所选表头或相关原文中。不同市场、方法、行列的相同数字不能互换。0.872不能写成0.87或87.2%。' : 'quote也逐字取对应locators，不自行改上下标、Unicode符号、缩写或标点。'}货币金额写“0.24美元”等形式，不写美元符号$，避免被误解为数学公式。
 ${excerptIds ? '每条所选excerptId对应的摘录' : '每条refs.quote'}按合并空白后的文本计至少8字符，摘录足以支持断言的相关原文；MAE、RMSE、MASE等指标不能只引用缩写或“MAE:”标签，应连同对应定义一起${excerptIds ? '选择原文摘录编号' : '逐字摘录'}。检查所有claims，不因先发现句子不匹配而遗漏其它引用问题。
 数值用原文数字和单位，不新增换算。元数据中的v1等版本号、发布日期、更新日期若不出现在locators原文，不得自行写入body；来源列表及真实发表/更新日期由程序添加，不添加补读标签。导语只概括主线，不添加数值。成稿前逐句检查全部body中的数字与claims映射，推断标签不能替代事实定位。
 ${DAILY_STYLE_RULES}

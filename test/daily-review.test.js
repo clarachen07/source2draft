@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildWholeArticlePrompt, reviewDailyDraft as reviewIncludingHeader } from '../src/research/review.js';
+import { DAILY_EXPERIMENT_RULES } from '../src/research/evidence.js';
+import { buildWholeArticlePrompt, DAILY_REVIEW_POLICY, reviewDailyDraft as reviewIncludingHeader } from '../src/research/review.js';
 import { writeDailyDraft } from '../src/research/writing.js';
 import { CODEX_JSON_REPAIR_HEADROOM, CODEX_LIMITS, codexCharacterLength, codexPromptBudget, codexStdin } from '../src/core/codex-model.js';
 
@@ -235,4 +236,44 @@ test('header repair keeps the draft body and drops raw locator dumps above the C
   assert.equal(repairPrompt.includes(sentinel), false);
   assert.equal(repairPrompt.includes('x'.repeat(200)), false);
   assert.ok(codexCharacterLength(codexStdin(repairPrompt, { responseFormat: { type: 'json_object' } })) <= CODEX_LIMITS.inputChars);
+});
+
+test('first review sends omissions to warnings; a later pass rechecks earlier findings for that scope', async () => {
+  const f = fixture();
+  let first = '';
+  f.args.model.json = async request => {
+    if (request.prompt.startsWith('只审核本条事件C1')) first = request.prompt;
+    if (request.prompt.startsWith('只审核整篇标题')) assert.doesNotMatch(request.prompt, /修正后的复核/);
+    return { issues: [], warnings: [] };
+  };
+  await reviewIncludingHeader(f.args);
+  assert.match(first, /评估窗口起止日期/);
+  assert.match(first, /不要给high/);
+  assert.ok(first.includes(DAILY_EXPERIMENT_RULES.slice(0, 24)));
+  assert.doesNotMatch(first, /未核实则写本次未核实/);
+  assert.doesNotMatch(first, /修正后的复核/);
+
+  const later = fixture();
+  later.args.checkpoint.correctionCount = 1;
+  later.args.checkpoint.audits = [{
+    policy: DAILY_REVIEW_POLICY, fingerprint: 'older-draft', passNumber: 0,
+    issues: [
+      { cardId: 'C1', severity: 'high', reason: '样本区间未写在结果旁边' },
+      { scope: 'header', severity: 'high', reason: '标题声称实盘；C1原文仅为合成实验' },
+    ],
+    warnings: [],
+  }];
+  let item = '', header = '';
+  later.args.model.json = async request => {
+    if (request.prompt.startsWith('只审核整篇标题')) header = request.prompt;
+    else if (request.prompt.includes('事件C1')) item = request.prompt;
+    return { issues: [], warnings: [] };
+  };
+  await reviewIncludingHeader(later.args);
+  assert.match(item, /修正后的复核/);
+  assert.match(item, /样本区间未写在结果旁边/);
+  assert.doesNotMatch(item, /标题声称实盘/);
+  assert.match(header, /修正后的复核/);
+  assert.match(header, /标题声称实盘/);
+  assert.match(header, /不要列high/);
 });

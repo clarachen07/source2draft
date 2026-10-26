@@ -744,16 +744,16 @@ test('a high issue first raised by the final review gets one scoped follow-up co
   } finally { f.close(); }
 });
 
-test('the follow-up correction is spent once; a further high issue blocks without another rewrite', async () => {
-  const f = followUpFixture(['样本区间未写在结果旁边', '修正后混淆了比较组', '补充修正后又遗漏了重复次数']);
+test('the follow-up correction is spent once; a further positive fact error blocks without another rewrite', async () => {
+  const f = followUpFixture(['样本区间未写在结果旁边', '修正后混淆了比较组', '补充修正后把回撤写成了收益亏损']);
   try {
-    await assert.rejects(runDailyResearch(f.args), error => error.needsReview && !error.retryable && /遗漏了重复次数/.test(error.message));
+    await assert.rejects(runDailyResearch(f.args), error => error.needsReview && !error.retryable && /写成了收益亏损/.test(error.message));
     assert.equal(f.stats.writer, 3); assert.equal(f.stats.review, 3);
     const trace = f.trace();
     assert.ok(trace.followUpCorrection);
-    assert.ok(trace.reviewFailure.errors.some(error => error.includes('遗漏了重复次数')));
+    assert.ok(trace.reviewFailure.errors.some(error => error.includes('写成了收益亏损')));
     const blocked = { ...f.stats };
-    await assert.rejects(runDailyResearch(f.args), /遗漏了重复次数/);
+    await assert.rejects(runDailyResearch(f.args), /写成了收益亏损/);
     assert.deepEqual(f.stats, blocked, 'crash recovery or an automatic rerun does not grant another follow-up');
   } finally { f.close(); }
 });
@@ -796,5 +796,67 @@ test('a user retry of a task blocked before follow-ups existed can rewrite, then
     assert.equal(trace.repairRequest.followUp, true);
     assert.equal(trace.repairHistory.length, 2);
     assert.equal(trace.approval.policy, DAILY_REVIEW_POLICY);
+  } finally { f.close(); }
+});
+
+test('a pure omission first raised after the correction is a review note and does not spend the follow-up', async () => {
+  const later = '没有交代指数成分是否按时点构造，本次核查未确认该构造方式';
+  const f = followUpFixture(['样本区间未写在结果旁边', later]);
+  try {
+    const result = await runDailyResearch(f.args);
+    assert.equal(f.stats.writer, 2, 'the follow-up rewrite is not spent on a new omission');
+    assert.equal(f.stats.review, 2);
+    const trace = f.trace();
+    assert.equal(trace.followUpCorrection, undefined);
+    assert.equal(trace.reviewFailure, undefined);
+    assert.equal(trace.approval.policy, DAILY_REVIEW_POLICY);
+    assert.match(result.warnings.join('\n'), /审稿补充（不阻断）/);
+    assert.match(result.warnings.join('\n'), /本次核查未确认/);
+    assert.doesNotMatch(f.prompts.review[0], /修正后的复核/);
+    assert.match(f.prompts.review[1], /修正后的复核/);
+    assert.match(f.prompts.review[1], /样本区间未写在结果旁边/);
+  } finally { f.close(); }
+});
+
+test('a post-correction contradiction still gets one follow-up while a new omission stays a note', async () => {
+  const omission = '没有交代成本费率的币种及是否含税费，本次核查未确认';
+  const introduced = '修正后把甲比较的数字写到了乙比较下';
+  const f = followUpFixture(['样本区间未写在结果旁边']);
+  const original = f.args.model.json;
+  f.args.model.json = async args => {
+    if (args.role !== 'review') return original(args);
+    f.stats.review++;
+    f.prompts.review.push(args.prompt);
+    const marks = ['', '该结论限于作者报告的预测评估。', '该结论仍需样本外复核。'];
+    const seen = marks.reduce((latest, mark, index) => mark && args.prompt.includes(mark) ? index : latest, 0);
+    if (seen === 0) return { issues: [{ severity: 'high', reason: '样本区间未写在结果旁边' }], warnings: [] };
+    if (seen === 1) return { issues: [{ severity: 'high', reason: omission }, { severity: 'high', reason: introduced }], warnings: [] };
+    return { issues: [], warnings: [] };
+  };
+  try {
+    const result = await runDailyResearch(f.args);
+    assert.equal(f.stats.writer, 3);
+    assert.equal(f.stats.review, 3);
+    assert.match(f.prompts.writer[2], new RegExp(introduced));
+    assert.doesNotMatch(f.prompts.writer[2], /本次核查未确认/);
+    assert.match(result.warnings.join('\n'), /币种/);
+    const trace = f.trace();
+    assert.deepEqual(trace.followUpCorrection.errors, [`C1：${introduced}`]);
+    assert.equal(trace.reviewFailure, undefined);
+    assert.equal(trace.approval.policy, DAILY_REVIEW_POLICY);
+  } finally { f.close(); }
+});
+
+test('an omission raised after the follow-up is a review note instead of another block', async () => {
+  const f = followUpFixture(['样本区间未写在结果旁边', '修正后混淆了比较组', '没有交代仿真对手方，本次核查未确认']);
+  try {
+    const result = await runDailyResearch(f.args);
+    assert.equal(f.stats.writer, 3);
+    assert.equal(f.stats.review, 3);
+    const trace = f.trace();
+    assert.ok(trace.followUpCorrection);
+    assert.equal(trace.reviewFailure, undefined);
+    assert.equal(trace.approval.policy, DAILY_REVIEW_POLICY);
+    assert.match(result.warnings.join('\n'), /仿真对手方/);
   } finally { f.close(); }
 });

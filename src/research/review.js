@@ -3,7 +3,7 @@ import { CODEX_JSON_REPAIR_HEADROOM, CODEX_LIMITS, codexCharacterLength, codexPr
 import { DAILY_SYSTEM, DAILY_EXPERIMENT_RULES, DAILY_STYLE_RULES, renderDailyArticle, reviewFingerprint } from './evidence.js';
 import { modelIdentity } from '../core/model-identity.js';
 
-export const DAILY_REVIEW_POLICY = 10;
+export const DAILY_REVIEW_POLICY = 11;
 const OMITTED_LOCATOR_NOTE = '完整原文定位块已在逐条审稿中核对。本请求不重复附上定位全文，只保留定位编号与字符数；条目正文和claims摘录保持完整。不要因未见定位全文把已核对条目判为缺证据。';
 const CLIPPED_QUOTE_NOTE = '过长的证据摘录已按定位编号截断，并标注原字符数。判断标题和导语时以条目正文和保留的摘录为准。';
 const BULK_CARD_KEYS = ['receipt', 'claimValidation', 'figures', 'contentHash', 'extraction', 'fetchedAt', 'firstSeenAt', 'licenseUrl'];
@@ -123,6 +123,25 @@ export function dailyReviewContextIdentity({ run, context, config }) {
     system: DAILY_SYSTEM, experiment: DAILY_EXPERIMENT_RULES, style: DAILY_STYLE_RULES });
 }
 
+function priorHighReasons(checkpoint, scopeId, fingerprint, passNumber) {
+  const reasons = [];
+  for (const audit of checkpoint.audits || []) {
+    if (audit?.policy !== DAILY_REVIEW_POLICY) continue;
+    if (audit.fingerprint === fingerprint && audit.passNumber === passNumber) continue;
+    for (const issue of audit.issues || []) {
+      const id = issue.scope === 'header' ? 'HEADER' : issue.cardId;
+      if (id === scopeId && typeof issue.reason === 'string') reasons.push(issue.reason.slice(0, 500));
+    }
+  }
+  return [...new Set(reasons)].slice(-6);
+}
+
+// Later passes recheck earlier high findings and the sentences a repair changed.
+// They do not open a new omission list on text the repair left alone.
+function deltaInstruction(reasons) {
+  return `\n本轮是修正后的复核，不是从头再做一遍开放式遗漏清单。此前本范围的高严重度意见：${reasons.length ? JSON.stringify(reasons) : '无'}。请逐条核对这些问题是否仍成立，并只对相对上一稿改动过的句子查找新的事实错误。新的 high 仅限仍未改正或改稿新引入的正向事实错误。此前未提出的纯遗漏、本次核查未确认的细节、标题用词与指标不同名，写入 warnings，不要给 high。`;
+}
+
 // Each pass has the current full draft identity. Persist every reviewed item
 // before moving on; retries reuse only verified responses for identical input.
 export async function reviewDailyDraft({ draft, cards, run, context, config, checkpoint, persist, model, signal, onTelemetry, progress = () => {} }) {
@@ -171,13 +190,15 @@ export async function reviewDailyDraft({ draft, cards, run, context, config, che
         prompt: `只审核本条事件${item.cardId}。用户要求：${run.input}\n冻结窗口：${JSON.stringify(context)}\n本条相关原文证据卡与完整定位：${JSON.stringify(relevant)}\n本条实际呈现（程序已添加来源标题、链接及经过核验的发表/更新日期，末尾单独显示文章对应日期）：\n${article}\n本条claims映射：${JSON.stringify(item.claims)}
 对照完整原文核对主语、比较组、指标定义、样本、时间划分、成本单位/对象、实验条件与局限。数字能在原文找到并不证明断言正确：不同主语/比较组的相同数字不能互换；区分受限动作集与放宽动作集相对谁的增益、单次运行与多种子平均、实际成本与估算价目、执行token与反思token。rank若按任务到达顺序定义，就只能写时间先后，不能暗示成绩排名。金额对比必须明确金额对应哪种模型/方案。equal-mass分箱指等样本量，不指物理质量；headroom是可达到且被评估表达的提升空间，不能误译为上下文容量。
 ${DAILY_EXPERIMENT_RULES}
-若本条报告金融市场预测或策略回测结果，正文必须交代市场、样本期、测试划分或评估窗口、基准，以及预测评估/回测/实盘性质。报告策略收益、组合表现或交易回测时，还必须交代交易成本假设；只评估估值或预测误差（如MAPE）、没有报告交易收益且正文已明确其预测评估性质时，交易成本不适用于该误差比较，不能因未重复说明未计成本而列high，也不能从本次未核实推定作者未做交易实验。原文提供而正文遗漏这些适用的关键条件，列high并给出原文定位与必要摘录；原文未披露的适用条件须明确限定为本次已核查原文未披露，未核实则写本次未核实。代码生成或通用模型基准不强套市场回测条件。不要要求将所有超参数搬入文章。
-locators是完整取得的正文，claims只是精选提要。核对“未披露/未报告/缺少”必须查完整locators，未查到完整附录/仓库只能写“本次未核实”，不得从卡片缺项推定论文缺项。明确区分作者报告、作者观点与推断；不把本次模型审稿当复现实验。核验是否真的包含LLM，合成市场不能说真实市场已验证。
+若本条报告金融市场预测或策略回测结果，核对稿件是否把原文没有的事实写进去，或把已有事实说错。只评估估值或预测误差（如MAPE）、没有报告交易收益且正文已明确其预测评估性质时，不能因未写交易成本而列high，也不能从本次未核实推定作者未做交易实验。代码生成或通用模型基准不强套市场回测条件。不要要求把所有超参数写入文章。
+high只用于稿件里的正向事实错误：数字、日期、指标或比较组与原文矛盾；把甲比较的数字写到乙比较；无中生有；把回测、纸面或模拟说成实盘或真实交易；把回撤写成收益亏损；把原文没有检验的差异说成显著；把原文已经说明的内容声称未披露。reason写明稿件原句、原文定位和正确比较。
+正文遗漏原文中的补充条件（评估窗口日期、成本费率的币种或税费、指数成分如何构造、基线预算是否相同、仿真中的对手方），标题用词与指标不完全同名，以及“本次核查未确认/未核实”且稿件没有断言该细节，都写入warnings，severity不要用high，也不要要求稿件为未断言的细节补一句“本次未核实”。
+locators是完整取得的正文，claims只是精选提要。稿件如果声称“未披露/未报告/缺少”，必须先查完整locators；未查到完整附录或仓库时，不能把卡片缺项写成论文缺项，这种错误声称是high。稿件没有声称该细节时，不要要求补写“本次未核实”。明确区分作者报告、作者观点与推断；不把本次模型审稿当复现实验。核验是否真的包含LLM，合成市场不能说真实市场已验证。
 程序来源页脚已提供来源标题、链接及真实发表/更新日期，不要求补读标签；不因body没重复这些元数据而报缺来源或把元数据强写入正文。${DAILY_STYLE_RULES}
 核对判断与建议是否省略表达主体，仍须保留研究事实的必要归属。不得要求恢复定期汇编措辞、补读标签或结尾固定说明。
 只审核本条，warnings必须有本条原文依据，不能把其它事件的LLM裁判、实验设置或局限混到本条。样式偏好、篇幅偏好和不影响事实的补充背景列low，不要求另一次重写。
-reason会直接交给改稿模型。引用数字时，每个数字须紧跟其所属主语、比较组（谁相对谁）、样本或实例数及原文定位；不同比较的数字分开陈述，不能把多个比较的数字并列归到同一比较下。
-返回 JSON {"issues":[{"severity":"high或medium或low","reason":"具体问题，指出稿件原句、原文定位和正确比较/定义"}],"warnings":["仅本条原文支持的限制"]}。明确事实错误、比较组/语义错误、重要无证据断言、错误实验口径、错称实测/今日发布均为high；非关键细节为medium；样式为low。`,
+reason会直接交给改稿模型。引用数字时，每个数字须紧跟其所属主语、比较组（谁相对谁）、样本或实例数及原文定位；不同比较的数字分开陈述，不能把多个比较的数字并列归到同一比较下。${passNumber > 0 ? deltaInstruction(priorHighReasons(checkpoint, item.cardId, fingerprint, passNumber)) : ''}
+返回 JSON {"issues":[{"severity":"high或medium或low","reason":"具体问题，指出稿件原句、原文定位和正确比较/定义"}],"warnings":["仅本条原文支持的限制"]}。与原文矛盾、比较组或数字张冠李戴、无中生有、错称实盘或实测、错称今日发布，均为high。补充条件遗漏和本次未核实且稿件未断言的细节写入warnings，不要给high。样式为low。`,
         validate: auditShape });
       if (!auditShape(audit)) throw new Error('日报逐条审稿结构化结果不合格');
       pass.items[item.cardId] = { identity, valueHash: hash(audit), value: audit }; persist();
@@ -195,7 +216,7 @@ reason会直接交给改稿模型。引用数字时，每个数字须紧跟其�
     signal?.throwIfAborted();
     const value = await model.json({ role: 'review', signal, onTelemetry, systemPrompt: DAILY_SYSTEM,
       prompt: buildWholeArticlePrompt({
-        instruction: '只审核整篇标题与导语的事实准确性和跨条一致性。不要重新审稿或重写条目正文，不要求文风调整。标题和导语不能把合成/预测/回测结果说成真实交易，不得反转范围、对象、比较或局限；只能概括已核对条目及有证据的内容。事实错误列high并定位标题/导语原句和支持正确表达的条目/原文。引用数字时，每个数字须紧跟其所属主语、比较组（谁相对谁）、样本或实例数及原文定位；不同比较的数字分开陈述，不能把多个比较的数字并列归到同一比较下。返回JSON {"issues":[{"severity":"high或medium或low","reason":"具体证据与问题"}],"warnings":[]}。',
+        instruction: `只审核整篇标题与导语的事实准确性和跨条一致性。不要重新审稿或重写条目正文，不要求文风调整。标题和导语不能把合成/预测/回测结果说成真实交易，不得反转范围、对象、比较或局限；只能概括已核对条目及有证据的内容。事实错误列high并定位标题/导语原句和支持正确表达的条目/原文。标题用词与指标不完全同名，或总标题范围宽于某一条的方法，但没有把回测或纸面说成实盘、没有写错数字或比较组时，写入warnings，不要列high。${passNumber > 0 ? deltaInstruction(priorHighReasons(checkpoint, 'HEADER', fingerprint, passNumber)) : ''}引用数字时，每个数字须紧跟其所属主语、比较组（谁相对谁）、样本或实例数及原文定位；不同比较的数字分开陈述，不能把多个比较的数字并列归到同一比较下。返回JSON {"issues":[{"severity":"high或medium或low","reason":"具体证据与问题"}],"warnings":[]}。`,
         payload: { title: draft.title, intro: draft.intro, items: draft.items, cards, context },
       }),
       validate: auditShape });

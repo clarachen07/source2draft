@@ -11,6 +11,7 @@ import { readResearchDocument, acquirePermittedFigures, githubReadme } from '../
 import { extractEvidenceCard, isCompleteDailyDraft, validateDailyDraft, narrowDailyDraft, reviewFingerprint, renderDailyArticle } from '../research/evidence.js';
 import { writeDailyDraft, dailyWritingIdentity } from '../research/writing.js';
 import { reviewDailyDraft, DAILY_REVIEW_POLICY } from '../research/review.js';
+import { dailyDraftText, deferredReviewNote, partitionDailyReviewErrors } from '../research/review-findings.js';
 
 export function dailyContext(run) {
   let context;
@@ -284,6 +285,9 @@ export async function runDailyResearch({ run, config, store, workDir, model, sig
   }
   let corrections = checkpoint.correctionCount || 0;
   // At most: first review, the one correction, and one scoped follow-up.
+  // The first review may spend the correction on missing source-stated scope.
+  // Later passes block only on positive fact errors. New omissions and
+  // unverified caveats become success-post notes instead of another rewrite.
   for (let pass = 0; !checkpoint.approval && pass < 3; pass++) {
     narrow();
     if (!isCompleteDailyDraft(checkpoint.draft, cards)) throw blocked('日报写作结构未完整，已停止审稿与上传');
@@ -292,14 +296,21 @@ export async function runDailyResearch({ run, config, store, workDir, model, sig
       progress(corrections ? '正在复核唯一一次修正' : '正在逐条核验原文、数字与日期');
       const audit = await reviewDailyDraft({ draft: checkpoint.draft, cards, run, context, config, checkpoint, persist, model, signal, onTelemetry, progress });
       checkpoint.warnings.push(...audit.warnings);
-      errors = [...new Set([...errors, ...audit.issues.filter(issue => issue.severity === 'high').map(issue => `${issue.scope === 'header' ? 'HEADER' : issue.cardId}：${issue.reason}`)])];
+      const auditErrors = [...new Set(audit.issues.filter(issue => issue.severity === 'high').map(issue => `${issue.scope === 'header' ? 'HEADER' : issue.cardId}：${issue.reason}`))];
+      const alreadyRequested = new Set([...(checkpoint.repairHistory || []), checkpoint.repairRequest].flatMap(request => request?.errors || []));
+      const findings = partitionDailyReviewErrors(auditErrors, {
+        passNumber: corrections, requested: alreadyRequested,
+        priorText: dailyDraftText(checkpoint.repairRequest?.baseDraft), currentText: dailyDraftText(checkpoint.draft),
+      });
+      if (findings.deferred.length) checkpoint.deferredReview = [...new Set([...(checkpoint.deferredReview || []), ...findings.deferred])];
+      errors = [...new Set([...errors, ...findings.blocking])];
       persist();
     }
     if (!errors.length) { checkpoint.approval = { version: 1, policy: DAILY_REVIEW_POLICY, fingerprint: fingerprint(), checkedAt: new Date().toISOString() }; persist(); break; }
     if (corrections >= 1) {
-      // A final review can surface high issues the correction itself caused
-      // or a medium issue escalated to high. Those get one scoped follow-up
-      // per task. Any issue already sent to a repair is unresolved and blocks.
+      // Positive fact errors this pass has not sent to a repair yet get one
+      // scoped follow-up. An issue already sent, or any positive error after
+      // that follow-up, stays blocked. Omissions were removed above.
       const requested = new Set([...(checkpoint.repairHistory || []), checkpoint.repairRequest].flatMap(request => request?.errors || []));
       if (!checkpoint.followUpCorrection && checkpoint.repairRequest?.complete === true && errors.every(error => !requested.has(error))) {
         checkpoint.followUpCorrection = { version: 1, errors: [...errors], at: new Date().toISOString() };
@@ -322,6 +333,9 @@ export async function runDailyResearch({ run, config, store, workDir, model, sig
     await completeWriting('repairWriting', checkpoint.repairRequest);
   }
   if (!checkpoint.approval || checkpoint.approval.fingerprint !== fingerprint()) throw blocked('日报缺少当前版本的核验通过记录');
+  if (checkpoint.deferredReview?.length) {
+    checkpoint.warnings = [deferredReviewNote(checkpoint.deferredReview), ...checkpoint.deferredReview, ...checkpoint.warnings];
+  }
   const usedIds = new Set(checkpoint.draft.items.flatMap(item => [item.cardId, ...item.claims.flatMap(claim => claim.refs.map(ref => ref.cardId))]));
   const usedCards = cards.filter(card => usedIds.has(card.id));
   const eventIds = [...new Set(usedCards.filter(card => !card.supplied).map(card => card.eventId))];

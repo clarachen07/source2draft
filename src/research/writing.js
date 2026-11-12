@@ -1,7 +1,7 @@
 import { hash } from '../lib/io.js';
 import { DAILY_SYSTEM, dailyOutlinePrompt, dailyWriterPrompt, dailyPlainLength, dailyItemCharLimit, numericTokens, dailyItemEvidenceErrors, dailyStyleErrors } from './evidence.js';
 import { modelIdentity } from '../core/model-identity.js';
-import { createDailyQuoteCatalog, resolveDailyQuoteReferences } from './quotes.js';
+import { createDailyQuoteCatalog, dailyClaimRefsAllowed, resolveDailyQuoteReferences } from './quotes.js';
 import { buildWholeArticlePrompt } from './review.js';
 
 const plainHeading = value => typeof value === 'string' && value.trim() && value.length <= 120 && !/[\r\n<>\[\]`]|https?:\/\//.test(value);
@@ -86,9 +86,9 @@ export function dailyItemErrors(item, assigned, cards, options) {
     if (typeof claim?.sentence !== 'string' || !claim.sentence.trim() || typeof item.body !== 'string' || !item.body.includes(claim.sentence)) {
       errors.push(`${prefix}.sentence必须逐字复制body中的非空原句，不能改动标点或空格。`);
     }
-    if (!Array.isArray(claim?.refs) || !claim.refs.length || claim.refs.length > 6) {
+    if (!dailyClaimRefsAllowed(claim)) {
       const count = Array.isArray(claim?.refs) ? claim.refs.length : 0;
-      errors.push(`${prefix}.refs必须含1–6条引用${count ? `；当前${count}条` : ''}。超过6条时拆成多个短句claims，每句只保留支撑该句的excerptId。`);
+      errors.push(`${prefix}.refs必须含1–6条引用${count ? `；当前${count}条` : ''}。超过6条时只保留覆盖该句数字的excerptId，删除重复编号，不要为了条数改写整句。`);
     } else claim.refs.forEach((ref, refIndex) => {
       if (ref && typeof ref === 'object' && Object.hasOwn(ref, 'excerptId')) return;
       if (typeof ref?.quote !== 'string' || !byId.get(ref?.cardId)?.locators.some(locator => locator.id === ref?.locatorId)) {
@@ -165,6 +165,9 @@ export async function writeDailyDraft({ phase = 'writing', run, context, cards, 
       // can then ground numbers. A pure length overrun on that last response
       // gets one compress-only attempt inside the adapter; this budget stays
       // three so grounding does not gain another rewrite. Equality checks are unchanged.
+      // A grounded claim with more than six excerpt ids is normalized before
+      // this call, so that count does not spend the budget. Writing identity
+      // stays version 7: completed items already passed the cap and remain reusable.
       item = await model.json({ role: 'writer', signal, onTelemetry, systemPrompt: DAILY_SYSTEM, maxAttempts: 3,
         prompt: dailyWriterPrompt({ run, context, cards: catalog.cards, previousArticle, repair: itemRepairErrors(repair, assigned.cardId), outline: writing.outline, assigned, excerptIds: true,
           generation, followUp, previousItem: previousDraft?.items.find(value => value.cardId === assigned.cardId) }),

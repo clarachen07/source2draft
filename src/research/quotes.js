@@ -1,6 +1,56 @@
+import { numericTokens } from './evidence.js';
+
 // The writer selects immutable source excerpts instead of transcribing quotes
 // and their locator IDs independently. Canonical saved claims still contain
 // literal source bytes and pass the existing evidence and semantic audits.
+
+// Six is the selective-citation cap, not a grounding limit. A seventh real
+// excerpt used to fail the writer and ask the model to split the sentence.
+// That rewrite must stay a verbatim body substring, so the model resubmits
+// the same ids and the three-attempt budget aborts a claim the number check
+// would accept. Duplicates are removed here. Refs that add no sentence number
+// are dropped only until six remain. A number that occurs in one excerpt stays.
+const DAILY_CLAIM_REF_LIMIT = 6;
+
+function numericCover(refs, sentence) {
+  const missing = new Set(numericTokens(typeof sentence === 'string' ? sentence : ''));
+  const cover = [];
+  for (const ref of refs) {
+    if (!missing.size) break;
+    const quote = typeof ref?.quote === 'string' ? ref.quote : '';
+    const found = numericTokens(quote).filter(number => missing.has(number));
+    if (!found.length) continue;
+    for (const number of found) missing.delete(number);
+    cover.push(ref);
+  }
+  return cover;
+}
+
+function selectGroundedRefs(refs, sentence) {
+  const cover = numericCover(refs, sentence);
+  if (cover.length >= DAILY_CLAIM_REF_LIMIT) return cover;
+  const required = new Set(cover);
+  const room = DAILY_CLAIM_REF_LIMIT - cover.length;
+  let fillers = 0;
+  const kept = [];
+  for (const ref of refs) {
+    if (required.has(ref)) { kept.push(ref); continue; }
+    if (fillers >= room) continue;
+    fillers += 1;
+    kept.push(ref);
+  }
+  return kept;
+}
+
+// More than six refs is allowed only when every ref adds a sentence number
+// the earlier refs do not. Anything looser still fails the cap.
+export function dailyClaimRefsAllowed(claim) {
+  const refs = claim?.refs;
+  if (!Array.isArray(refs) || refs.length < 1) return false;
+  if (refs.length <= DAILY_CLAIM_REF_LIMIT) return true;
+  return numericCover(refs, claim?.sentence).length === refs.length;
+}
+
 function excerptSpans(text) {
   const boundaries = [0];
   for (const match of text.matchAll(/\n+|(?<=[.!?。！？])\s+(?=[A-Z“"‘(\[])/g)) boundaries.push(match.index + match[0].length);
@@ -68,17 +118,35 @@ export function resolveDailyQuoteReferences(value, catalog) {
   if (!Array.isArray(item?.claims)) return { item, errors };
   for (const [index, claim] of item.claims.entries()) {
     if (!Array.isArray(claim?.refs)) continue;
-    claim.refs = claim.refs.map((ref, refIndex) => {
+    const next = [];
+    const seen = new Set();
+    let unresolved = false, catalogOnly = true;
+    for (const [refIndex, ref] of claim.refs.entries()) {
       // Existing canonical checkpoints and injected clients retain the same
       // strict literal-quote path. Never relocate or invent a legacy quote.
-      if (!ref || typeof ref !== 'object' || !Object.hasOwn(ref, 'excerptId')) return ref;
+      if (!ref || typeof ref !== 'object' || !Object.hasOwn(ref, 'excerptId')) {
+        catalogOnly = false;
+        next.push(ref);
+        continue;
+      }
       const source = catalog.byId.get(ref.excerptId);
       if (!source || Object.keys(ref).some(key => key !== 'excerptId')) {
         errors.push(excerptSelectionError(ref, index, refIndex, catalog));
-        return ref;
+        unresolved = true;
+        catalogOnly = false;
+        next.push(ref);
+        continue;
       }
-      return { ...source };
-    });
+      if (seen.has(ref.excerptId)) continue;
+      seen.add(ref.excerptId);
+      next.push({ ...source });
+    }
+    // Trim only a claim whose every ref already resolved. An unknown id keeps
+    // its range error so the repair can name the valid excerpt. The sentence
+    // and the claim stay; nothing is borrowed from another claim.
+    claim.refs = catalogOnly && !unresolved && next.length > DAILY_CLAIM_REF_LIMIT
+      ? selectGroundedRefs(next, claim.sentence)
+      : next;
   }
   return { item, errors };
 }
